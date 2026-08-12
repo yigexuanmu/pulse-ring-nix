@@ -1,5 +1,3 @@
-use std::num::NonZeroU32;
-
 use bytemuck::{Pod, Zeroable};
 use wgpu::wgt::CompositeAlphaMode;
 
@@ -31,8 +29,18 @@ pub struct RingRenderer {
     particle_count_data: u32,
     particle_band_r_data: f32,
     render_scale: f32,
+    lyric_enabled: u32,
+    lyric_time: f32,
+    lyric_word_count: u32,
+    lyric_words_data: [f32; 65536],
+    lyric_bounds_data: [f32; 4],
+    lyric_fx_data: [f32; 8],
+    capture_once: bool,
+    capture_path: String,
     atlas_texture: Option<wgpu::Texture>,
     atlas_view: Option<wgpu::TextureView>,
+    lyric_texture: Option<wgpu::Texture>,
+    lyric_view: Option<wgpu::TextureView>,
     sampler: wgpu::Sampler,
     bind_group_layout: wgpu::BindGroupLayout,
 }
@@ -103,6 +111,13 @@ struct Uniforms {
     overall_energy_val: f32,
     particle_count: u32,
     particle_band_r: f32,
+    // ---- lyrics ----
+    lyric_enabled: u32,
+    lyric_time: f32,
+    lyric_word_count: u32,
+    lyric_words: [f32; 65536],
+    lyric_bounds: [f32; 4],
+    lyric_fx: [f32; 8],
 }
 
 impl RingRenderer {
@@ -135,7 +150,7 @@ impl RingRenderer {
         };
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format,
             color_space: wgpu::SurfaceColorSpace::Auto,
             width: 64,
@@ -152,9 +167,12 @@ impl RingRenderer {
             source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
         });
 
+        // WGSL storage structs align their total size to the largest member alignment (vec2 →
+        // 8 bytes), so the buffer must be rounded up to 8 to satisfy validation.
+        let uniform_size = (std::mem::size_of::<Uniforms>() as u64 + 7) & !7;
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("ring uniforms"),
-            size: 10832,
+            size: uniform_size,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -168,7 +186,7 @@ impl RingRenderer {
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
-                        min_binding_size: NonZeroU32::new(10832).map(|n| n.get() as u64).and_then(std::num::NonZeroU64::new),
+                        min_binding_size: std::num::NonZeroU64::new(uniform_size),
                     },
                     count: None,
                 },
@@ -186,6 +204,16 @@ impl RingRenderer {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
                     count: None,
                 },
             ],
@@ -229,6 +257,10 @@ impl RingRenderer {
                     binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&placeholder_view),
+                },
             ],
         });
 
@@ -253,7 +285,22 @@ impl RingRenderer {
                 compilation_options: Default::default(),
                 targets: &[Some(wgpu::ColorTargetState {
                     format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    // The shader emits premultiplied colour (ring + lyric layers are built
+                    // premultiplied and the surface alpha mode is PreMultiplied), so blend
+                    // with src factor One — ALPHA_BLENDING (SrcAlpha) would dim every
+                    // semi-transparent pixel by its own alpha a second time.
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                        alpha: wgpu::BlendComponent {
+                            src_factor: wgpu::BlendFactor::One,
+                            dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                            operation: wgpu::BlendOperation::Add,
+                        },
+                    }),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
@@ -290,8 +337,18 @@ impl RingRenderer {
             particle_count_data: 0,
             particle_band_r_data: 0.0,
             render_scale: 1.0,
+            lyric_enabled: 0,
+            lyric_time: 0.0,
+            lyric_word_count: 0,
+            lyric_words_data: [0.0; 65536],
+            lyric_bounds_data: [-1.0, -1.0, -1.0, -1.0],
+            lyric_fx_data: [0.0; 8],
+            capture_once: false,
+            capture_path: String::new(),
             atlas_texture: None,
             atlas_view: None,
+            lyric_texture: None,
+            lyric_view: None,
             sampler: sampler.clone(),
             bind_group_layout: bind_group_layout.clone(),
         }
@@ -332,6 +389,17 @@ impl RingRenderer {
         self.auto_rotate = rad;
     }
 
+    /// Post-processing for the lyric layer: [blur, glitch, noise, contrast] in 0..1.
+    pub fn set_lyrics_fx(&mut self, fx: [f32; 8]) {
+        self.lyric_fx_data = fx;
+    }
+
+    /// Save the next rendered frame to `path` (debugging: shows exactly what the GPU draws).
+    pub fn request_capture(&mut self, path: &str) {
+        self.capture_once = true;
+        self.capture_path = path.to_string();
+    }
+
     /// Upload widget layout (computed CPU-side, pixels) into the uniform array.
     pub fn set_widgets(&mut self, data: &[f32]) {
         self.widget_data.fill(0.0);
@@ -340,8 +408,40 @@ impl RingRenderer {
         self.widget_count = (n / 40) as u32;
     }
 
+    /// Upload the lyric layer state: enabled flag, current playback time and up to 3276 word
+    /// quads (20 f32 each: slot, uv(4), px(2), pos(2), scale, alpha, rotate, color(4), ext(4)).
+    pub fn set_lyrics(&mut self, enabled: bool, time: f32, words: &[[f32; 20]]) {
+        self.lyric_enabled = enabled as u32;
+        self.lyric_time = time;
+        self.lyric_words_data.fill(0.0);
+        let n = words.len().min(3276);
+        let mut min_x = f32::MAX;
+        let mut min_y = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut max_y = f32::MIN;
+        for (i, word) in words.iter().take(n).enumerate() {
+            let o = i * 20;
+            self.lyric_words_data[o..o + 20].copy_from_slice(word);
+            // Rotation-safe AABB margin: a rotated quad's corners exceed the axis box by up to
+            // ~41%; 1.5x is a safe overdraw bound.
+            let half_x = word[5] * word[9].max(0.0) * 0.75;
+            let half_y = word[6] * word[9].max(0.0) * 0.75;
+            min_x = min_x.min(word[7] - half_x);
+            min_y = min_y.min(word[8] - half_y);
+            max_x = max_x.max(word[7] + half_x);
+            max_y = max_y.max(word[8] + half_y);
+        }
+        if n > 0 {
+            self.lyric_bounds_data = [min_x, min_y, max_x, max_y];
+        } else {
+            self.lyric_bounds_data = [-1.0, -1.0, -1.0, -1.0];
+        }
+        self.lyric_word_count = n as u32;
+    }
+
     fn refresh_texture_bindings(&mut self) {
         if let Some(view) = &self.atlas_view {
+            let lyric = self.lyric_view.as_ref().unwrap_or(view);
             self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("ring bg"),
                 layout: &self.bind_group_layout,
@@ -349,9 +449,56 @@ impl RingRenderer {
                     wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buffer.as_entire_binding() },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lyric) },
                 ],
             });
         }
+    }
+
+    /// Upload the single-channel SDF glyph atlas (one byte per pixel). Re-uploads when a new
+    /// glyph was rasterised (marked dirty by the CPU-side atlas).
+    pub fn upload_lyric_sdf(&mut self, data: &[u8]) {
+        use crate::sdf::ATLAS_PX;
+        if data.len() < ATLAS_PX * ATLAS_PX {
+            return;
+        }
+        if self.lyric_texture.is_none() {
+            let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("lyric sdf atlas"),
+                size: wgpu::Extent3d {
+                    width: ATLAS_PX as u32,
+                    height: ATLAS_PX as u32,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::R8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+            self.lyric_texture = Some(tex);
+            self.lyric_view = Some(view);
+            self.refresh_texture_bindings();
+        }
+        let tex = self.lyric_texture.as_ref().unwrap();
+        let dst = wgpu::TexelCopyTextureInfo {
+            texture: tex,
+            mip_level: 0,
+            origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
+            aspect: wgpu::TextureAspect::All,
+        };
+        let layout = wgpu::TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(ATLAS_PX as u32),
+            rows_per_image: Some(ATLAS_PX as u32),
+        };
+        self.queue.write_texture(dst, data, layout, wgpu::Extent3d {
+            width: ATLAS_PX as u32,
+            height: ATLAS_PX as u32,
+            depth_or_array_layers: 1,
+        });
     }
 
     /// Upload an RGBA image into atlas slot `index` (each slot is 256x256 in a 8x8 grid).
@@ -579,6 +726,12 @@ impl RingRenderer {
             overall_energy_val: self.overall_energy_data,
             particle_count: self.particle_count_data,
             particle_band_r: self.particle_band_r_data,
+            lyric_enabled: self.lyric_enabled,
+            lyric_time: self.lyric_time,
+            lyric_word_count: self.lyric_word_count,
+            lyric_words: self.lyric_words_data,
+            lyric_bounds: self.lyric_bounds_data,
+            lyric_fx: self.lyric_fx_data,
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
@@ -610,6 +763,9 @@ impl RingRenderer {
         drop(pass);
 
         self.queue.submit(Some(encoder.finish()));
+        if self.capture_once {
+            self.capture_frame(&frame);
+        }
         if self.id == 0 && self.render_count % 30 == 1 {
             log::info!("render id=0 presenting (#{})", self.render_count);
         }
@@ -625,6 +781,72 @@ impl RingRenderer {
                 self.height,
             );
         }
+    }
+
+    /// Read back the just-rendered frame and save it as a PNG (debugging).
+    fn capture_frame(&mut self, frame: &wgpu::SurfaceTexture) {
+        let w = self.width.max(1);
+        let h = self.height.max(1);
+        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u32;
+        let bytes_per_row = (w * 4).max(1);
+        let padded = ((bytes_per_row + align - 1) / align) * align;
+        let buf = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("capture"),
+            size: (padded as u64) * h as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("capture") });
+        enc.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &frame.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &buf,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(padded),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(enc.finish()));
+        let slice = buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let _ = rx.recv();
+        let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+        {
+            let data = slice.get_mapped_range().expect("capture buffer mapped");
+            // Surface is Bgra8UnormSrgb; convert to RGBA.
+            for row in 0..h {
+                let base = (row * padded) as usize;
+                for col in 0..w as usize {
+                    let o = base + col * 4;
+                    rgba.push(data[o + 2]);
+                    rgba.push(data[o + 1]);
+                    rgba.push(data[o]);
+                    rgba.push(255);
+                }
+            }
+        }
+        buf.unmap();
+        let path = std::mem::take(&mut self.capture_path);
+        match image::save_buffer(&path, &rgba, w, h, image::ExtendedColorType::Rgba8) {
+            Ok(()) => log::info!("captured frame to {path} ({w}x{h})"),
+            Err(e) => log::warn!("capture save failed: {e}"),
+        }
+        self.capture_once = false;
     }
 }
 
@@ -692,10 +914,17 @@ const SHADER_SRC: &str = stringify!(
         overall_energy_val: f32,
         particle_count: u32,
         particle_band_r: f32,
+        lyric_enabled: u32,
+        lyric_time: f32,
+        lyric_word_count: u32,
+        lyric_words: array<f32, 65536>,
+        lyric_bounds: array<f32, 4>,
+        lyric_fx: array<f32, 8>,
     };
 
     @group(0) @binding(1) var widget_texture: texture_2d<f32>;
     @group(0) @binding(2) var widget_sampler: sampler;
+    @group(0) @binding(3) var lyric_texture: texture_2d<f32>;
 
     @group(0) @binding(0) var<storage, read> u: Uniforms;
 
@@ -717,6 +946,26 @@ const SHADER_SRC: &str = stringify!(
     fn hash_band(ang: f32) -> Band {
         let t = ang / 6.28318530718 * f32(NBANDS);
         return Band(u32(t) % NBANDS, t - floor(t));
+    }
+
+    fn hash01(p: vec2<f32>) -> f32 {
+        let d = fract(vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)), dot(p, vec2<f32>(269.5, 183.3))) * 43758.5453);
+        return fract(d.x + d.y * 57.0);
+    }
+
+    fn sd_triangle(p0: vec2<f32>, p1: vec2<f32>, p2: vec2<f32>, p: vec2<f32>) -> f32 {
+        let e0 = p1 - p0;
+        let e1 = p2 - p1;
+        let e2 = p0 - p2;
+        let v0 = p - p0;
+        let v1 = p - p1;
+        let v2 = p - p2;
+        let pq0 = v0 - e0 * clamp(dot(v0, e0) / dot(e0, e0), 0.0, 1.0);
+        let pq1 = v1 - e1 * clamp(dot(v1, e1) / dot(e1, e1), 0.0, 1.0);
+        let pq2 = v2 - e2 * clamp(dot(v2, e2) / dot(e2, e2), 0.0, 1.0);
+        let s = sign(e0.x * e2.y - e0.y * e2.x);
+        let dd = min(min(vec2<f32>(dot(pq0, pq0), s * (v0.x * e0.y - v0.y * e0.x)), vec2<f32>(dot(pq1, pq1), s * (v1.x * e1.y - v1.y * e1.x))), vec2<f32>(dot(pq2, pq2), s * (v2.x * e2.y - v2.y * e2.x)));
+        return -sqrt(dd.x) * sign(dd.y);
     }
 
     fn hsl_to_rgb(h: f32, s: f32, l: f32) -> vec3<f32> {
@@ -912,16 +1161,20 @@ const SHADER_SRC: &str = stringify!(
         return exp(-abs(dist - edge) / front_w) * (1.0 - local);
     }
 
-    @fragment
-    fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+    fn ring_at(p: vec2<f32>) -> vec4<f32> {
         let min_d = min(u.resolution.x, u.resolution.y);
+        // When the lyric layer is active the ring acts as a subtle background: slightly smaller
+        // but stays centred (no offset, so it never looks misaligned).
+        let lyr_active = u.lyric_enabled != 0u;
+        let lf = select(1.0, 0.92, lyr_active);
         let centre = u.resolution * 0.5 + vec2<f32>(u.x_off, u.y_off) * min_d;
-        let d = in.pos.xy - centre;
+        let d = p - centre;
         let dist = length(d);
 
         // Fast reject: pixels far outside the outer ring + halo skip all ring math.
         // (Only particles / widgets / background remain, which are much cheaper.)
-        let ring_max = u.base_r + u.growth + u.halo;
+        let base_r_eff = u.base_r * lf;
+        let ring_max = base_r_eff + u.growth + u.halo;
         var ang = 0.0;
         var amp = 0.0;
         var ang_eff = 0.0;
@@ -954,12 +1207,12 @@ const SHADER_SRC: &str = stringify!(
             let s_outer = spawn_layer(u.spawn_t, 0.0);
             let s_mid = spawn_layer(u.spawn_t, 0.18);
             let s_inner = spawn_layer(u.spawn_t, 0.36);
-            base_scaled = u.base_r * s_outer;
-            mid_base_scaled = u.mid_base_r * s_mid;
-            inner_base_scaled = u.inner_base_r * s_inner;
+            base_scaled = base_r_eff * s_outer;
+            mid_base_scaled = u.mid_base_r * lf * s_mid;
+            inner_base_scaled = u.inner_base_r * lf * s_inner;
             edge_out = ring_edge(dist, ang_eff, amp, base_scaled, u.growth);
             ring_a = shape_ring_a(dist, ang_eff, amp, base_scaled, u.growth, u.half_thick);
-            front_a = magic_front(dist, u.base_r, u.spawn_t, 0.0);
+            front_a = magic_front(dist, base_r_eff, u.spawn_t, 0.0);
             if (dist > edge_out) {
                 let h_t = max(0.0, edge_out + u.halo - dist) / u.halo;
                 halo_a = min(1.0, h_t * amp) * u.halo_strength;
@@ -1035,7 +1288,7 @@ const SHADER_SRC: &str = stringify!(
                 var t = 0.0;
                 while (t <= trail_max) {
                     let ghost = vec2<f32>(px - vx * t * 0.05, py - vy * t * 0.05);
-                    let dd = in.pos.xy - ghost;
+                    let dd = p - ghost;
                     // Rotate into the sprite's local frame for shaped sprites.
                     let cs = cos(-spin);
                     let sn = sin(-spin);
@@ -1079,7 +1332,7 @@ const SHADER_SRC: &str = stringify!(
                 continue;
             }
             let wpos = vec2<f32>(wx, wy) * u.resolution;
-            let wd = in.pos.xy - wpos;
+            let wd = p - wpos;
             let wdist = length(wd);
             if (wtype == 0.0) {
                 // Ring widget: fully independent style from its own uniform fields.
@@ -1357,7 +1610,6 @@ const SHADER_SRC: &str = stringify!(
         }
         let wa = min(w_a, 1.0);
 
-        // Composite: rings + magic front + saturn band + particles + widgets (premultiplied).
         let pa = min(p_a, 1.0);
         let sat_col = vec3<f32>(0.75, 0.85, 1.0);
         let front_col = vec3<f32>(0.7, 0.8, 1.0) * front_a * u.alpha;
@@ -1366,9 +1618,248 @@ const SHADER_SRC: &str = stringify!(
         let base_col = mix(rgb * a, sat_col, sat_a / max(a + sat_a, 0.0001)) * (a + sat_a);
         let col = base_col + front_col + p_col * (1.0 - ring_alpha) + w_col;
         let alpha = a + sat_a + front_alpha + pa * (1.0 - min(a + sat_a, 1.0)) + wa * (1.0 - min(a + sat_a, 1.0));
-        if (alpha <= 0.004) {
+        return vec4<f32>(col, alpha);
+    }
+
+    fn scene_at(p: vec2<f32>) -> vec4<f32> {        let ring_c = ring_at(p);
+        var ring_rgb = ring_c.rgb;
+        let rgb_amt = u.lyric_fx[5];
+        if (rgb_amt > 0.001) {
+            let shift = vec2<f32>(1.25 * 0.9063, 1.25 * 0.4226) * rgb_amt;
+            let r = ring_at(p + shift);
+            let b = ring_at(p - shift);
+            ring_rgb = vec3<f32>(r.r, ring_rgb.g, b.b);
+        }
+        // ---- lyrics: per-word textured quads sampled from the lyric line textures ----
+        // Text (glyph quads) composites over the MG decoration layer (shape quads) exactly like
+        // folia's layer order, so decorative boxes never wash out the lyrics.
+        var lyr_col = vec3<f32>(0.0);
+        var lyr_a = 0.0;
+        var mg_col = vec3<f32>(0.0);
+        var mg_a = 0.0;
+        // Lens distortion + dispersion (folia sonnetLensFilter): barrel warp of the lyric
+        // sampling position; the per-glyph CA channel adds the RGB split (dispersion).
+        let lc = u.resolution * 0.5;
+        let ld0 = (p - lc) / max(u.resolution.x, u.resolution.y);
+        let lr2 = dot(ld0, ld0);
+        let lens = 0.03 + u.lyric_fx[4] * 0.04;
+        let lpos = lc + (p - lc) * (1.0 + lens * lr2);
+        // Fast reject: only pixels inside the lyrics' screen AABB run the per-quad loop.
+        if (u.lyric_enabled != 0u
+            && lpos.x >= u.lyric_bounds[0] && lpos.x <= u.lyric_bounds[2]
+            && lpos.y >= u.lyric_bounds[1] && lpos.y <= u.lyric_bounds[3]) {
+            for (var li = 0u; li < u.lyric_word_count; li = li + 1u) {
+                let lo = li * 20u;
+                let lslot = u.lyric_words[lo];
+                let luv_x = u.lyric_words[lo + 1u];
+                let luv_y = u.lyric_words[lo + 2u];
+                let luv_w = u.lyric_words[lo + 3u];
+                let luv_h = u.lyric_words[lo + 4u];
+                let lw = u.lyric_words[lo + 5u];
+                let lh = u.lyric_words[lo + 6u];
+                let lx = u.lyric_words[lo + 7u];
+                let ly = u.lyric_words[lo + 8u];
+                let lscale = u.lyric_words[lo + 9u];
+                let lalpha = u.lyric_words[lo + 10u];
+                let lrot = u.lyric_words[lo + 11u];
+                let lv0 = vec2<f32>(u.lyric_words[lo + 16u], u.lyric_words[lo + 17u]);
+                let lv1 = vec2<f32>(u.lyric_words[lo + 18u], u.lyric_words[lo + 19u]);
+                let ltint = vec4<f32>(u.lyric_words[lo + 12u], u.lyric_words[lo + 13u], u.lyric_words[lo + 14u], u.lyric_words[lo + 15u]);
+                if (lalpha <= 0.004 || lw <= 0.0 || lh <= 0.0) {
+                    continue;
+                }
+                // Coarse axis-aligned reject: skip the rotation/slot work for far quads.
+                let lhalf_w = lw * lscale * 0.72;
+                let lhalf_h = lh * lscale * 0.72;
+                if (lpos.x < lx - lhalf_w || lpos.x > lx + lhalf_w || lpos.y < ly - lhalf_h || lpos.y > ly + lhalf_h) {
+                    continue;
+                }
+                let ld = lpos - vec2<f32>(lx, ly);
+                let lcs = cos(-lrot);
+                let lsn = sin(-lrot);
+                var llx = ld.x * lcs - ld.y * lsn;
+                var lly = ld.x * lsn + ld.y * lcs;
+                // Glitch: dual-band slice displacement with hard-step gating, bidirectional
+                // offset and brightness tearing (folia sonnetGlitchFilter).
+                var tear: f32 = 0.0;
+                if (u.lyric_fx[1] > 0.0) {
+                    let gstep = floor(u.lyric_time * 8.0);
+                    let gseed = fract(gstep * 0.173 + 0.0001);
+                    let g1 = hash01(vec2<f32>(floor(p.y / 26.0) * 0.71, gseed * 7.0));
+                    let g2 = hash01(vec2<f32>(floor(p.y / 110.0) * 1.7, gseed * 13.0));
+                    let gate1 = step(0.58, g1);
+                    let gate2 = step(0.88, g2);
+                    let dir1 = sign(g1 - 0.5);
+                    let dir2 = sign(g2 - 0.5);
+                    llx = llx + (gate1 * dir1 * 0.095 + gate2 * dir2 * 0.035) * u.lyric_fx[1] * lw;
+                    lly = lly + gate2 * dir2 * 0.02 * u.lyric_fx[1] * lh;
+                    tear = gate1 * 0.42;
+                }
+                // `lslot` carries the glow intensity; sentinels draw shapes instead of glyphs.
+                if (lslot >= 252.0 && lslot < 254.0) {
+                    // Filled triangle (MG decoration). Vertices are stage-local px relative to
+                    // the bbox centre (lv0/lv1 in `ext`, v2 in `uv[0..1]`); the quad is centred
+                    // on the bbox so `ld` already lands inside the triangle's local frame.
+                    let lv2 = vec2<f32>(luv_x, luv_y);
+                    let tpos = vec2<f32>(llx, lly);
+                    let sd = sd_triangle(lv0, lv1, lv2, tpos);
+                    let tri_a = smoothstep(1.5, -1.5, sd) * ltint.a * lalpha;
+                    mg_col += ltint.rgb * tri_a;
+                    mg_a += tri_a;
+                    continue;
+                }
+                if (lslot >= 255.0) {
+                    // Fully-rounded pill (translation bar).
+                    let r = min(lw, lh) * 0.5;
+                    let half = vec2<f32>(lw, lh) * 0.5 * lscale;
+                    let d = abs(vec2<f32>(llx, lly)) - half + vec2<f32>(r, r);
+                    let sd = length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
+                    let pill_a = smoothstep(1.5, -1.5, sd) * ltint.a * lalpha;
+                    mg_col += ltint.rgb * pill_a;
+                    mg_a += pill_a;
+                    continue;
+                }
+                if (lslot >= 254.0) {
+                    // Low-corner-radius filled rect (frame decor bars / ornaments).
+                    let r = min(lw, lh) * 0.12;
+                    let half = vec2<f32>(lw, lh) * 0.5 * lscale;
+                    let d = abs(vec2<f32>(llx, lly)) - half + vec2<f32>(r, r);
+                    let sd = length(max(d, vec2<f32>(0.0))) + min(max(d.x, d.y), 0.0) - r;
+                    let rect_a = smoothstep(1.5, -1.5, sd) * ltint.a * lalpha;
+                    mg_col += ltint.rgb * rect_a;
+                    mg_a += rect_a;
+                    continue;
+                }
+                let half = vec2<f32>(lw, lh) * 0.5 * lscale;
+                if (abs(llx) <= half.x && abs(lly) <= half.y) {
+                    let uv = vec2<f32>(
+                        luv_x + (llx / (half.x * 2.0) + 0.5) * luv_w,
+                        luv_y + (lly / (half.y * 2.0) + 0.5) * luv_h,
+                    );
+                    // SDF glyph: 0.5 = glyph edge; aa in SDF units for a ~1px edge.
+                    let s = lw / 128.0;
+                    let aa = clamp(1.0 / (32.0 * s), 0.004, 0.25);
+                    // Blur: cross-tap the SDF (transition "fast-blur").
+                    var d = textureSample(lyric_texture, widget_sampler, uv).r;
+                    if (u.lyric_fx[0] > 0.0) {
+                        let bstep = (u.lyric_fx[0] * 14.0 / max(half.x * 2.0, 1.0)) * luv_w;
+                        let dv = (u.lyric_fx[0] / max(half.y * 2.0, 1.0)) * luv_h;
+                        let d1 = textureSample(lyric_texture, widget_sampler, uv + vec2<f32>(bstep, 0.0)).r;
+                        let d2 = textureSample(lyric_texture, widget_sampler, uv - vec2<f32>(bstep, 0.0)).r;
+                        let d3 = textureSample(lyric_texture, widget_sampler, uv + vec2<f32>(0.0, dv)).r;
+                        let d4 = textureSample(lyric_texture, widget_sampler, uv - vec2<f32>(0.0, dv)).r;
+                        d = (d + d1 + d2 + d3 + d4) * 0.2;
+                    }
+                    var cov = smoothstep(0.5 - aa, 0.5 + aa, d);
+                    // RGB shift + chromatic aberration: per-quad entry amount (`ext[0]`) plus a
+                    // constant base print shift along the 25° axis (folia rgbShift 0.9063/0.4226).
+                    let ca_amt = lv0.x + u.lyric_fx[4] + 0.02;
+                    if (ca_amt > 0.001) {
+                        let ca = ca_amt * (luv_w * 0.05);
+                        let shift = vec2<f32>(ca * 0.9063, ca * 0.4226);
+                        let d_r = textureSample(lyric_texture, widget_sampler, uv + shift).r;
+                        let d_b = textureSample(lyric_texture, widget_sampler, uv - shift).r;
+                        let cov_r = smoothstep(0.5 - aa, 0.5 + aa, d_r);
+                        let cov_b = smoothstep(0.5 - aa, 0.5 + aa, d_b);
+                        cov = (cov_r + cov + cov_b) * (1.0 / 3.0);
+                    }
+                    var col = ltint.rgb * cov;
+                    // Brightness tearing (folia: color *= 1 + tear*0.42).
+                    col = col * (1.0 + tear * 0.42);
+                    var a = cov * ltint.a * lalpha;
+                    // Glow: a soft outside halo peaking at the glyph edge (SDF 0.5) and
+                    // fading outward over `band` (~4px). Zero far from the glyph — empty
+                    // space never renders as a box. Strength matches folia glowAlpha (≤0.62).
+                    if (lslot > 0.0) {
+                        let g_band = 0.12;
+                        let g_a = smoothstep(0.5 - g_band, 0.5, d) * lslot * 0.62 * (1.0 + u.lyric_fx[3]);
+                        col += ltint.rgb * g_a;
+                        a += g_a * ltint.a * lalpha;
+                    }
+                    // Contrast push.
+                    if (u.lyric_fx[3] > 0.0) {
+                        // Contrast: additive amount 0..1 → up to a 2x matrix multiplier
+                        // (folia: postProcessContrast*0.5, e.g. 0.35 → ~1.5x).
+                        col = clamp((col - 0.5) * (1.0 + u.lyric_fx[3]) + 0.5, vec3<f32>(0.0), vec3<f32>(1.0));
+                    }
+                    // Film grain on the lyric alpha.
+                    if (u.lyric_fx[2] > 0.0) {
+                        let nz = (hash01(p * 0.39) - 0.5) * u.lyric_fx[2];
+                        a = max(0.0, a + cov * nz);
+                    }
+                    lyr_col += col * lalpha;
+                    lyr_a += a;
+                }
+            }
+        }
+        // MG decoration composites behind the text (alpha-over in quad-pass order).
+        let mg_a_c = min(mg_a, 1.0);
+        var lyr_col_final = mg_col + lyr_col * (1.0 - mg_a_c);
+        var lyr_alpha = mg_a_c + min(lyr_a, 1.0) * (1.0 - mg_a_c);
+
+
+        // Lyrics render on top of everything (foreground over the ring background).
+        var fin_col = ring_rgb + lyr_col_final * (1.0 - min(ring_c.a, 1.0));
+        var fin_alpha = ring_c.a + lyr_alpha * (1.0 - min(ring_c.a, 1.0));
+        // Full-scene print pass (folia PrintFilters): vignette toward opaque black + a CMYK
+        // dot screen. Both scale with their tuning channels and vanish when post is off.
+        {
+            let ndv = (p / u.resolution) - vec2<f32>(0.5);
+            let dvv = length(ndv);
+            let vig = smoothstep(0.52, 1.08, dvv) * u.lyric_fx[7] * 0.6;
+            if (vig > 0.001) {
+                fin_col = mix(fin_col, vec3<f32>(0.0), vig);
+                fin_alpha = max(fin_alpha, vig);
+            }
+            let ht_strength = u.lyric_fx[6];
+            if (ht_strength > 0.001) {
+                // CMYK dot screen approximation (folia: 15°/75°/0° channels, cell 5).
+                let cell = 5.0;
+                var ht_mask: f32 = 1.0;
+                let channels = array<f32, 3>(0.2618, 1.309, 0.0);
+                for (var ci2 = 0u; ci2 < 3u; ci2 = ci2 + 1u) {
+                    let ha = channels[ci2];
+                    let rot_p = vec2<f32>(p.x * cos(ha) + p.y * sin(ha), -p.x * sin(ha) + p.y * cos(ha));
+                    let ci = floor(rot_p / cell);
+                    let ccenter = (ci + vec2<f32>(0.5)) * cell;
+                    let cc = vec2<f32>(ccenter.x * cos(ha) - ccenter.y * sin(ha), ccenter.x * sin(ha) + ccenter.y * cos(ha));
+                    let dd = length(p - cc);
+                    let dot_r = cell * 0.62 * 0.5 * sqrt(hash01(ci + vec2<f32>(f32(ci2), 0.0)));
+                    let dot = smoothstep(dot_r + 0.8, dot_r - 0.8, dd);
+                    ht_mask *= mix(1.0, dot, ht_strength * 0.5);
+                }
+                fin_col *= mix(1.0, ht_mask, ht_strength);
+                fin_alpha *= mix(1.0, ht_mask, ht_strength);
+            }
+        }
+        if (fin_alpha <= 0.004) {
             return vec4<f32>(0.0, 0.0, 0.0, 0.0);
         }
-        return vec4<f32>(col * alpha, alpha);
+        // `fin_col` is already premultiplied (ring + lyric layers are all built
+        // premultiplied); multiplying by `fin_alpha` again would dim every
+        // semi-transparent pixel by its own alpha. The surface alpha mode is
+        // PreMultiplied, so write the color as-is.
+        return vec4<f32>(fin_col, fin_alpha);
+    }
+
+    @fragment
+    fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+        // scene_at applies the full-screen RGB shift to the ring background only (R/B at
+        // ±1.25px on the 25° axis) while the lyric loop stays single-pass.
+        return scene_at(in.pos.xy);
     }
 );
+
+#[cfg(test)]
+mod tests {
+    /// The embedded WGSL must parse and validate, otherwise the renderer fails at runtime.
+    #[test]
+    fn shader_is_valid_wgsl() {
+        let module = naga::front::wgsl::parse_str(crate::draw::SHADER_SRC).expect("wgsl parse");
+        let mut validator = naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        );
+        validator.validate(&module).expect("wgsl validate");
+    }
+}

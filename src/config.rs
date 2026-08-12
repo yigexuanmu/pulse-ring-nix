@@ -7,6 +7,39 @@
 
 use std::path::Path;
 
+/// Lyric animation style. `Off` keeps the original ring-only behaviour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LyricStyle {
+    /// No lyrics; the music-reactive ring runs as usual.
+    Off,
+    /// "商籁" — cinematic paragraph/shot lyric animation (ported from folia sonnet).
+    Sonnet,
+}
+
+impl Default for LyricStyle {
+    fn default() -> Self {
+        LyricStyle::Off
+    }
+}
+
+/// Parse a style name (English or Chinese alias) into a `LyricStyle`.
+pub fn parse_lyric_style(s: &str) -> Option<LyricStyle> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "off" | "none" | "关" | "关掉" | "关闭" => Some(LyricStyle::Off),
+        "sonnet" | "商籁" | "十四行诗" => Some(LyricStyle::Sonnet),
+        _ => None,
+    }
+}
+
+impl LyricStyle {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LyricStyle::Off => "off",
+            LyricStyle::Sonnet => "sonnet",
+        }
+    }
+}
+
 /// A placed widget on the wallpaper layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WidgetType {
@@ -334,6 +367,30 @@ pub struct Config {
     // ---- position ----
     pub x_offset: f32,
     pub y_offset: f32,
+    // ---- lyrics ----
+    /// Lyric animation style: off / sonnet.
+    pub style: LyricStyle,
+    /// Lyric source id passed to lyric_sources.py (lrclib / netease / ttml / ...).
+    pub lyric_source: String,
+    /// Optional per-track TTML lyric URL (used when `lyricSource: "ttml"`).
+    pub ttml_url: String,
+    /// Sonnet MG decoration toggles (folia's showBackgroundMg / showFixedGeo / showBackgroundDecor).
+    pub mg_bg: bool,
+    pub mg_fixed: bool,
+    pub mg_decor: bool,
+    /// Sonnet post-processing tuning (folia postProcessEnabled / grain / contrast / lens).
+    pub post_enabled: bool,
+    pub post_grain: f32,
+    pub post_contrast: f32,
+    pub post_lens: f32,
+    /// Manual global font weight override (folia normalizeFontWeight; 0 = per-role auto).
+    pub font_weight: f32,
+    /// Full-screen RGB shift amount (folia postProcessRgbShift).
+    pub post_rgb_shift: f32,
+    /// Halftone dot screen amount (folia postProcessHalftone).
+    pub post_halftone: f32,
+    /// Full-scene vignette amount (folia postProcessVignette).
+    pub post_vignette: f32,
 }
 
 impl Default for Config {
@@ -392,6 +449,20 @@ impl Default for Config {
             smoothness: 2.0,
             x_offset: 0.0,
             y_offset: 0.0,
+            style: LyricStyle::Off,
+            lyric_source: "netease".to_string(),
+            ttml_url: String::new(),
+            mg_bg: true,
+            mg_fixed: true,
+            mg_decor: true,
+            post_enabled: true,
+            post_grain: 0.3,
+            post_contrast: 0.5,
+            post_lens: 0.5,
+            font_weight: 0.0,
+            post_rgb_shift: 0.0,
+            post_halftone: 0.15,
+            post_vignette: 0.4,
         }
     }
 }
@@ -885,6 +956,78 @@ fn apply(cfg: &mut Config, key: &str, v: &Val) {
                 cfg.lua_script = Some(s.clone());
             }
         }
+        "style" | "lyricStyle" => {
+            if let Val::Str(s) = v {
+                if let Some(style) = parse_lyric_style(s) {
+                    cfg.style = style;
+                }
+            }
+        }
+        "lyricSource" | "lyricsSource" | "source" => {
+            if let Val::Str(s) = v {
+                cfg.lyric_source = s.trim().to_string();
+            }
+        }
+        "ttmlUrl" | "ttml" => {
+            if let Val::Str(s) = v {
+                cfg.ttml_url = s.trim().to_string();
+            }
+        }
+        "showBackgroundMg" | "showMgBg" | "mgBg" => {
+            if let Val::Bool(b) = v {
+                cfg.mg_bg = *b;
+            }
+        }
+        "showFixedGeo" | "showMgFixed" | "mgFixed" => {
+            if let Val::Bool(b) = v {
+                cfg.mg_fixed = *b;
+            }
+        }
+        "showBackgroundDecor" | "showMgDecor" | "mgDecor" => {
+            if let Val::Bool(b) = v {
+                cfg.mg_decor = *b;
+            }
+        }
+        "postProcessEnabled" | "postEnabled" | "post" => {
+            if let Val::Bool(b) = v {
+                cfg.post_enabled = *b;
+            }
+        }
+        "postGrain" | "postProcessGrain" | "grain" => {
+            if let Val::Num(n) = v {
+                cfg.post_grain = (*n).clamp(0.0, 1.0);
+            }
+        }
+        "postContrast" | "postProcessContrast" | "contrast" => {
+            if let Val::Num(n) = v {
+                cfg.post_contrast = (*n).clamp(0.0, 1.0);
+            }
+        }
+        "postLens" | "postProcessLens" | "lens" => {
+            if let Val::Num(n) = v {
+                cfg.post_lens = (*n).clamp(0.0, 1.0);
+            }
+        }
+        "fontWeight" | "fontWeightOverride" | "weight" => {
+            if let Val::Num(n) = v {
+                cfg.font_weight = (*n).clamp(0.0, 1000.0);
+            }
+        }
+        "postRgbShift" | "rgbShift" | "postProcessRgbShift" => {
+            if let Val::Num(n) = v {
+                cfg.post_rgb_shift = (*n).clamp(0.0, 1.0);
+            }
+        }
+        "postHalftone" | "halftone" | "postProcessHalftone" => {
+            if let Val::Num(n) = v {
+                cfg.post_halftone = (*n).clamp(0.0, 1.0);
+            }
+        }
+        "postVignette" | "vignette" | "postProcessVignette" => {
+            if let Val::Num(n) = v {
+                cfg.post_vignette = (*n).clamp(0.0, 1.0);
+            }
+        }
         "widgets" => {
             if let Val::Arr(items) = v {
                 cfg.widgets.clear();
@@ -975,7 +1118,7 @@ pub fn parse_for_test(src: &str) -> Config {
 /// Locate the config file: `$XDG_CONFIG_HOME/pulse-ring/pulse-ring.qml` (or
 /// `~/.config/...`), falling back to `./pulse-ring.qml`.
 /// Write the bundled default QML/Lua configs to ~/.config/pulse-ring/ on first run.
-fn ensure_defaults() {
+pub(crate) fn ensure_defaults() {
     let base = std::env::var("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| {
@@ -1024,4 +1167,106 @@ pub fn config_path() -> std::path::PathBuf {
         return local;
     }
     p
+}
+
+/// Rewrite the `style: "..."` key inside a pulse-ring QML config file. If the file has no
+/// `style` key yet, a line is inserted just before the root block's closing brace.
+pub fn set_style(path: &Path, style: LyricStyle) -> Result<(), String> {
+    let src = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let value = style.as_str();
+    let line = format!("    style: \"{value}\"");
+
+    // Replace an existing `style:` key (whitespace-flexible).
+    let mut replaced = false;
+    let mut out_lines: Vec<String> = Vec::new();
+    for raw in src.lines() {
+        let trimmed = raw.trim_start();
+        if !replaced {
+            let mut it = trimmed.split(':');
+            let key = it.next().unwrap_or("").trim();
+            if key == "style" || key == "lyricStyle" {
+                let indent = &raw[..raw.len() - raw.trim_start().len()];
+                out_lines.push(format!("{indent}style: \"{value}\""));
+                replaced = true;
+                continue;
+            }
+        }
+        out_lines.push(raw.to_string());
+    }
+
+    if !replaced {
+        // Insert before the root block's closing brace (the last `}` line).
+        let mut insert_at = out_lines.len();
+        for (i, l) in out_lines.iter().enumerate().rev() {
+            if l.trim() == "}" {
+                insert_at = i;
+                break;
+            }
+        }
+        out_lines.insert(insert_at, line);
+    }
+
+    let mut text = out_lines.join("\n");
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    std::fs::write(path, text).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+/// Read the currently configured style from a QML file (falls back to the parse result).
+pub fn current_style(path: &Path) -> LyricStyle {
+    match std::fs::read_to_string(path) {
+        Ok(src) => parse(&src).map(|c| c.style).unwrap_or_default(),
+        Err(_) => LyricStyle::default(),
+    }
+}
+
+/// CLI entry for `pulse-ring sonnet [true|false]`. No argument prints the current state;
+/// `true`/`on`/`1` enables the sonnet lyrics, `false`/`off`/`0` disables them. Rewrites the
+/// QML file so the setting applies on next launch.
+pub fn run_sonnet_subcommand(args: &[String]) {
+    use std::io::Write;
+    let mut out = std::io::stdout();
+    ensure_defaults();
+    let path = config_path();
+
+    let on = |style: LyricStyle| matches!(style, LyricStyle::Sonnet);
+
+    match args {
+        [] => {
+            let current = current_style(&path);
+            let _ = writeln!(
+                out,
+                "sonnet: {} (当前: {})\n用法: pulse-ring sonnet <true|false>",
+                on(current),
+                if on(current) { "商籁" } else { "关" }
+            );
+        }
+        [arg] => match arg.to_ascii_lowercase().as_str() {
+            "true" | "on" | "1" | "开" | "开启" => match set_style(&path, LyricStyle::Sonnet) {
+                Ok(()) => {
+                    let _ = writeln!(out, "已启用 sonnet（商籁）歌词动画 -> {}", path.display());
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "设置失败: {e}");
+                }
+            },
+            "false" | "off" | "0" | "关" | "关闭" => match set_style(&path, LyricStyle::Off) {
+                Ok(()) => {
+                    let _ = writeln!(out, "已关闭歌词动画（保留圆环）-> {}", path.display());
+                }
+                Err(e) => {
+                    let _ = writeln!(out, "设置失败: {e}");
+                }
+            },
+            other => {
+                let _ = writeln!(out, "未知参数 `{other}`，可用: true | false");
+            }
+        },
+        _ => {
+            let _ = writeln!(out, "用法: pulse-ring sonnet <true|false>");
+        }
+    }
 }

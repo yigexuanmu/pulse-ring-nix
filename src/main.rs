@@ -25,7 +25,12 @@ mod audio;
 mod config;
 mod draw;
 mod lua;
+mod lyrics;
+mod lyricstyles;
+mod lyricview;
 mod plugin;
+mod preview;
+mod sdf;
 use audio::NBANDS;
 use draw::RingRenderer;
 
@@ -72,6 +77,7 @@ struct App {
     cover_loaded: bool,
     cover_aspect: f32,
     current_cover: Option<ImageData>,
+    cover_uploaded: bool,
     cover_slot: usize,
     lua_state: lua::LuaState,
     plugins: Vec<plugin::LoadedPlugin>,
@@ -80,10 +86,48 @@ struct App {
     music: lua::MusicInfo,
     ring_amp_smooth: f32,
     last_music_poll: f32,
+    lyric_worker_tx: std::sync::mpsc::Sender<lyrics::TrackRequest>,
+    lyric_rx: std::sync::mpsc::Receiver<Result<lyrics::LyricData, String>>,
+    /// Parsed lyrics for the current track (None = no track / not matched yet).
+    lyrics: Option<lyrics::LyricData>,
+    /// Identity of the track whose lyrics are cached (title|artist).
+    lyric_key: String,
+    /// Playback position in microseconds, refreshed by a background thread.
+    pos_us: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    /// Smoothed playback position in seconds (lyric time).
+    pos_sec: f32,
+    /// SDF glyph atlas backing real-time lyric text.
+    glyph_atlas: sdf::GlyphAtlas,
+    /// Last time lyric diagnostics were logged (seconds since start).
+    last_lyric_log: f32,
+    /// Audio energy [bass, vocal, power] 0..1 for music-reactive lyric particles.
+    lyric_audio: [f32; 3],
+    /// Capture the first frame after startup to this path (PULSE_RING_CAPTURE=...).
+    capture_path: Option<String>,
+    capture_done: bool,
 }
 
 fn main() {
     env_logger::init();
+
+    // `pulse-ring sonnet [true|false]` — enable/disable the sonnet lyric animation.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(|s| s.as_str()) == Some("sonnet") {
+        config::run_sonnet_subcommand(&args[1..]);
+        return;
+    }
+    // `pulse-ring preview "<text>" [style] [time]` — headless PNG preview of the lyric layer.
+    if args.first().map(|s| s.as_str()) == Some("preview") {
+        let text = args.get(1).cloned().unwrap_or_else(|| "Hello world 你好世界".to_string());
+        let style = args.get(2).cloned().unwrap_or_else(|| "sonnet".to_string());
+        let time = args.get(3).and_then(|s| s.parse::<f32>().ok()).unwrap_or(2.5);
+        let path = args.get(4).cloned().unwrap_or_else(|| "/tmp/pulse-ring-preview.png".to_string());
+        match preview::render(&text, &style, time, &path) {
+            Ok(()) => println!("preview written to {path}"),
+            Err(e) => eprintln!("preview failed: {e}"),
+        }
+        return;
+    }
 
     let mut cfg = config::Config::load(&config::config_path());
     let audio_rx = audio::start_audio(cfg.sensitivity, cfg.decay);
@@ -127,6 +171,29 @@ fn main() {
 
     let lua_script = cfg.lua_script.clone();
     let lua_state = lua::LuaState::new(lua_script.as_deref(), &mut cfg);
+    let lyric_worker = lyrics::LyricWorker::spawn();
+    let pos_us: std::sync::Arc<std::sync::atomic::AtomicI64> =
+        std::sync::Arc::new(std::sync::atomic::AtomicI64::new(0));
+    {
+        let pos_us = pos_us.clone();
+        std::thread::Builder::new()
+            .name("pulse-ring-pos".into())
+            .spawn(move || loop {
+                let v = std::process::Command::new("playerctl")
+                    .args(["position"])
+                    .output()
+                    .ok()
+                    .filter(|o| o.status.success())
+                    .and_then(|o| String::from_utf8_lossy(&o.stdout).trim().parse::<f64>().ok())
+                    .map(|s| (s * 1_000_000.0) as i64);
+                if let Some(v) = v {
+                    pos_us.store(v, std::sync::atomic::Ordering::Relaxed);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            })
+            .expect("spawn position thread");
+    }
+    let font_data = crate::load_font_data();
     let mut app = App {
         compositor,
         layer_shell,
@@ -153,6 +220,7 @@ fn main() {
         cover_loaded: false,
         cover_aspect: 1.0,
         current_cover: None,
+        cover_uploaded: false,
         cover_slot: 0,
         lua_state,
         plugins: plugin::load_plugins_with_log(),
@@ -161,6 +229,31 @@ fn main() {
         music: lua::MusicInfo::default(),
         ring_amp_smooth: 0.0,
         last_music_poll: -10.0,
+        lyric_worker_tx: lyric_worker.tx,
+        lyric_rx: lyric_worker.rx,
+        lyrics: None,
+        lyric_key: String::new(),
+        pos_us,
+        pos_sec: 0.0,
+        glyph_atlas: sdf::GlyphAtlas::new_with_weights(
+            &font_data,
+            {
+                let bold = crate::load_font_data_bold();
+                if bold.is_empty() { None } else { Some(bold) }
+            }.as_deref(),
+            {
+                let black = crate::load_font_data_black();
+                if black.is_empty() { None } else { Some(black) }
+            }.as_deref(),
+            {
+                let light = crate::load_font_data_light();
+                if light.is_empty() { None } else { Some(light) }
+            }.as_deref(),
+        ).expect("glyph atlas"),
+        last_lyric_log: -10.0,
+        lyric_audio: [0.0; 3],
+        capture_path: std::env::var("PULSE_RING_CAPTURE").ok(),
+        capture_done: false,
     };
 
     // Wait for the first configure (outputs sized) via blocking dispatch, then switch to a
@@ -548,16 +641,51 @@ fn chrono_now() -> String {
 
 
 /// Simple RGBA image holder.
-#[derive(Clone)]
-struct ImageData {
-    w: u32,
-    h: u32,
-    rgba: Vec<u8>,
+#[derive(Clone, Debug)]
+pub(crate) struct ImageData {
+    pub w: u32,
+    pub h: u32,
+    pub rgba: Vec<u8>,
 }
 
-/// Load a system font for clock rendering (Noto Sans, fallback DejaVu).
-fn load_font() -> rusttype::Font<'static> {
-    // JetBrains Maple Mono (contains Chinese + Latin glyphs).
+/// Everything the lyric layer needs from the CPU per frame.
+struct LyricFrame {
+    enabled: bool,
+    time: f32,
+    words: Vec<[f32; 20]>,
+    /// Post-processing values for the lyric layer: [blur, glitch, noise, contrast].
+    fx: [f32; 8],
+    /// The SDF atlas gained glyphs this frame and should be re-uploaded to the renderer.
+    atlas_dirty: bool,
+}
+
+/// Virtual "♪" staff lines around the playhead for instrumental tracks without lyrics
+/// (folia's virtual-staff mode). Lines every 8s with a 6s window.
+fn virtual_staff(t: f32) -> lyrics::LyricData {
+    let start = ((t - 20.0) / 8.0).floor() as i64 * 8;
+    let mut lines = Vec::with_capacity(10);
+    for i in 0..10 {
+        lines.push(lyrics::LyricLine {
+            start_ms: (start + i as i64 * 8) * 1000,
+            duration_ms: 6000,
+            text: "♪".to_string(),
+            translation: String::new(),
+            romanization: String::new(),
+            chars: vec![],
+        });
+    }
+    lyrics::LyricData { source: "virtual-staff".to_string(), lines }
+}
+
+/// Load a system font for clock/lyric rendering (CJK-capable preferred).
+pub(crate) fn load_font() -> rusttype::Font<'static> {    let data = load_font_data();
+    font_from_bytes(data, true).unwrap_or_else(|| {
+        panic!("no usable system font found (install fontconfig + a CJK font, or set PULSE_RING_FONT)")
+    })
+}
+
+/// Resolve the font file bytes (CJK-capable preferred), via hard-coded paths then fontconfig.
+pub(crate) fn load_font_data() -> Vec<u8> {
     let candidates = [
         "/usr/share/fonts/TTF/JetBrains-Maple-Mono-NF-XX-XX/JetBrainsMapleMono-Regular.ttf",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
@@ -566,22 +694,114 @@ fn load_font() -> rusttype::Font<'static> {
     ];
     for p in candidates {
         if let Ok(data) = std::fs::read(p) {
-            if p.ends_with(".ttc") {
-                for idx in 0..8 {
-                    if let Some(f) = rusttype::Font::try_from_vec_and_index(data.clone(), idx) {
-                        if f.glyph('中').id().0 > 0 {
-                            return f;
-                        }
-                    }
-                }
-            } else if let Some(f) = rusttype::Font::try_from_vec(data) {
+            if let Some(f) = font_from_bytes(data.clone(), p.ends_with(".ttc")) {
                 if f.glyph('中').id().0 > 0 {
-                    return f;
+                    return data;
                 }
             }
         }
     }
-    panic!("no usable system font found");
+    // fontconfig fallback: resolve a CJK-capable font then a generic sans.
+    for pattern in ["sans:lang=zh-cn", "Noto Sans CJK SC", "sans-serif", "sans", "mono"] {
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}\n", pattern])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && s != "TrueType");
+        if let Some(path) = out {
+            if let Ok(data) = std::fs::read(&path) {
+                if let Some(f) = font_from_bytes(data.clone(), path.ends_with(".ttc")) {
+                    if f.glyph('中').id().0 > 0 || pattern.contains("sans") || pattern == "mono" {
+                        log::info!("font via fc-match: {path}");
+                        return data;
+                    }
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Resolve a bold font file (for the sonnet hero/semi-hero weight hierarchy). Returns empty
+/// when no bold face is available (callers fall back to regular).
+pub(crate) fn load_font_data_bold() -> Vec<u8> {
+    for pattern in ["sans:lang=zh-cn:weight=bold", "sans:weight=bold", "Noto Sans CJK SC Bold"] {
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}\n", pattern])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && s != "TrueType");
+        if let Some(path) = out {
+            if let Ok(data) = std::fs::read(&path) {
+                if !data.is_empty() {
+                    log::info!("bold font via fc-match: {path}");
+                    return data;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Black (weight 900) face for sonnet hero words (folia hero/semi = 900).
+pub(crate) fn load_font_data_black() -> Vec<u8> {
+    for pattern in ["sans:lang=zh-cn:weight=black", "sans:weight=black", "Noto Sans CJK SC Black"] {
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}\n", pattern])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && s != "TrueType");
+        if let Some(path) = out {
+            if let Ok(data) = std::fs::read(&path) {
+                if !data.is_empty() {
+                    log::info!("black font via fc-match: {path}");
+                    return data;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+/// Light (weight 300) face for sonnet decoration words (folia decoration = 300).
+pub(crate) fn load_font_data_light() -> Vec<u8> {
+    for pattern in ["sans:lang=zh-cn:weight=light", "sans:weight=light", "sans:weight=300", "Noto Sans CJK SC Light"] {
+        let out = std::process::Command::new("fc-match")
+            .args(["-f", "%{file}\n", pattern])
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .filter(|s| !s.is_empty() && s != "TrueType");
+        if let Some(path) = out {
+            if let Ok(data) = std::fs::read(&path) {
+                if !data.is_empty() {
+                    log::info!("light font via fc-match: {path}");
+                    return data;
+                }
+            }
+        }
+    }
+    Vec::new()
+}
+
+fn font_from_bytes(data: Vec<u8>, is_ttc: bool) -> Option<rusttype::Font<'static>> {
+    if is_ttc {
+        for idx in 0..8 {
+            if let Some(f) = rusttype::Font::try_from_vec_and_index(data.clone(), idx) {
+                return Some(f);
+            }
+        }
+        None
+    } else {
+        rusttype::Font::try_from_vec(data)
+    }
 }
 
 /// Decode a PNG file to RGBA.
@@ -812,6 +1032,7 @@ impl App {
                         self.cover_loaded = true;
                         self.cover_aspect = img.h as f32 / img.w as f32;
                         self.current_cover = Some(img);
+                        self.cover_uploaded = false;
                         log::info!("cover: new cover stored ({}x{})", self.cover_aspect, 0);
                     }
                 }
@@ -880,26 +1101,215 @@ impl App {
 
     /// Refresh MPRIS music info (throttled by the cover thread cadence: cheap anyway).
     fn poll_music(&mut self) {
-        let out = std::process::Command::new("playerctl")
-            .args(["metadata", "xesam:title"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        if let Some(t) = out {
-            if self.music.title != t {
-                self.music.title = t;
+        let meta = |key: &str| -> String {
+            std::process::Command::new("playerctl")
+                .args(["metadata", key])
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .filter(|s| !s.is_empty())
+                .unwrap_or_default()
+        };
+        let title = meta("xesam:title");
+        let artist = meta("xesam:artist");
+        let album = meta("xesam:album");
+        let duration_us = meta("mpris:length")
+            .parse::<i64>()
+            .unwrap_or(0);
+
+        let music_changed = !title.is_empty() && self.music.title != title;
+        if !title.is_empty() {
+            self.music.title = title.clone();
+        }
+        if !artist.is_empty() {
+            self.music.artist = artist.clone();
+        }
+
+        // Lyric fetching only matters when a lyric style is active.
+        if self.cfg.style != config::LyricStyle::Off && music_changed {
+            self.request_lyrics(lyrics::TrackRequest {
+                title,
+                artist,
+                album,
+                duration_ms: duration_us / 1000,
+                source: self.cfg.lyric_source.clone(),
+                ttml_url: self.cfg.ttml_url.clone(),
+            });
+        }
+
+        // Drain any finished lyric fetches.
+        while let Ok(result) = self.lyric_rx.try_recv() {
+            match result {
+                Ok(data) => {
+                    log::info!("lyrics: {} lines from {}", data.lines.len(), data.source);
+                    self.lyrics = Some(data);
+                }
+                Err(e) => {
+                    log::info!("lyrics: {e}");
+                    self.lyrics = None;
+                }
             }
         }
-        let out = std::process::Command::new("playerctl")
-            .args(["metadata", "xesam:artist"])
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-        if let Some(a) = out {
-            self.music.artist = a;
+    }
+
+    /// Send a lyric fetch for `req` unless one is already pending/cached for the same track.
+    fn request_lyrics(&mut self, req: lyrics::TrackRequest) {
+        let key = req.key();
+        if self.lyric_key == key {
+            return; // already fetched or in flight
         }
+        self.lyric_key = key;
+        self.lyrics = None;
+        let _ = self.lyric_worker_tx.send(req);
+    }
+
+    /// Smooth the playback position toward the MPRIS value (refreshed ~6x/s).
+    fn update_pos(&mut self, dt: f32) {
+        let target = self.pos_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1_000_000.0;
+        self.pos_sec += (target - self.pos_sec) * (dt * 3.0).min(1.0);
+    }
+
+    /// Index of the lyric line active at `pos_sec`, or None when the song hasn't started.
+    fn active_lyric_index(&self) -> Option<usize> {
+        let data = self.lyrics.as_ref()?;
+        if data.lines.is_empty() {
+            return None;
+        }
+        let t = self.pos_sec;
+        let mut idx = None;
+        for (i, l) in data.lines.iter().enumerate() {
+            if (l.start_ms as f32 / 1000.0) <= t {
+                idx = Some(i);
+            }
+        }
+        idx
+    }
+
+    /// Everything the renderer needs this frame: whether lyrics are enabled, the playback
+    /// time, per-char quads, and whether the SDF atlas gained glyphs that must be uploaded.
+    fn compute_lyric_frame(&mut self, width: u32, height: u32) -> LyricFrame {
+        let empty = LyricFrame {
+            enabled: false,
+            time: self.pos_sec,
+            words: Vec::new(),
+            fx: [0.0; 8],
+            atlas_dirty: false,
+        };
+        let style = self.cfg.style;
+        if style == config::LyricStyle::Off {
+            return empty;
+        }
+        let t = self.pos_sec;
+        // Instrumental fallback: when no lyrics were fetched, sonnet animates a virtual
+        // "♪" staff (folia's virtual staff lines) so the scene never sits empty.
+        let mut virtual_data: Option<lyrics::LyricData> = None;
+        let active_idx = match self.active_lyric_index() {
+            Some(i) => i,
+            None => {
+                if style == config::LyricStyle::Sonnet {
+                    virtual_data = Some(virtual_staff(t));
+                    0
+                } else {
+                    return empty;
+                }
+            }
+        };
+        let translation: String;
+        // Ensure glyphs for a visible window around the playhead + the active translation.
+        {
+            let data = match &self.lyrics {
+                Some(d) => d,
+                None => virtual_data.as_ref().expect("virtual staff"),
+            };
+            translation = data.lines[active_idx].translation.clone();
+            let mut lo = active_idx;
+            while lo > 0 && (data.lines[lo - 1].start_ms as f32 / 1000.0) >= t - 30.0 {
+                lo -= 1;
+            }
+            let mut hi = active_idx;
+            while hi + 1 < data.lines.len() && (data.lines[hi + 1].start_ms as f32 / 1000.0) <= t + 30.0 {
+                hi += 1;
+            }
+            for i in lo..=hi {
+                // Sonnet emits glyphs at all four role weights (900/700/500/300); the atlas
+                // must rasterise the same char set for each, or those quads get skipped.
+                self.glyph_atlas.ensure_text(&data.lines[i].text, 0);
+                self.glyph_atlas.ensure_text(&data.lines[i].text, 1);
+                self.glyph_atlas.ensure_text(&data.lines[i].text, 2);
+                self.glyph_atlas.ensure_text(&data.lines[i].text, 3);
+            }
+            self.glyph_atlas.ensure_text(&translation, 0);
+            self.glyph_atlas.ensure_text(&translation, 1);
+            self.glyph_atlas.ensure_text(&translation, 2);
+            self.glyph_atlas.ensure_text(&translation, 3);
+        }
+
+        let atlas_dirty = self.glyph_atlas.is_dirty();
+        let colors = lyricview::LyricColors::default();
+        let seed = self.lyric_key.bytes().fold(0x100000001b3, |h, b| (h ^ b as u64).wrapping_mul(0x9E3779B97F4A7C15)) ^ active_idx as u64;
+        let ctx = lyricview::StyleCtx {
+            width: width as f32,
+            height: height as f32,
+            time: t,
+            atlas: &self.glyph_atlas,
+            colors: &colors,
+            seed,
+            mg_bg: self.cfg.mg_bg,
+            mg_fixed: self.cfg.mg_fixed,
+            mg_decor: self.cfg.mg_decor,
+            audio: self.lyric_audio,
+            post: if self.cfg.post_enabled {
+                [self.cfg.post_grain, self.cfg.post_contrast, self.cfg.post_lens, self.cfg.post_rgb_shift, self.cfg.post_halftone, self.cfg.post_vignette]
+            } else {
+                [0.0; 6]
+            },
+            font_weight: self.cfg.font_weight,
+        };
+        let quads = {
+            let data = match &self.lyrics {
+                Some(d) => d,
+                None => match &virtual_data {
+                    Some(v) => v,
+                    None => return LyricFrame { enabled: false, time: t, words: Vec::new(), fx: [0.0; 8], atlas_dirty },
+                },
+            };
+            let input = lyricview::StyleInput {
+                lines: &data.lines,
+                active_idx,
+                translation: &translation,
+                song_title: &self.music.title,
+                song_artist: &self.music.artist,
+                song_album: &self.music.album,
+            };
+            lyricview::build_frame(style, &ctx, &input)
+        };
+        LyricFrame {
+            enabled: true,
+            time: t,
+            words: quads.quads.iter().map(|q| q.to_array()).collect(),
+            fx: quads.fx.to_array(),
+            atlas_dirty,
+        }
+    }
+
+    /// Throttled lyric diagnostics for on-device debugging.
+    fn log_lyric_state(&mut self, frame: &LyricFrame, active_idx: Option<usize>) {
+        let now = self.start.elapsed().as_secs_f32();
+        if now - self.last_lyric_log < 2.0 {
+            return;
+        }
+        self.last_lyric_log = now;
+        log::info!(
+            "lyric-state style={:?} enabled={} active={:?} t={:.2} words={} atlas_cells={} dirty={}",
+            self.cfg.style,
+            frame.enabled,
+            active_idx,
+            frame.time,
+            frame.words.len(),
+            self.glyph_atlas.glyph_count(),
+            frame.atlas_dirty,
+        );
     }
 
     /// Ask each plugin to render its RGBA texture, then store into texture_slots for
@@ -968,6 +1378,8 @@ impl App {
                 }
             }
         }
+        // All renderers uploaded the latest SDF atlas this frame; reset the dirty flag.
+        self.glyph_atlas.clear_dirty();
     }
 
     fn pull_audio(&mut self) {
@@ -986,6 +1398,7 @@ impl App {
         }
 
         let elapsed = self.start.elapsed().as_secs_f32();
+        self.update_pos(0.033);
         if elapsed - self.last_music_poll > 2.0 {
             self.last_music_poll = elapsed;
             self.poll_music();
@@ -1040,18 +1453,42 @@ impl App {
 
         // Widgets need &mut self; do it before borrowing the renderer.
         let mut widgets = self.prepare_widgets(width, height);
+        // Audio triplet [bass, vocal, power] for music-reactive lyric particles.
+        {
+            let bass: f32 = render_bands[..16].iter().copied().sum::<f32>() / 16.0;
+            let vocal: f32 = render_bands[40..72].iter().copied().sum::<f32>() / 32.0;
+            let power: f32 = amp_avg;
+            self.lyric_audio = [bass.min(1.0), vocal.min(1.0), power.min(1.0)];
+        }
+        let lyric_frame = self.compute_lyric_frame(width, height);
+        let lyric_active = self.active_lyric_index();
+        self.log_lyric_state(&lyric_frame, lyric_active);
         let renderer = &mut self.outputs[idx].renderer;
-        // Cover texture: upload to every renderer independently (multi-monitor safe).
+        if lyric_frame.atlas_dirty {
+            renderer.upload_lyric_sdf(self.glyph_atlas.atlas_bytes());
+        }
+        renderer.set_lyrics(lyric_frame.enabled, lyric_frame.time, &lyric_frame.words);
+        renderer.set_lyrics_fx(lyric_frame.fx);
+        if let Some(path) = &self.capture_path {
+            if !self.capture_done && elapsed > 6.0 {
+                renderer.request_capture(path);
+                self.capture_done = true;
+            }
+        }
+        // Cover texture: upload only when a new cover arrived (not every frame).
         if let Some(img) = &self.current_cover {
-            if let Some((ux, uy, uw, uh)) = renderer.upload_texture(self.cover_tex_index, &img.rgba, img.w, img.h) {
-                log::info!("cover: uploaded slot={} uv=({:.3},{:.3},{:.3},{:.3})", self.cover_slot, ux, uy, uw, uh);
-                self.widget_uvs[self.cover_slot] = (ux, uy, uw, uh);
-                // also write into the local widgets array so this frame sees it
-                let wo = self.cover_slot * 40;
-                widgets[wo + 7] = ux;
-                widgets[wo + 8] = uy;
-                widgets[wo + 9] = uw;
-                widgets[wo + 10] = uh;
+            if !self.cover_uploaded {
+                if let Some((ux, uy, uw, uh)) = renderer.upload_texture(self.cover_tex_index, &img.rgba, img.w, img.h) {
+                    log::info!("cover: uploaded slot={} uv=({:.3},{:.3},{:.3},{:.3})", self.cover_slot, ux, uy, uw, uh);
+                    self.widget_uvs[self.cover_slot] = (ux, uy, uw, uh);
+                    // also write into the local widgets array so this frame sees it
+                    let wo = self.cover_slot * 40;
+                    widgets[wo + 7] = ux;
+                    widgets[wo + 8] = uy;
+                    widgets[wo + 9] = uw;
+                    widgets[wo + 10] = uh;
+                    self.cover_uploaded = true;
+                }
             }
         }
         // Upload every texture slot to THIS renderer every frame (multi-monitor safe):
@@ -1141,7 +1578,7 @@ impl App {
 }
 #[cfg(test)]
 mod tests {
-    use crate::config::{Config, parse_for_test};
+    use crate::config::parse_for_test;
 
     #[test]
     fn parse_widgets_works() {
@@ -1157,5 +1594,16 @@ PulseRing {
         for w in &cfg.widgets {
             println!("widget: {:?} x={} y={} size={} alpha={}", w.widget_type, w.x, w.y, w.size, w.alpha);
         }
+    }
+
+    #[test]
+    fn parse_style_works() {
+        use crate::config::{LyricStyle, parse_for_test, parse_lyric_style};
+        assert_eq!(parse_for_test("PulseRing { style: \"off\" }").style, LyricStyle::Off);
+        assert_eq!(parse_for_test("PulseRing { style: \"sonnet\" }").style, LyricStyle::Sonnet);
+        assert_eq!(parse_for_test("PulseRing { lyricStyle: \"商籁\" }").style, LyricStyle::Sonnet);
+        assert_eq!(parse_for_test("PulseRing { }").style, LyricStyle::Off);
+        assert_eq!(parse_lyric_style("商籁"), Some(LyricStyle::Sonnet));
+        assert_eq!(parse_lyric_style("nope"), None);
     }
 }

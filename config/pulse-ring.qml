@@ -5,6 +5,10 @@ PulseRing {
     // Lua 脚本（动态控制/自定义算法）
     luaScript: "~/.config/pulse-ring/pulse-ring.lua"
 
+    // ================= 歌词动画样式 =================
+    // off | sonnet(商籁) — 通过 `pulse-ring sonnet <true|false>` 切换
+    style: "off"
+
     // ================= 主环（外环）=================
     shape: "ring"
     corners: 5

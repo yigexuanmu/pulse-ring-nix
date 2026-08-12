@@ -33,6 +33,35 @@ Wayland 壁纸层上的音乐律动可视化（GPU 渲染，wgpu/Vulkan）。
 - **多显示器**：每台独立渲染
 - **音频**：PipeWire monitor 实时 FFT
 
+## 安装（Nix flake）
+
+```bash
+# 直接运行（不安装）
+nix run github:yigexuanmu/pulse-ring-nix
+
+# 临时进入 shell
+nix shell github:yigexuanmu/pulse-ring-nix -c pulse-ring
+```
+
+安装到系统（NixOS flake）：
+
+```nix
+{
+  inputs = {
+    pulse-ring = {
+      url = "github:yigexuanmu/pulse-ring-nix";
+      # 可选：复用你的 nixpkgs
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
+
+  # environment.systemPackages = [ inputs.pulse-ring.packages.${system}.default ];
+
+  # Home Manager
+  # home.packages = [ inputs.pulse-ring.packages.${system}.default ];
+}
+```
+
 ## 安装（Arch Linux）
 
 ```bash

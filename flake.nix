@@ -63,13 +63,8 @@
               install -Dm644 config/pulse-ring.lua "$out/share/pulse-ring/pulse-ring.lua"
               install -Dm644 LICENSE "$out/share/licenses/pulse-ring/LICENSE"
               wrapProgram "$out/bin/pulse-ring" \
-                --prefix LD_LIBRARY_PATH : "${pkgs.wayland}/lib:${pkgs.alsa-lib}/lib:${pkgs.libxkbcommon}/lib:${pkgs.vulkan-loader}/lib:${pkgs.mesa}/lib:${pkgs.libGL}/lib" \
-                --prefix VK_ICD_FILENAMES : "${
-                  pkgs.lib.concatStringsSep ":"
-                  (map
-                    (name: "${pkgs.mesa}/share/vulkan/icd.d/${name}")
-                    (builtins.attrNames (builtins.readDir "${pkgs.mesa}/share/vulkan/icd.d")))
-                }"
+                --prefix PATH : "${pkgs.lib.makeBinPath [ pkgs.pulseaudio ]}" \
+                --prefix LD_LIBRARY_PATH : "${pkgs.wayland}/lib:${pkgs.alsa-lib}/lib:${pkgs.libxkbcommon}/lib:${pkgs.vulkan-loader}/lib:${pkgs.mesa}/lib:${pkgs.libGL}/lib"
             '';
 
             meta = with pkgs.lib; {

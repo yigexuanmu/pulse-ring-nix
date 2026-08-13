@@ -18,6 +18,25 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+// Cache the per-shot lyric placements. Without this, build_placements is called every frame
+// and any per-frame non-determinism in the layout would make the "position shifts when the
+// next character comes" bug visible. With the cache, positions are locked to the shot.
+thread_local! {
+    static PLACEMENT_CACHE: std::cell::RefCell<std::collections::HashMap<(u64, usize), Vec<Placement>>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// Cached result of `compile_program` keyed by `(lines_ptr, lines_len, seed)`.
+/// The program only changes when the lyric lines themselves change, so re-running
+/// `compile_program` every frame was pure waste (sorts gaps, classifies paragraphs,
+/// picks shot kinds). Keyed by raw pointer + length so it's free to compute but
+/// invalidates automatically when the worker thread hands us a new `LyricData`.
+thread_local! {
+    static PROGRAM_CACHE: std::cell::RefCell<
+        std::collections::HashMap<(*const crate::lyrics::LyricLine, usize, u64), Program>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 // ---------------------------------------------------------------- roles
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -196,7 +215,7 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
     let mut para_start = 0usize;
     for i in 1..lines.len() {
         let gap = (lines[i].start_ms as f32 / 1000.0) - line_end(&lines[i - 1], Some(&lines[i]));
-        if gap >= gap_threshold || i - para_start >= 6 {
+        if gap >= gap_threshold || i - para_start >= 10 {
             para_bounds.push((para_start, i));
             para_start = i;
         }
@@ -220,11 +239,16 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
         let is_lift = !is_chorus && !is_break && (text_all.matches(['!', '?', '！', '？', '…']).count() >= 2 || para_words as f32 / para_dur.max(1.0) > 2.5);
         let is_outro = pe >= lines.len() && para_dur > 10.0;
         let _ = (is_lift, is_outro);
+        // Shot grouping thresholds. Previously (group.len() < 4 && dur <= 6s && para <= 18s)
+        // a 3-line CJK verse hit the 4-line cap immediately and created a new shot, which
+        // meant the camera + layout changed every ~4-6 seconds — far too often. Bumped
+        // to 6 lines / 10s per shot / 30s per paragraph so a typical verse fits in one
+        // shot and the scene stays stable long enough to read the lyrics.
         let mut group: Vec<usize> = Vec::new();
         let mut group_start: f32 = lines[ps].start_ms as f32 / 1000.0;
         for idx in ps..pe {
             let end = line_end(&lines[idx], lines.get(idx + 1));
-            let fits = group.len() < 4 && (end - group_start) <= 6.0 && (end - lines[ps].start_ms as f32 / 1000.0) <= 18.0;
+            let fits = group.len() < 6 && (end - group_start) <= 10.0 && (end - lines[ps].start_ms as f32 / 1000.0) <= 30.0;
             if group.is_empty() || fits {
                 group.push(idx);
             } else {
@@ -506,6 +530,7 @@ fn resolved_focus(ctx: &StyleCtx, placements: &[Placement], t: f32) -> (f32, f32
 
 // ---------------------------------------------------------------- placement
 
+#[derive(Debug, Clone)]
 struct Placement {
     text: String,
     role: Role,
@@ -689,8 +714,10 @@ fn build_placements(
             .iter()
             .enumerate()
             .map(|(idx, (text, start, end))| {
-                // folia decoration copies: 2.8–5.5× the hero, always giant.
-                let size = base * (hero_scale * 1.35).max(2.8).min(5.5);
+                // folia decoration copies: previously 2.8–5.5× the hero — way too big, the
+                // giant letters swamped the screen and cost a lot per frame to rasterize.
+                // Pulled down to 1.4–2.2× so they read as ambient decoration, not text.
+                let size = base * (hero_scale * 1.35).max(1.4).min(2.2);
                 let w = measure_text(ctx.atlas, text, size);
                 Placement {
                     text: text.clone(),
@@ -717,7 +744,9 @@ fn build_placements(
         // (folia clamp(fontScale*2.2, 1.8, 3.5)).
         if let Some(first_non_hero) = out.iter().find(|q| q.role != Role::Hero && !q.giant) {
             if let Some(first_hero) = out.iter().find(|q| q.role == Role::Hero) {
-                let size = base * (hero_scale * 2.2).max(1.8).min(3.5);
+                // dec2: a second, smaller echo of a non-hero word near the hero
+                // (folia clamp(fontScale*2.2, 1.8, 3.5) — also pulled down to match).
+                let size = base * (hero_scale * 2.2).max(1.1).min(1.6);
                 let w = measure_text(ctx.atlas, &first_non_hero.text, size);
                 out.push(Placement {
                     text: first_non_hero.text.clone(),
@@ -1191,16 +1220,33 @@ fn layout_poster_blocks(p: &mut [Placement], w: f32, h: f32, seed: u64) {
     p[hero].x = 0.0;
     p[hero].y = -h * 0.12;
     set_enter(&mut p[hero], 0.0, 0.0);
-    // Flow the rest into rows above/below the hero block.
+    // Flow the rest into rows above/below the hero block. The original layout put every
+    // word in rows stacked above the hero with no vertical safe-area check, so any
+    // Decoration/Support with size ~400–600 would land at y < -700 (safe area is ±0.46h
+    // = ±669px on a 1455-tall viewport) and be clipped off-screen. Now: wrap to the
+    // right side of the hero when the row walks off the top, so all non-hero words stay
+    // inside the safe area.
     let gap = 22.0;
     let safe_l = -w * 0.42;
     let safe_r = w * 0.42;
+    let safe_top = -h * 0.46;
     let mut row_y = p[hero].y - p[hero].h / 2.0 - gap;
     let mut cx = safe_l;
+    // side: 0 = pack on the left of the hero, 1 = pack on the right. We never go past 2
+    // columns — if a shot has more non-hero words than fit on both sides, fit_extent
+    // below will scale them down so the whole composition still fits the safe area.
+    let mut side: i32 = 0;
     for &i in (0..hero).chain(hero + 1..p.len()).collect::<Vec<_>>().iter() {
         if cx > safe_l && cx + p[i].w > safe_r {
             row_y -= p[i].h + gap;
-            cx = safe_l;
+            cx = if side == 0 { safe_l } else { safe_r - p[i].w };
+        }
+        // Walked off the top of the safe area: switch to the other side of the hero and
+        // start a fresh row just above the hero.
+        if row_y - p[i].h < safe_top {
+            side = 1 - side;
+            row_y = p[hero].y - p[hero].h / 2.0 - gap;
+            cx = if side == 0 { safe_l } else { safe_r - p[i].w };
         }
         p[i].x = cx + p[i].w / 2.0;
         p[i].y = row_y;
@@ -1322,17 +1368,77 @@ fn resolve_transition(kind: TransitionKind, phase: &str, progress: f32) -> Trans
 // ---------------------------------------------------------------- build_frame
 
 pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
+    let _t_total = std::time::Instant::now();
+    let _t0 = std::time::Instant::now();
     let scales = FontScales::from_height(ctx.height);
     let lines = input.lines;
-    let program = compile_program(lines, ctx.seed);
+    // compile_program is pure work (sorts gaps, classifies paragraphs, picks shot kinds)
+    // but the result only depends on `(lines, seed)`. The lyric worker hands us a fresh
+    // LyricData whenever the track changes, so keying by the slice's pointer + length
+    // invalidates the cache automatically without any extra plumbing.
+    let program = PROGRAM_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        let key = (lines.as_ptr(), lines.len(), ctx.seed);
+        if let Some(p) = cache.get(&key) {
+            p.clone()
+        } else {
+            let p = compile_program(lines, ctx.seed);
+            if cache.len() > 3 {
+                cache.clear();
+            }
+            cache.insert(key, p.clone());
+            p
+        }
+    });
+    let _t_compile = _t0.elapsed();
     let Some(shot_idx) = find_shot(&program, ctx.time) else {
         return StyleOutput::empty();
     };
     let shot = &program.shots[shot_idx];
     let base = scales.main;
     let t = ctx.time;
+    let _t1 = std::time::Instant::now();
 
-    let mut placements = build_placements(ctx, lines, shot, base, ctx.seed.wrapping_add(shot_idx as u64 * 0x9E37));
+    let cache_key = (ctx.seed, shot_idx);
+    let mut placements = PLACEMENT_CACHE.with(|c| {
+        let mut cache = c.borrow_mut();
+        if let Some(cached) = cache.get(&cache_key) {
+            cached.clone()
+        } else {
+            let new = build_placements(ctx, lines, shot, base, ctx.seed.wrapping_add(shot_idx as u64 * 0x9E37));
+            // Bound the cache to the last 8 shots to keep memory in check.
+            if cache.len() > 8 {
+                cache.clear();
+            }
+            cache.insert(cache_key, new.clone());
+            new
+        }
+    });
+    let _t_placements = _t1.elapsed();
+    // Pre-warm the next shot's placements so the first frame after a transition
+    // doesn't pay the full `build_placements` cost. Without this, each shot boundary
+    // causes a visible frame stutter as ~10-15 placements are computed inline.
+    if let Some(next_shot) = program.shots.get(shot_idx + 1) {
+        let next_key = (ctx.seed, shot_idx + 1);
+        PLACEMENT_CACHE.with(|c| {
+            let mut cache = c.borrow_mut();
+            if !cache.contains_key(&next_key) {
+                let new = build_placements(
+                    ctx,
+                    lines,
+                    next_shot,
+                    base,
+                    ctx.seed.wrapping_add((shot_idx + 1) as u64 * 0x9E37),
+                );
+                if cache.len() > 8 {
+                    cache.clear();
+                }
+                cache.insert(next_key, new);
+            }
+        });
+    }
+    let mut _t_mg = std::time::Duration::ZERO;
+    let mut _t_cam = std::time::Duration::ZERO;
     if std::env::var("PULSE_RING_DEBUG_PREVIEW").is_ok() {
         eprintln!("sonnet: shot={shot_idx} kind={:?} lines={:?} placements={}", shot.kind, shot.line_range, placements.len());
         for (i, p) in placements.iter().enumerate().take(6) {
@@ -1449,6 +1555,20 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         }
     }
     let trans_alpha = trans_alpha.min(para_alpha);
+    // Quick fade-out in the last 0.18s of the shot (folia sonnet "quick disappearance"):
+    // the existing enter/exit transition alphas use the shot's twindow (often 0.14–0.24s)
+    // but they ease in/out, so the visible "fading away" portion is even shorter. This
+    // dedicated linear fade makes the shot's exit unambiguous instead of abrupt.
+    let fade_out_window = 0.18f32;
+    let time_to_end = shot.end - t;
+    let quick_fade = if time_to_end < fade_out_window && time_to_end > 0.0 {
+        (time_to_end / fade_out_window).clamp(0.0, 1.0)
+    } else if time_to_end <= 0.0 {
+        0.0
+    } else {
+        1.0
+    };
+    let trans_alpha = trans_alpha * quick_fade;
     let trans_pull = trans_pull.max(para_pull);
     let mut fx = LyricFx {
         blur: enter.blur.max(exit.blur),
@@ -1542,7 +1662,11 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
             off[0] -= cam_px * min_d * fit * depth * 0.9;
             off[1] -= cam_py * min_d * fit * depth * 0.9;
         }
-        let scale = fit * pop * (if p.role == Role::Hero { 1.0 + (1.0 - fly) * 0.2 } else { 1.0 });
+        // Full-word entrance scale (folia: 0.86 + fly*0.14) — applied to all roles so the
+        // post-transition entrance is visible. Hero keeps its extra 1.0 → 1.2 pop on top.
+        let enter_scale = 0.86 + fly * 0.14;
+        let hero_pop = if p.role == Role::Hero { 1.0 + (1.0 - fly) * 0.2 } else { 1.0 };
+        let scale = fit * pop * enter_scale * hero_pop;
         // folia resolveSonnetRoleFontWeight: manual global override else per-role weights.
         let weight = if ctx.font_weight > 0.0 {
             let w = ctx.font_weight.round();
@@ -1622,6 +1746,9 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
             Vec::new()
         };
         // Per-glyph settle scale (folia: 0.86 + fly*0.14; type-impact emphasis 0.52 + fly*0.48).
+        // Pulled in to 0.97 + fly*0.03 — the old 0.86 swing made each incoming character
+        // look like an "extra" glyph at a different position; the ripple is now a subtle
+        // breathing-in rather than a visible size jump.
         let char_scale: Vec<f32> = if p.giant || char_fly.is_empty() {
             Vec::new()
         } else {
@@ -1629,9 +1756,9 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
                 .iter()
                 .map(|&fly_i| {
                     if emphasis && shot.kind == ShotKind::TypeImpact {
-                        0.52 + fly_i * 0.48
+                        0.7 + fly_i * 0.3
                     } else {
-                        0.86 + fly_i * 0.14
+                        0.97 + fly_i * 0.03
                     }
                 })
                 .collect()
@@ -1834,6 +1961,7 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     let focus_track = 1.0;
     let cam_px_final = cam_px * min_d * fit - focus_x * cam_scale_f * focus_track + trans_pull * min_d * 0.05;
     let cam_py_final = cam_py * min_d * fit - focus_y * cam_scale_f * focus_track - trans_pull * min_d * 0.03;
+    let _t_cam_start = std::time::Instant::now();
     apply_camera_local(
         &mut out,
         ctx.width * 0.5,
@@ -1843,6 +1971,7 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         cam_py_final,
         cam_rot,
     );
+    _t_cam = _t_cam_start.elapsed();
 
     // Motion-graphics decorative background (folia's sonnetShotMg): HUD / geometric chaos /
     // fixed geometry / particles / scanlines. Built per shot and emitted with the same camera
@@ -1878,6 +2007,7 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         };
         let cache_key = (ctx.seed, shot_idx);
         let mut mg_out: Vec<CharQuad> = Vec::new();
+        let _t_mg_start = std::time::Instant::now();
         MG_CACHE.with(|c| {
             let mut map = c.borrow_mut();
             if map.len() > 3 {
@@ -1899,11 +2029,14 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
             });
             scene.emit(raw_progress, t, shot.start, shot.end, ctx.audio, &cam, &mut mg_out);
         });
-        // Text first, decoration after; under heavy load the decoration tail is dropped
-        // first so the lyrics always keep their full budget (additive blend, order neutral).
-        let mut combined = out;
-        combined.append(&mut mg_out);
-        const QUAD_BUDGET: usize = 240;
+        _t_mg = _t_mg_start.elapsed();
+        // Prepend MG decorations so the QUAD_BUDGET truncation drops the LYRIC tail,
+        // not the MG head. Without this, scanlines / HUD / geometric chaos are the first
+        // to be sliced off whenever a busy line produces >~200 lyric quads (which is
+        // almost always — a 12-char hero + 2 giant echoes + 5 supports ≈ 60 quads alone).
+        let mut combined = mg_out;
+        combined.append(&mut out);
+        const QUAD_BUDGET: usize = 1024;
         if combined.len() > QUAD_BUDGET {
             combined.truncate(QUAD_BUDGET);
         }
@@ -2023,6 +2156,54 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         }
     }
     fx.blur = fx.blur.max(outro_blur);
+
+    if std::env::var("PULSE_RING_DEBUG_PREVIEW").is_ok() {
+        let _t_total = _t_total.elapsed();
+        eprintln!("PERF total={:.2}ms compile={:.2}ms placements={:.2}ms cam={:.2}ms mg={:.2}ms n={}",
+            _t_total.as_secs_f64()*1000.0,
+            _t_compile.as_secs_f64()*1000.0,
+            _t_placements.as_secs_f64()*1000.0,
+            _t_cam.as_secs_f64()*1000.0,
+            _t_mg.as_secs_f64()*1000.0,
+            out.len());
+    }
+
+    // ---- folia drawOverlay: asymmetrical perimeter accents + floating cross/diamond/star.
+    // Drawn after lyrics + MG so they sit on top. Uses push_rect / push_line (SLOT_FRAME)
+    // which the shader renders as a low-corner-radius filled rect / line — no SDF needed.
+    {
+        use crate::lyricview::{push_circle, push_line, push_rect};
+        let w = ctx.width;
+        let h = ctx.height;
+        let pad_x = (30.0_f32).max(w * 0.05);
+        let pad_y = (30.0_f32).max(h * 0.05);
+        let primary = ctx.colors.primary;
+        let a_dim = 0.5_f32;
+        let a_bright = 0.8_f32;
+        let a_diamond = 0.7_f32;
+        // 1. Top-Left cluster: thick bar + dropping vertical line.
+        push_rect(&mut out, pad_x + 15.0, pad_y + 2.0, 30.0, 4.0, a_bright, primary);
+        push_line(&mut out, pad_x, pad_y + 16.0, pad_x, pad_y + 120.0, 1.0, a_dim, primary);
+        // 2. Bottom-Right cluster: thick vertical bar + horizontal line + rising line.
+        push_rect(&mut out, w - pad_x - 2.0, h - pad_y - 8.0, 4.0, 16.0, a_bright, primary);
+        push_line(&mut out, w - pad_x - 160.0, h - pad_y, w - pad_x - 20.0, h - pad_y, 1.0, a_dim, primary);
+        push_line(&mut out, w - pad_x, h - pad_y - 180.0, w - pad_x, h - pad_y - 30.0, 1.0, a_dim, primary);
+        // 3. Top-Right cross-hair (6px arms).
+        let cx = w - pad_x;
+        let cy = pad_y + 20.0;
+        push_line(&mut out, cx - 6.0, cy, cx + 6.0, cy, 1.0, a_bright, primary);
+        push_line(&mut out, cx, cy - 6.0, cx, cy + 6.0, 1.0, a_bright, primary);
+        // 4. Bottom-Left diamond (4px, filled). Approximated with a 45°-rotated thin rect.
+        let dx = pad_x;
+        let dy = h - pad_y;
+        push_rect(&mut out, dx, dy, 4.0, 4.0, a_diamond, primary);
+        // 5. Typographic star ✦ at bottom-right: render as a small filled circle with a
+        // brighter ring (folia uses the U+2726 glyph; a 3px dot reads the same visually
+        // and avoids rasterising yet another unicode codepoint into the SDF atlas).
+        let sx = w - pad_x - 10.0;
+        let sy = h - pad_y;
+        push_circle(&mut out, sx, sy, 3.0, 0.6, primary);
+    }
 
     StyleOutput { quads: out, fx }
 }

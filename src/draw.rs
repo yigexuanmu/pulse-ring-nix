@@ -376,7 +376,9 @@ impl RingRenderer {
 
     /// Number of active particles (loops less than the fixed 32 capacity).
     pub fn set_particle_count(&mut self, n: u32) {
-        self.particle_count_data = n.min(32);
+        // Buffer is 96 slots; let the CPU push the full configured count instead of
+        // silently dropping anything past 32.
+        self.particle_count_data = n.min(96);
     }
 
     /// Centre radius (px) of the particle band, for cheap rejection of pixels far from it.
@@ -455,11 +457,13 @@ impl RingRenderer {
         }
     }
 
-    /// Upload the single-channel SDF glyph atlas (one byte per pixel). Re-uploads when a new
-    /// glyph was rasterised (marked dirty by the CPU-side atlas).
-    pub fn upload_lyric_sdf(&mut self, data: &[u8]) {
-        use crate::sdf::ATLAS_PX;
-        if data.len() < ATLAS_PX * ATLAS_PX {
+    /// Upload dirty cells of the single-channel SDF glyph atlas. Each cell is CELL×CELL bytes
+    /// at offset `(idx % GRID) * CELL, (idx / GRID) * CELL` in the atlas. Uploading only the
+    /// changed cells instead of the whole 16MB atlas is the difference between 14ms TICK and
+    /// 1300–13000ms TICK when a new CJK character shows up.
+    pub fn upload_lyric_sdf(&mut self, data: &[u8], dirty_cells: &[usize]) {
+        use crate::sdf::{ATLAS_PX, CELL, GRID};
+        if data.len() < ATLAS_PX * ATLAS_PX || dirty_cells.is_empty() {
             return;
         }
         if self.lyric_texture.is_none() {
@@ -483,22 +487,40 @@ impl RingRenderer {
             self.refresh_texture_bindings();
         }
         let tex = self.lyric_texture.as_ref().unwrap();
-        let dst = wgpu::TexelCopyTextureInfo {
-            texture: tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d { x: 0, y: 0, z: 0 },
-            aspect: wgpu::TextureAspect::All,
-        };
-        let layout = wgpu::TexelCopyBufferLayout {
-            offset: 0,
-            bytes_per_row: Some(ATLAS_PX as u32),
-            rows_per_image: Some(ATLAS_PX as u32),
-        };
-        self.queue.write_texture(dst, data, layout, wgpu::Extent3d {
-            width: ATLAS_PX as u32,
-            height: ATLAS_PX as u32,
-            depth_or_array_layers: 1,
-        });
+        for &idx in dirty_cells {
+            if idx >= GRID * GRID {
+                continue;
+            }
+            let cx = (idx % GRID) * CELL;
+            let cy = (idx / GRID) * CELL;
+            // Copy CELL×CELL bytes from the CPU atlas to the GPU texture at (cx, cy).
+            // wgpu's write_texture requires contiguous bytes_per_row, so we slice one
+            // row at a time (16KB total per cell — vs the old 16MB full-atlas upload).
+            for row in 0..CELL {
+                let src_offset = (cy + row) * ATLAS_PX + cx;
+                let dst = wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d { x: cx as u32, y: (cy + row) as u32, z: 0 },
+                    aspect: wgpu::TextureAspect::All,
+                };
+                let layout = wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(CELL as u32),
+                    rows_per_image: Some(1),
+                };
+                self.queue.write_texture(
+                    dst,
+                    &data[src_offset..src_offset + CELL],
+                    layout,
+                    wgpu::Extent3d {
+                        width: CELL as u32,
+                        height: 1,
+                        depth_or_array_layers: 1,
+                    },
+                );
+            }
+        }
     }
 
     /// Upload an RGBA image into atlas slot `index` (each slot is 256x256 in a 8x8 grid).
@@ -1271,7 +1293,7 @@ const SHADER_SRC: &str = stringify!(
         // blow out to white; the ring mode has no trail ghosts to avoid self-overlap.
         var p_col = vec3<f32>(0.0);
         var p_a = 0.0;
-        if (u.particle_mode != 0u && abs(dist - u.particle_band_r) < min_d * 0.25) {
+        if (u.particle_mode != 0u && abs(dist - u.particle_band_r) < min_d * 0.5) {
             let trail_max = select(1.0, 0.0, u.particle_mode == 3u);
             for (var i = 0u; i < u.particle_count; i = i + 1u) {
                 let o = i * 12u;
@@ -1645,9 +1667,12 @@ const SHADER_SRC: &str = stringify!(
         let lens = 0.03 + u.lyric_fx[4] * 0.04;
         let lpos = lc + (p - lc) * (1.0 + lens * lr2);
         // Fast reject: only pixels inside the lyrics' screen AABB run the per-quad loop.
+        // Test against un-distorted `p` (the bounds are computed in un-distorted space);
+        // using the post-lens `lpos` would push near-edge pixels outside the AABB and
+        // clip thin slivers of lyrics at the corners.
         if (u.lyric_enabled != 0u
-            && lpos.x >= u.lyric_bounds[0] && lpos.x <= u.lyric_bounds[2]
-            && lpos.y >= u.lyric_bounds[1] && lpos.y <= u.lyric_bounds[3]) {
+            && p.x >= u.lyric_bounds[0] && p.x <= u.lyric_bounds[2]
+            && p.y >= u.lyric_bounds[1] && p.y <= u.lyric_bounds[3]) {
             for (var li = 0u; li < u.lyric_word_count; li = li + 1u) {
                 let lo = li * 20u;
                 let lslot = u.lyric_words[lo];
@@ -1753,7 +1778,11 @@ const SHADER_SRC: &str = stringify!(
                     var cov = smoothstep(0.5 - aa, 0.5 + aa, d);
                     // RGB shift + chromatic aberration: per-quad entry amount (`ext[0]`) plus a
                     // constant base print shift along the 25° axis (folia rgbShift 0.9063/0.4226).
-                    let ca_amt = lv0.x + u.lyric_fx[4] + 0.02;
+                    // RGB shift + chromatic aberration: per-quad entry amount (`ext[0]`) plus a
+                    // dispersion from the FX channel — but only when FX actually requests
+                    // CA. The previous unconditional `+ 0.02` baseline shifted every glyph
+                    // even with CA off, hurting small support-word readability.
+                    let ca_amt = lv0.x + max(u.lyric_fx[4], 0.0) * 0.04;
                     if (ca_amt > 0.001) {
                         let ca = ca_amt * (luv_w * 0.05);
                         let shift = vec2<f32>(ca * 0.9063, ca * 0.4226);

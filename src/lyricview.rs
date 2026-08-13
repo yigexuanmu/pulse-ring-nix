@@ -154,18 +154,31 @@ fn is_cjk_char(c: char) -> bool {
     matches!(c, '\u{4E00}'..='\u{9FFF}' | '\u{3040}'..='\u{30FF}' | '\u{AC00}'..='\u{D7AF}')
 }
 
-/// Split a line into display words: CJK characters each become their own word; Latin/digit
-/// runs group into words; punctuation sticks to the preceding word (folia's sticky segments).
+/// Split a line into display words. The key rule for CJK is that **consecutive CJK
+/// characters stay grouped as one word** — per-character fly-in is handled inside
+/// `push_word_full` by iterating the word's `chars()`. Splitting "你好世界" into four
+/// single-character words caused the giant-decoration pass to copy the *hero character*
+/// (e.g. "好") as a background echo at 1.4-2.2× — the user saw the same glyph rendered
+/// twice simultaneously. Latin/digit runs group into words; punctuation sticks to the
+/// preceding word (folia's sticky segments).
 pub fn segment_words(line: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut cur: Option<String> = None;
     for token in line.split_whitespace() {
         for ch in token.chars() {
             if is_cjk_char(ch) {
-                if let Some(w) = cur.take() {
-                    out.push(w);
+                match &mut cur {
+                    // Extend a CJK run that was already started this token.
+                    Some(w) if w.chars().next().map(is_cjk_char).unwrap_or(false) => {
+                        w.push(ch);
+                    }
+                    _ => {
+                        if let Some(w) = cur.take() {
+                            out.push(w);
+                        }
+                        cur = Some(ch.to_string());
+                    }
                 }
-                out.push(ch.to_string());
             } else if ch.is_alphanumeric() {
                 let mut w = cur.take().unwrap_or_default();
                 w.push(ch);
@@ -634,7 +647,10 @@ impl FontScales {
     pub fn from_height(height: f32) -> Self {
         let min_d = height;
         Self {
-            main: min_d * 0.12,
+            // Bumped from 0.12 → 0.16 to match folia's `5.4vw` main lyric size on a 1080p+
+            // screen (folia uses clamp(2rem, 5.4vw, 5.6rem); 0.16 × 1455 ≈ 233px ≈ 5.4vw
+            // at 2560 screen width). Bigger main = more readable, no more "tiny hero".
+            main: min_d * 0.16,
             context: min_d * 0.078,
             subtitle: min_d * 0.04,
         }

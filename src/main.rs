@@ -81,7 +81,10 @@ struct App {
     cover_slot: usize,
     lua_state: lua::LuaState,
     plugins: Vec<plugin::LoadedPlugin>,
-    plugin_tex: Vec<Option<(u32, u32, Vec<u8>)>>,
+    /// Reused RGBA staging buffer for plugin renders (allocated once, 512x512x4 = 1MB).
+    /// Previously this was `vec![0u8; 512*512*4]` every frame → 30MB/sec allocation
+    /// → allocator fragmentation → freeze after long use.
+    plugin_buf: Vec<u8>,
     plugin_smooth_bands: [f32; 128],
     music: lua::MusicInfo,
     ring_amp_smooth: f32,
@@ -96,10 +99,24 @@ struct App {
     pos_us: std::sync::Arc<std::sync::atomic::AtomicI64>,
     /// Smoothed playback position in seconds (lyric time).
     pos_sec: f32,
+    /// True after the first playback-position sync. Until then we snap pos_sec straight
+    /// to the target on the first update_pos call so a song that's already in progress
+    /// when we start doesn't get every prior lyric "played through" during the smoothing
+    /// ramp.
+    pos_synced: bool,
     /// SDF glyph atlas backing real-time lyric text.
     glyph_atlas: sdf::GlyphAtlas,
     /// Last time lyric diagnostics were logged (seconds since start).
     last_lyric_log: f32,
+    /// Rolling FPS window: timestamps (seconds since start) of the last N frames.
+    /// Used to log a smoothed frame rate without spamming the log every frame.
+    fps_window: Vec<f32>,
+    /// Last time the FPS line was printed (seconds since start).
+    last_fps_log: f32,
+    /// Total frames rendered since start (for monotonic average).
+    total_frames: u64,
+    /// Process start instant — used as the zero point for FPS window timestamps.
+    start_time: std::time::Instant,
     /// Audio energy [bass, vocal, power] 0..1 for music-reactive lyric particles.
     lyric_audio: [f32; 3],
     /// Capture the first frame after startup to this path (PULSE_RING_CAPTURE=...).
@@ -212,7 +229,7 @@ fn main() {
         image_cache: Vec::new(),
         font: std::sync::Arc::new(load_font()),
         clock_cache: std::array::from_fn(|_| (String::new(), 0, 0, 0)),
-        texture_slots: vec![None; 16],
+        texture_slots: vec![None; 64],
         widget_uvs: [(0.0, 0.0, 0.0, 0.0); 32],
         cover_rx: spawn_cover_thread(),
         last_cover_path: String::new(),
@@ -224,7 +241,7 @@ fn main() {
         cover_slot: 0,
         lua_state,
         plugins: plugin::load_plugins_with_log(),
-        plugin_tex: Vec::new(),
+        plugin_buf: vec![0u8; 512 * 512 * 4],
         plugin_smooth_bands: [0.0; 128],
         music: lua::MusicInfo::default(),
         ring_amp_smooth: 0.0,
@@ -235,6 +252,7 @@ fn main() {
         lyric_key: String::new(),
         pos_us,
         pos_sec: 0.0,
+        pos_synced: false,
         glyph_atlas: sdf::GlyphAtlas::new_with_weights(
             &font_data,
             {
@@ -254,6 +272,10 @@ fn main() {
         lyric_audio: [0.0; 3],
         capture_path: std::env::var("PULSE_RING_CAPTURE").ok(),
         capture_done: false,
+        fps_window: Vec::with_capacity(120),
+        last_fps_log: -10.0,
+        total_frames: 0,
+        start_time: std::time::Instant::now(),
     };
 
     // Wait for the first configure (outputs sized) via blocking dispatch, then switch to a
@@ -1044,6 +1066,11 @@ impl App {
                     data[o + 21] = w.bar_mirror as u32 as f32;
                 }
                 WidgetType::Image => {
+                    // The cover owns slot 3 (set after the cover upload loop below). Skip
+                    // it so an Image widget never clobbers the album art.
+                    if tex_index as usize == self.cover_tex_index {
+                        tex_index += 1;
+                    }
                     let src = match &w.source {
                         Some(s) => s.clone(),
                         None => continue,
@@ -1059,6 +1086,9 @@ impl App {
                     }
                 }
                 WidgetType::Clock => {
+                    if tex_index as usize == self.cover_tex_index {
+                        tex_index += 1;
+                    }
                     let txt = chrono_now();
                     let (cached_text, cw, ch, cached_tex) = &self.clock_cache[slot];
                     let (cw, ch) = (*cw, *ch);
@@ -1087,13 +1117,26 @@ impl App {
     }
 
     fn get_image(&mut self, path: &str) -> Option<&ImageData> {
-        // Simple cache; expand ~ in path.
+        // Simple LRU cache (max IMAGE_CACHE_MAX entries); expand ~ in path. Without LRU
+        // eviction a misconfigured widget that points at a rotating path (e.g. a log of
+        // MPRIS covers) would grow this Vec without bound, eventually OOM-ing.
+        const IMAGE_CACHE_MAX: usize = 32;
         let expanded = path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1);
         if let Some(pos) = self.image_cache.iter().position(|(p, _)| *p == expanded) {
-            return Some(&self.image_cache[pos].1);
+            // Cache hit: move-to-end makes this the most-recently-used entry. Older entries
+            // bubble to the front and get evicted first when we exceed the cap.
+            if pos != self.image_cache.len() - 1 {
+                let entry = self.image_cache.remove(pos);
+                self.image_cache.push(entry);
+            }
+            return self.image_cache.last().map(|(_, d)| d.as_ref());
         }
         if let Some(img) = load_png(&expanded) {
             self.image_cache.push((expanded, std::sync::Arc::new(img)));
+            // Evict oldest entries (front of Vec) until we're back under the cap.
+            while self.image_cache.len() > IMAGE_CACHE_MAX {
+                self.image_cache.remove(0);
+            }
             return self.image_cache.last().map(|(_, d)| d.as_ref());
         }
         None
@@ -1164,10 +1207,32 @@ impl App {
         let _ = self.lyric_worker_tx.send(req);
     }
 
-    /// Smooth the playback position toward the MPRIS value (refreshed ~6x/s).
+    /// Track the playback position toward the MPRIS value (refreshed ~6x/s).
+    /// Per-character lyric animation uses `t - p.start` to drive its fly-in clock, so
+    /// any smoothing here makes every glyph appear a few frames after the beat. The
+    /// previous `(target - pos_sec) * (dt * 3.0)` chase added ~100–150ms of visible lag
+    /// — noticeable on fast syllables. Now we follow the target directly, snapping on
+    /// large jumps (seek / track change) so the user never sees a glide.
     fn update_pos(&mut self, dt: f32) {
         let target = self.pos_us.load(std::sync::atomic::Ordering::Relaxed) as f32 / 1_000_000.0;
-        self.pos_sec += (target - self.pos_sec) * (dt * 3.0).min(1.0);
+        if !self.pos_synced {
+            if target > 0.0 {
+                self.pos_sec = target;
+                self.pos_synced = true;
+            }
+        } else {
+            let jump = (target - self.pos_sec).abs();
+            if jump > 1.5 {
+                // User seeked or track changed — snap so the lyrics don't glide across
+                // the whole song. 1.5s threshold avoids snapping on normal playerctl
+                // polling jitter (~10–30ms).
+                self.pos_sec = target;
+            } else {
+                // Light smoothing (5% per frame ≈ 6ms at 30fps) absorbs MPRIS polling
+                // jitter without delaying the per-character animation perceptibly.
+                self.pos_sec += (target - self.pos_sec) * (dt * 1.5).min(1.0);
+            }
+        }
     }
 
     /// Index of the lyric line active at `pos_sec`, or None when the song hasn't started.
@@ -1189,6 +1254,10 @@ impl App {
     /// Everything the renderer needs this frame: whether lyrics are enabled, the playback
     /// time, per-char quads, and whether the SDF atlas gained glyphs that must be uploaded.
     fn compute_lyric_frame(&mut self, width: u32, height: u32) -> LyricFrame {
+        // Reset the per-frame EDT budget and drain any glyphs that were deferred in
+        // earlier frames. Without this, a CJK-heavy reveal would spike the EDT cost
+        // on a single frame and freeze the renderer.
+        self.glyph_atlas.begin_frame();
         let empty = LyricFrame {
             enabled: false,
             time: self.pos_sec,
@@ -1314,9 +1383,13 @@ impl App {
 
     /// Ask each plugin to render its RGBA texture, then store into texture_slots for
     /// `type: "plugin"` widgets (each plugin owns slot = 8 + plugin index).
+    ///
+    /// Bug fix: previously this allocated a fresh 1MB buffer every frame and cloned the
+    /// resulting RGBA into texture_slots — 30MB/sec of allocator pressure that fragmented
+    /// the heap and froze the renderer after long sessions. Now `plugin_buf` is allocated
+    /// once at startup and each plugin's RGBA is written in-place into texture_slots[8+i].
     fn render_plugin_textures(&mut self) {
         let n = self.plugins.len();
-        self.plugin_tex.resize(n, None);
         let (screen_w, screen_h) = self
             .outputs
             .first()
@@ -1324,12 +1397,14 @@ impl App {
             .unwrap_or((1920, 1080));
         for (i, p) in self.plugins.iter().enumerate() {
             let slot = (8 + i) as u32;
-            // allocate a 512x512 buffer per plugin (host-owned)
-            let mut buf = vec![0u8; 512 * 512 * 4];
+            // Zero the staging buffer (plugin may read stale data otherwise).
+            for b in self.plugin_buf.iter_mut() {
+                *b = 0;
+            }
             let mut req = plugin::RenderRequest {
                 slot,
-                buf_len: buf.len(),
-                buf: buf.as_mut_ptr(),
+                buf_len: self.plugin_buf.len(),
+                buf: self.plugin_buf.as_mut_ptr(),
                 update: false,
                 width: 0,
                 height: 0,
@@ -1341,29 +1416,72 @@ impl App {
             if req.update && req.width > 0 && req.height > 0 {
                 let w = req.width.min(512);
                 let h = req.height.min(512);
-                // Plugin writes a w×h image at the start of the buffer with row stride = w.
-                let mut rgba = Vec::with_capacity((w * h * 4) as usize);
-                for y in 0..h {
-                    for x in 0..w {
-                        let si = ((y * w + x) * 4) as usize;
-                        rgba.extend_from_slice(&buf[si..si + 4]);
+                let ti = 8 + i;
+                let needed = (w as usize) * (h as usize) * 4;
+                // Grow the texture slot's RGBA only when the size changes; otherwise
+                // reuse the existing allocation in place (no clone, no per-frame alloc).
+                match self.texture_slots.get_mut(ti) {
+                    Some(Some(img)) if img.w == w && img.h == h && img.rgba.len() == needed => {
+                        // Reuse: copy row by row from staging buf (stride = 512*4, not w*4).
+                        for y in 0..h {
+                            let src = (y as usize) * 512 * 4;
+                            let dst = (y as usize) * (w as usize) * 4;
+                            img.rgba[dst..dst + (w as usize) * 4]
+                                .copy_from_slice(&self.plugin_buf[src..src + (w as usize) * 4]);
+                        }
+                    }
+                    _ => {
+                        let mut rgba = vec![0u8; needed];
+                        for y in 0..h {
+                            let src = (y as usize) * 512 * 4;
+                            let dst = (y as usize) * (w as usize) * 4;
+                            rgba[dst..dst + (w as usize) * 4]
+                                .copy_from_slice(&self.plugin_buf[src..src + (w as usize) * 4]);
+                        }
+                        self.texture_slots[ti] = Some(ImageData { w, h, rgba });
                     }
                 }
-                self.plugin_tex[i] = Some((w, h, rgba));
-            }
-        }
-        // write plugin textures into texture_slots (so prepare_widgets picks them up)
-        for (i, tex) in self.plugin_tex.iter().enumerate() {
-            if let Some((w, h, rgba)) = tex {
-                let ti = 8 + i;
-                let img = ImageData { w: *w, h: *h, rgba: rgba.clone() };
-                self.texture_slots[ti] = Some(img);
             }
         }
     }
 
     /// Timed tick: render only the configured screen (or all if render_screen < 0).
     fn tick(&mut self) {
+        let _t_tick = std::time::Instant::now();
+        // ---- FPS tracking ----
+        // Record this frame's wall-clock time into a rolling window. We log a smoothed
+        // FPS once per second so the log stays scannable.
+        let now = self.start_time.elapsed().as_secs_f32();
+        self.fps_window.push(now);
+        // Keep the window at the last 120 frames (~4s @ 30fps).
+        if self.fps_window.len() > 120 {
+            self.fps_window.remove(0);
+        }
+        self.total_frames += 1;
+        // Log FPS once per second (or on the first frame).
+        if (now - self.last_fps_log) >= 1.0 || self.last_fps_log < 0.0 {
+            self.last_fps_log = now;
+            if self.fps_window.len() >= 2 {
+                let span = now - self.fps_window[0];
+                let fps = if span > 0.0 {
+                    (self.fps_window.len() - 1) as f32 / span
+                } else {
+                    0.0
+                };
+                let avg_ms = if self.total_frames > 0 {
+                    (now * 1000.0) / self.total_frames as f32
+                } else {
+                    0.0
+                };
+                eprintln!(
+                    "FPS {:.1} (avg {:.1}ms/frame, n={}, total={})",
+                    fps,
+                    avg_ms,
+                    self.fps_window.len(),
+                    self.total_frames
+                );
+            }
+        }
         self.pull_audio();
         let target = self.cfg.render_screen;
         if target >= 0 {
@@ -1380,6 +1498,11 @@ impl App {
         }
         // All renderers uploaded the latest SDF atlas this frame; reset the dirty flag.
         self.glyph_atlas.clear_dirty();
+        // TICK is measured AFTER all work so the number reflects the real frame cost.
+        // Previously it was printed before draw_one → always ~0ms and useless.
+        if std::env::var("PULSE_RING_DEBUG_PREVIEW").is_ok() {
+            eprintln!("TICK {:.2}ms", _t_tick.elapsed().as_secs_f64()*1000.0);
+        }
     }
 
     fn pull_audio(&mut self) {
@@ -1465,7 +1588,13 @@ impl App {
         self.log_lyric_state(&lyric_frame, lyric_active);
         let renderer = &mut self.outputs[idx].renderer;
         if lyric_frame.atlas_dirty {
-            renderer.upload_lyric_sdf(self.glyph_atlas.atlas_bytes());
+            // Drain the dirty cell set and upload only those cells (each CELL×CELL = 16KB),
+            // not the whole 16MB atlas. This is the difference between 14ms TICK and the
+            // 1–13s spikes we saw when a CJK character first appeared.
+            let dirty_cells = self.glyph_atlas.take_dirty_cells();
+            if !dirty_cells.is_empty() {
+                renderer.upload_lyric_sdf(self.glyph_atlas.atlas_bytes(), &dirty_cells);
+            }
         }
         renderer.set_lyrics(lyric_frame.enabled, lyric_frame.time, &lyric_frame.words);
         renderer.set_lyrics_fx(lyric_frame.fx);
@@ -1540,10 +1669,13 @@ impl App {
             acc / 80.0
         };
         renderer.set_overall_energy(overall);
-        let pcount = self.cfg.particles.len().min(32) as u32;
+        let pcount = self.cfg.particles.len().min(MAX_PARTICLES) as u32;
         renderer.set_particle_count(pcount);
-        // Particle band centre (px): ring base + half growth + halo + typical offset.
-        let band_r = (self.cfg.base_radius + self.cfg.growth * 0.5 + self.cfg.halo_size * 0.5
+        // Particle band centre (px): ring base + actual amp-driven growth + halo + offset.
+        // Previously this used `growth * 0.5` (i.e. assumed amp=0.5) which made the
+        // shader's pre-filter cull every particle once amp_avg drifted away from 0.5.
+        let amp_avg = self.ring_amp_smooth;
+        let band_r = (self.cfg.base_radius + self.cfg.growth * amp_avg + self.cfg.halo_size * 0.5
             + self.cfg.particles.first().map(|p| p.x).unwrap_or(0.012)) * (width.min(height) as f32);
         renderer.set_particle_band(band_r);
         renderer.set_render_scale(self.cfg.render_scale);

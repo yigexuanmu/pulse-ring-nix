@@ -20,6 +20,10 @@ pub const PAD: usize = 16;
 pub const GRID: usize = 32;
 /// Atlas pixel size = GRID * CELL.
 pub const ATLAS_PX: usize = GRID * CELL;
+/// Maximum new glyphs packed per frame. Each CJK glyph costs ~5-30ms (128×128 EDT);
+/// without this cap a shot revealing 10+ new CJK chars in one frame freezes the renderer
+/// for hundreds of ms. Remaining glyphs are deferred via `drain_pending` in subsequent frames.
+pub const MAX_NEW_PACKS_PER_FRAME: u32 = 4;
 
 /// A packed glyph: where its cell lives in the atlas and its font metrics at RASTER_PX.
 #[derive(Debug, Clone, Copy)]
@@ -53,7 +57,16 @@ pub struct GlyphAtlas {
     cell_order: Vec<(usize, (char, u8))>,
     next_cell: usize,
     atlas: Vec<u8>,
-    dirty: bool,
+    /// Cells whose contents changed since the last upload. The renderer uploads each cell
+    /// individually (16KB each) instead of the entire 16MB atlas. Without this a single new
+    /// CJK character would force a full 4096×4096 GPU upload — that's the 1–13s TICK spike.
+    dirty_cells: Vec<usize>,
+    /// Glyphs deferred because `new_packs_this_frame` hit the budget. Drained in
+    /// subsequent frames by `drain_pending`.
+    pending: Vec<(char, u8)>,
+    /// Counter incremented by `pack_glyph`, reset by `begin_frame` (called from main loop).
+    /// Caps the EDT cost per frame to avoid rendering freezes on new-CJK reveals.
+    new_packs_this_frame: u32,
 }
 
 impl GlyphAtlas {
@@ -98,16 +111,26 @@ impl GlyphAtlas {
             cell_order: Vec::new(),
             next_cell: 0,
             atlas: vec![0u8; ATLAS_PX * ATLAS_PX],
-            dirty: false,
+            dirty_cells: Vec::new(),
+            pending: Vec::new(),
+            new_packs_this_frame: 0,
         })
     }
 
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        !self.dirty_cells.is_empty()
     }
 
+    /// Drain the set of dirty cell indices. Each index is a cell slot in [0, GRID*GRID).
+    /// The caller should upload each cell's contents (CELL × CELL bytes starting at
+    /// `(idx % GRID) * CELL, (idx / GRID) * CELL`) to the GPU atlas, then we're clean again.
+    pub fn take_dirty_cells(&mut self) -> Vec<usize> {
+        std::mem::take(&mut self.dirty_cells)
+    }
+
+    /// Drop any pending dirty marks without uploading. Used by tests and as a safety net.
     pub fn clear_dirty(&mut self) {
-        self.dirty = false;
+        self.dirty_cells.clear();
     }
 
     /// The single-channel atlas (one byte per pixel, SDF in 0..255, 0.5 = edge).
@@ -132,6 +155,28 @@ impl GlyphAtlas {
         }
     }
 
+    /// Call at the start of each frame: resets the EDT budget counter and drains up to
+    /// `MAX_NEW_PACKS_PER_FRAME` deferred glyphs. `drain_pending` is called here so the
+    /// main loop only needs one call to keep the atlas packed.
+    pub fn begin_frame(&mut self) {
+        self.new_packs_this_frame = 0;
+        self.drain_pending(MAX_NEW_PACKS_PER_FRAME as usize);
+    }
+
+    /// Drain up to `max` pending glyphs that were deferred by `ensure` because the
+    /// per-frame EDT budget was exhausted. Call once per frame before `ensure_text` to
+    /// spread the cost of new CJK glyphs across multiple frames — without this, a
+    /// shot with 15 new CJK chars would spike 100-500ms on the first frame.
+    pub fn drain_pending(&mut self, max: usize) {
+        let take = max.min(self.pending.len());
+        for _ in 0..take {
+            if let Some((ch, weight)) = self.pending.first().copied() {
+                self.pending.remove(0);
+                self.ensure(ch, weight);
+            }
+        }
+    }
+
     pub fn ensure(&mut self, ch: char, weight: u8) {
         if ch == ' ' || ch == '\u{3000}' {
             return; // spaces don't need a glyph
@@ -139,6 +184,14 @@ impl GlyphAtlas {
         let weight = if (weight as usize) >= self.fonts.len() { 0 } else { weight };
         let key = (ch, weight);
         if self.cells.contains_key(&key) {
+            return;
+        }
+        // Per-frame EDT budget: each new CJK glyph costs ~5-30ms (128x128 EDT). Without
+        // this cap, a shot revealing 10+ new CJK chars in one frame freezes the renderer.
+        if self.new_packs_this_frame >= MAX_NEW_PACKS_PER_FRAME {
+            if !self.pending.iter().any(|p| p.0 == ch && p.1 == weight) {
+                self.pending.push((ch, weight));
+            }
             return;
         }
         if self.next_cell >= GRID * GRID {
@@ -162,6 +215,7 @@ impl GlyphAtlas {
     }
 
     fn pack_glyph(&mut self, ch: char, weight: u8, metrics: Metrics, cov: &[u8]) -> GlyphInfo {
+        self.new_packs_this_frame += 1;
         let idx = self.next_cell;
         self.next_cell += 1;
         let cx = (idx % GRID) * CELL;
@@ -204,7 +258,7 @@ impl GlyphAtlas {
         };
         self.cells.insert((ch, weight), info);
         self.cell_order.push((idx, (ch, weight)));
-        self.dirty = true;
+        self.dirty_cells.push(idx);
         info
     }
 

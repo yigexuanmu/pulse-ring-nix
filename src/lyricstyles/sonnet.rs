@@ -1513,6 +1513,34 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     let t_variant = (variant_seed % 4) as u32;
     let r_variant = (variant_seed % 3) as u32;
     let c_variant = (variant_seed % 3) as u32;
+    // Per-box 82% screen pre-fit (folia fitScale, applied BEFORE the flow layout). Step this
+    // BEFORE running the template so (a) the templates see the capped measured widths when
+    // spacing neighbours by those widths (no constant-pixel gap left around a half-sized
+    // box) and (b) track row/separation gaps derived from p[hero].size reflect the capped
+    // scale, not the original big size. The port ran this block AFTER the layout: the layout
+    // could spread neighbours at a box's ORIGINAL measured width and then shrink the box
+    // afterwards, leaving a constant-pixel gap surrounding a visually smaller word — the
+    // '歌词间距大' phenomenon (and, in extreme cases, the wound-up overlaps when the shrunk
+    // box drifted into its neighbour's reserved slot). GAINT echoes are excluded (folia
+    // renders decor freely outside the flow fit), exactly like before.
+    {
+        let max_w = ctx.width * 0.82;
+        let max_h = ctx.height * 0.82;
+        for p in &mut normal {
+            let mut fs = 1.0f32;
+            if p.w > max_w {
+                fs = fs.min(max_w / p.w);
+            }
+            if p.h > max_h {
+                fs = fs.min(max_h / p.h);
+            }
+            if fs < 1.0 {
+                p.w *= fs;
+                p.h *= fs;
+                p.size *= fs;
+            }
+        }
+    }
     match shot.kind {
         ShotKind::TypeImpact => layout_type_impact(&mut normal, ctx.width, ctx.height),
         ShotKind::QuietTableau => layout_quiet_tableau(&mut normal, ctx.width, ctx.height, t_variant),
@@ -1534,25 +1562,6 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     for p in &mut normal {
         if p.role == Role::Hero {
             p.enter = [0.0, ctx.height * 0.15];
-        }
-    }
-    // Per-box 82% screen pre-fit (folia fitScale), then the global 7-step fit below.
-    {
-        let max_w = ctx.width * 0.82;
-        let max_h = ctx.height * 0.82;
-        for p in &mut normal {
-            let mut fs = 1.0f32;
-            if p.w > max_w {
-                fs = fs.min(max_w / p.w);
-            }
-            if p.h > max_h {
-                fs = fs.min(max_h / p.h);
-            }
-            if fs < 1.0 {
-                p.w *= fs;
-                p.h *= fs;
-                p.size *= fs;
-            }
         }
     }
     placements = normal;

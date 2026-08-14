@@ -1562,59 +1562,60 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     // inside the screen while the MG background layer below uses its own weaker transform.
     let fit = fit_extent(&placements, ctx.width, ctx.height, shot.camera.zoom);
 
-    // Transitions: enter (near shot start) + exit (near shot end), gated so they only apply
-    // in their windows instead of always-on.
+    // Shot transitions (folia resolveSonnetShotTransitionFrame). Enter fires in the first
+    // `twindow` seconds of the shot; exit fires in the last `twindow` seconds *of the gap
+    // leading into the next shot* — i.e. [next.start - twindow, next.start] — falling back to
+    // the current shot's end when this is the final shot. Folia keys the exit window on the
+    // NEXT shot's start, not the current shot's last-line end, so a wide instrumental gap
+    // does not turn the screen blank for the whole gap.
+    //
+    // The progress argument must RISE 0→1 over the window so resolve_transition's
+    // `amount = ease(progress)` ramps the alpha from 1 down to 0 (a real fade-out). The
+    // previous port passed (shot.end - t)/twindow — which DECREASES 1→0 across the window —
+    // inverting the curve so alpha went 0→1 *up* during the exit, hitting exactly 0 at the
+    // START of the exit window and recovering to 1 at the end. That inverted ramp made the
+    // whole shot disappear ~twindow before its actual end and reappear right at the cut —
+    // the "转场没歌词" flash and the per-word "缺一会补上" flicker (the alpha <= 0.004 gate
+    // dropped whichever words were alive in that window).
     let idle = Transition { alpha: 1.0, blur: 0.0, glitch: 0.0, pull: 0.0 };
     let enter = if t < shot.start + shot.twindow {
         resolve_transition(shot.transition, "enter", (t - shot.start) / shot.twindow)
     } else {
         idle
     };
-    let exit = if t > shot.end - shot.twindow {
-        resolve_transition(shot.transition, "exit", (shot.end - t) / shot.twindow)
+    let exit_end = program.shots.get(shot_idx + 1).map(|s| s.start).unwrap_or(shot.end);
+    let exit_start = exit_end - shot.twindow;
+    let exit = if t >= exit_start && t < exit_end {
+        resolve_transition(shot.transition, "exit", (t - exit_start) / shot.twindow)
     } else {
         idle
     };
     let trans_alpha = enter.alpha.min(exit.alpha);
     let trans_pull = enter.pull.max(exit.pull);
-    // Paragraph-level transition (folia resolveSonnetEnter/ExitTransitionFrame): a soft
-    // alpha/pull window at each paragraph boundary, combined with the shot transition.
+    // Paragraph transition (folia compileSonnetProgram: each paragraph carries only a
+    // `transitionOut`, an exit fade covering the last `window` seconds before the next
+    // paragraph starts). There is NO paragraph enter — the first shot of a paragraph
+    // inherits its own shot-enter transition. The previous port added a paragraph "enter"
+    // fade (alpha 0.18→1 at every paragraph start) on top, and drove the exit progress
+    // BACKWARDS like the shot exit, so each paragraph boundary emptied the screen for
+    // `window` seconds and then re-faded-in — double-dipping the transition with the shot
+    // transition and holding the lyrics near-zero for far too long.
     let mut para_alpha = 1.0f32;
     let mut para_pull = 0.0f32;
-    {
-        for (pi, (ps, pe, pkind, window)) in program.paras.iter().enumerate() {
-            if pi == program.paras.len() - 1 {
-                break; // folia: the final paragraph has no transitionOut
-            }
-            if t >= *ps && t <= *pe {
-                if t > pe - window && pe - ps > 0.001 {
-                    let e = resolve_transition(*pkind, "exit", (pe - t) / window);
-                    para_alpha = para_alpha.min(e.alpha);
-                    para_pull = para_pull.max(e.pull);
-                } else if t < ps + window {
-                    let e = resolve_transition(*pkind, "enter", (t - ps) / window);
-                    para_alpha = para_alpha.min(e.alpha);
-                    para_pull = para_pull.max(e.pull);
-                }
-                break;
-            }
+    for (pi, (ps, pe, pkind, window)) in program.paras.iter().enumerate() {
+        if pi == program.paras.len() - 1 {
+            break; // folia: the final paragraph has no transitionOut
+        }
+        // folia: transitionOut.startTime = max(para.start, next.start - duration).
+        let exit_end = *pe;
+        let exit_start = (exit_end - *window).max(*ps);
+        if t >= exit_start && t < exit_end && (exit_end - *ps) > 0.001 {
+            let e = resolve_transition(*pkind, "exit", (t - exit_start) / window);
+            para_alpha = para_alpha.min(e.alpha);
+            para_pull = para_pull.max(e.pull);
         }
     }
     let trans_alpha = trans_alpha.min(para_alpha);
-    // Quick fade-out in the last 0.18s of the shot (folia sonnet "quick disappearance"):
-    // the existing enter/exit transition alphas use the shot's twindow (often 0.14–0.24s)
-    // but they ease in/out, so the visible "fading away" portion is even shorter. This
-    // dedicated linear fade makes the shot's exit unambiguous instead of abrupt.
-    let fade_out_window = 0.18f32;
-    let time_to_end = shot.end - t;
-    let quick_fade = if time_to_end < fade_out_window && time_to_end > 0.0 {
-        (time_to_end / fade_out_window).clamp(0.0, 1.0)
-    } else if time_to_end <= 0.0 {
-        0.0
-    } else {
-        1.0
-    };
-    let trans_alpha = trans_alpha * quick_fade;
     let trans_pull = trans_pull.max(para_pull);
     let mut fx = LyricFx {
         blur: enter.blur.max(exit.blur),

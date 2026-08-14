@@ -1771,6 +1771,8 @@ PulseRing {
         assert_eq!(parse_for_test("PulseRing { lyricStyle: \"商籁\" }").style, LyricStyle::Sonnet);
         assert_eq!(parse_for_test("PulseRing { }").style, LyricStyle::Off);
         assert_eq!(parse_lyric_style("商籁"), Some(LyricStyle::Sonnet));
+        assert_eq!(parse_for_test("PulseRing { style: \"classic\" }").style, LyricStyle::Classic);
+        assert_eq!(parse_lyric_style("经典"), Some(LyricStyle::Classic));
         assert_eq!(parse_lyric_style("nope"), None);
     }
 }

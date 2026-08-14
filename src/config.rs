@@ -14,6 +14,10 @@ pub enum LyricStyle {
     Off,
     /// "商籁" — cinematic paragraph/shot lyric animation (ported from folia sonnet).
     Sonnet,
+    /// "经典" — baseline per-word lyric animation (ported from folia classic). Coexists with
+    /// sonnet: selecting `style = "classic"` dispatches to `lyricstyles::classic::build_frame`
+    /// and never invokes the sonnet engine at runtime.
+    Classic,
 }
 
 impl Default for LyricStyle {
@@ -27,6 +31,7 @@ pub fn parse_lyric_style(s: &str) -> Option<LyricStyle> {
     match s.trim().to_ascii_lowercase().as_str() {
         "off" | "none" | "关" | "关掉" | "关闭" => Some(LyricStyle::Off),
         "sonnet" | "商籁" | "十四行诗" => Some(LyricStyle::Sonnet),
+        "classic" | "经典" | "luminous" | "流动" => Some(LyricStyle::Classic),
         _ => None,
     }
 }
@@ -36,6 +41,7 @@ impl LyricStyle {
         match self {
             LyricStyle::Off => "off",
             LyricStyle::Sonnet => "sonnet",
+            LyricStyle::Classic => "classic",
         }
     }
 }

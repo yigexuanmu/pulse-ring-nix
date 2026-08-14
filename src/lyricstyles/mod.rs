@@ -4,6 +4,7 @@
 //! input: &StyleInput) -> Vec<CharQuad>`, add a `LyricStyle` variant in `config.rs`, one arm
 //! in `lyricview::build_frame`, and a name alias in `config::parse_lyric_style`.
 
+pub mod classic;
 pub mod mg;
 pub mod mg_geo;
 pub mod mg_scene;

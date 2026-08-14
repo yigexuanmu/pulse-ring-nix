@@ -677,5 +677,6 @@ pub fn build_frame(
     match style {
         crate::config::LyricStyle::Off => StyleOutput::empty(),
         crate::config::LyricStyle::Sonnet => crate::lyricstyles::sonnet::build_frame(ctx, input),
+        crate::config::LyricStyle::Classic => crate::lyricstyles::classic::build_frame(ctx, input),
     }
 }

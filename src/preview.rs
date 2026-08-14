@@ -97,6 +97,7 @@ pub fn render(text: &str, style: &str, time: f32, path: &str) -> Result<(), Stri
     };
     let parsed_style = match style {
         "sonnet" | "商籁" => crate::config::LyricStyle::Sonnet,
+        "classic" | "经典" | "luminous" | "流动" => crate::config::LyricStyle::Classic,
         _ => crate::config::LyricStyle::Off,
     };
     let output = crate::lyricview::build_frame(parsed_style, &ctx, &input);

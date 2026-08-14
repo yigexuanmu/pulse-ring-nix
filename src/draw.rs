@@ -35,6 +35,23 @@ pub struct RingRenderer {
     lyric_words_data: [f32; 65536],
     lyric_bounds_data: [f32; 4],
     lyric_fx_data: [f32; 9],
+    // #5 uniform-split bookkeeping: `lyric_words_version` bumps ONLY when the lyric quad
+    // list actually changes. set_lyrics runs every frame to advance lyric_time, but the
+    // word content is stable within a line, so #5b can skip re-uploading the 256 KB
+    // lyric_words region when the version is unchanged. `last_lyric_words` caches the
+    // previous quad list on the heap (avoiding a 256 KB inline copy inside this already-
+    // large struct) for an O(words*20) content compare.
+    lyric_words_version: u64,
+    last_lyric_words: Vec<[f32; 20]>,
+    // Particles arrive via render(..) every frame; their positions animate with elapsed so
+    // they change during normal play but are static when idle. `particles_dirty` records
+    // whether the incoming slice differs from the last-written copy; render sets it on
+    // entry (the caller's `compute_particles` in main.rs is the functional updater) and
+    // clears it after writing. (#5a STILL rewrites the shared GPU buffer every frame, so
+    // this is pure bookkeeping that #5b consumes to skip the lyric_words / particles
+    // sub-uploads.)
+    particles_dirty: bool,
+    last_particles: [f32; 1152],
     capture_once: bool,
     capture_path: String,
     atlas_texture: Option<wgpu::Texture>,
@@ -447,6 +464,10 @@ impl RingRenderer {
             lyric_words_data: [0.0; 65536],
             lyric_bounds_data: [-1.0, -1.0, -1.0, -1.0],
             lyric_fx_data: [0.0; 9],
+            lyric_words_version: 0,
+            last_lyric_words: Vec::new(),
+            particles_dirty: false,
+            last_particles: [0.0; 1152],
             capture_once: false,
             capture_path: String::new(),
             atlas_texture: None,
@@ -556,6 +577,18 @@ impl RingRenderer {
             self.lyric_bounds_data = [-1.0, -1.0, -1.0, -1.0];
         }
         self.lyric_word_count = n as u32;
+
+        // #5: bump lyric_words_version ONLY when the quad content actually changed.
+        // set_lyrics is called every frame (to advance lyric_time), so without this guard
+        // the version would spike every frame and #5b could never skip the 256 KB upload.
+        // Comparing at most `n` words (<= 3276 words x 20 f32) is dramatically cheaper than
+        // re-uploading the shared Uniforms buffer.
+        let changed = self.last_lyric_words.len() != n
+            || !self.last_lyric_words.iter().eq(words[..n].iter());
+        if changed {
+            self.lyric_words_version = self.lyric_words_version.wrapping_add(1);
+            self.last_lyric_words = words[..n].to_vec();
+        }
     }
 
     fn refresh_texture_bindings(&mut self) {
@@ -767,6 +800,10 @@ impl RingRenderer {
             log::info!("render id={} SKIPPED: not configured", self.id);
             return;
         }
+        // #5: detect whether the particle slice changed since the last write. #5a keeps the
+        // shared GPU upload byte-identical, so this is bookkeeping only; #5b uses it to skip
+        // the 4.5 KB particle sub-upload on idle frames.
+        self.particles_dirty = self.last_particles != *particles;
         self.render_count += 1;
         if self.id == 0 && self.render_count % 30 == 1 {
             log::info!("render id=0 entering get_current_texture (#{})", self.render_count);
@@ -919,6 +956,10 @@ impl RingRenderer {
         };
         self.queue
             .write_buffer(&self.uniform_buffer, 0, bytemuck::bytes_of(&uniforms));
+        // #5: the shared buffer was fully rewritten (perf-neutral #5a, byte-identical), so
+        // the last-written particle cache is now current and the dirty flag can be cleared.
+        self.last_particles = *particles;
+        self.particles_dirty = false;
 
         let mut encoder = self
             .device

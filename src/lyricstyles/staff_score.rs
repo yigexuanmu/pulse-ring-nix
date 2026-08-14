@@ -29,9 +29,9 @@ pub enum StaffElement {
 /// `ctx` provides the screen size + theme colours; `line` is the active virtual-staff line
 /// (its text is the ♪ marker); `time` is the playback clock in seconds. The returned
 /// strokes are centre-relative and the dispatch loop positions them at the ♪ placement.
-// TODO fft-coupling: drive note pulse + cursor from FFT band energy (ctx.audio) instead of
-// wall-clock time, add bar lines + D-minor key signature + notehead stems, and gate the
-// whole staff behind an instrumental-segment-detection hold.
+// Stage 2: bar lines, D-minor key signature, time-driven playback cursor and beat-pulsing
+// noteheads (FFT-coupled via ctx.audio[0]=bass, time-fallback). Instrumental gating is
+// already enforced upstream by the ♪ marker in the dispatch loop.
 pub fn draw_staff_score(ctx: &StyleCtx, _line: &LyricLine, _time: f32) -> Vec<StaffElement> {
     let primary = ctx.colors.primary;
     let mut out: Vec<StaffElement> = Vec::new();
@@ -43,11 +43,55 @@ pub fn draw_staff_score(ctx: &StyleCtx, _line: &LyricLine, _time: f32) -> Vec<St
     let line_spacing = 18.0_f32;
     let half_w = staff_width * 0.5;
     let half_h = line_spacing * 2.0;
+    // 3/4 bar lines: 三等分点垂直线
+    let accent = ctx.colors.accent;
+    for i in 0..2u32 {
+        let x = -half_w + (staff_width * (i as f32 + 1.0) / 3.0);
+        out.push(StaffElement::Line {
+            x0: x, y0: -half_h - 4.0, x1: x, y1: half_h + 4.0,
+            thickness: 1.5, alpha: 0.5 * primary[3], color: primary,
+        });
+    }
+
+    // D-minor key signature: 2 个 flat (♭) markers 在 staff 左侧
+    for i in 0..2u32 {
+        let y = -half_h + (1.0 + i as f32) * line_spacing;
+        let fx = -half_w + 8.0 + i as f32 * 10.0;
+        out.push(StaffElement::Ellipse {
+            cx: fx, cy: y, rx: 4.0, ry: 3.0,
+            alpha: 0.6 * primary[3], color: primary,
+        });
+        // stem from flat marker down
+        out.push(StaffElement::Line {
+            x0: fx + 3.0, y0: y - 2.0, x1: fx + 3.0, y1: y + 5.0,
+            thickness: 1.0, alpha: 0.5 * primary[3], color: primary,
+        });
+    }
+
+    // Time-driven playback cursor (sweeps staff_width every 3s)
+    let cursor_x = -half_w + (((_time * staff_width / 3.0) % staff_width).max(0.0));
+    out.push(StaffElement::Line {
+        x0: cursor_x, y0: -half_h - 6.0, x1: cursor_x, y1: half_h + 6.0,
+        thickness: 2.0, alpha: 0.65 * accent[3], color: accent,
+    });
+
+    // Beat-pulsing noteheads along cursor at 5 staff-line heights; FFT-coupled alpha.
+    // ctx.audio[0]=bass dominant; fallback time-based beat if audio silent.
+    let bass = ctx.audio[0].max(0.0);
+    let beat_pulse = 0.5 + 0.5 * (_time * 2.0).sin(); // ~120 BPM = 2 Hz
+    let base_alpha = 0.4 + 0.4 * bass + 0.2 * beat_pulse;
     for i in 0..5u32 {
         let y = -half_h + i as f32 * line_spacing;
+        let phase = (_time * 2.0 + i as f32 * 0.4).sin();
+        let alpha = (base_alpha + 0.2 * phase).clamp(0.0, 1.0);
+        out.push(StaffElement::Ellipse {
+            cx: cursor_x, cy: y, rx: 5.0, ry: 4.0,
+            alpha: alpha * primary[3], color: primary,
+        });
+        // stem
         out.push(StaffElement::Line {
-            x0: -half_w, y0: y, x1: half_w, y1: y,
-            thickness: 2.0, alpha: 0.3 * primary[3], color: primary,
+            x0: cursor_x + 5.0, y0: y - 2.0, x1: cursor_x + 5.0, y1: y - 14.0,
+            thickness: 1.2, alpha: 0.5 * primary[3], color: primary,
         });
     }
     out

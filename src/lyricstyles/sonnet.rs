@@ -1624,8 +1624,16 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
             para_pull = para_pull.max(e.pull);
         }
     }
-    let trans_alpha = trans_alpha.min(para_alpha);
-    let trans_pull = trans_pull.max(para_pull);
+    // folia precedence (createSonnetPixiRuntime.ts:649):
+    //   frame = shotTransitionFrame !== IDLE ? shotTransitionFrame : paragraphTransitionFrame
+    // When shot is IN transition, only the shot's transition alpha applies; the
+    // paragraph alpha is ignored. Earlier `trans_alpha.min(para_alpha)` double-dipped
+    // the two when both fired at the same boundary (paragraph end aligned with shot
+    // end), driving alpha LOWER than folia — the lyrics faded out earlier than they
+    // should, contributing to the "转场没歌词" flash.
+    let in_shot_transition = (enter.alpha < 1.0) || (exit.alpha < 1.0);
+    let trans_alpha = if in_shot_transition { trans_alpha } else { para_alpha };
+    let trans_pull = if in_shot_transition { trans_pull } else { para_pull };
     let mut fx = LyricFx {
         blur: enter.blur.max(exit.blur),
         glitch: enter.glitch.max(exit.glitch),
@@ -2098,12 +2106,21 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
             scene.emit(raw_progress, t, shot.start, shot.end, ctx.audio, &cam, &mut mg_out);
         });
         _t_mg = _t_mg_start.elapsed();
-        // Prepend MG decorations so the QUAD_BUDGET truncation drops the LYRIC tail,
-        // not the MG head. Without this, scanlines / HUD / geometric chaos are the first
-        // to be sliced off whenever a busy line produces >~200 lyric quads (which is
-        // almost always — a 12-char hero + 2 giant echoes + 5 supports ≈ 60 quads alone).
-        let mut combined = mg_out;
-        combined.append(&mut out);
+        // LYRIC MUST remain whole: lyric appended BEFORE MG decor so a QUAD_BUDGET
+        // `truncate()` shears the MG decoration tail, not the lyric tail.
+        //
+        // Reason: the previous order (mg_out then lyric) dropped the LAST sung
+        // characters of the visible line whenever a busy shot pushed past 1024
+        // quads — lyric tail vanished mid-line. Empirically confirmed by the
+        // sonnet parity audit (preview sweep t=5.5: 1032 quads, t=6.5: 1049,
+        // both >1024 → back 8/25 lyric chars sliced).
+        //
+        // Shader is additive blend, so MG/lyric quad ORDER does not affect the
+        // composite — only the truncation pick is shifted. MG decoration (HUD /
+        // scanlines / geometric chaos) is non-essential ambient; lyric characters
+        // are the focus content the user is reading.
+        let mut combined = out;
+        combined.append(&mut mg_out);
         const QUAD_BUDGET: usize = 1024;
         if combined.len() > QUAD_BUDGET {
             combined.truncate(QUAD_BUDGET);

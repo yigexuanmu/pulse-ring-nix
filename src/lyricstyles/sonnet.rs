@@ -10,6 +10,7 @@ use crate::lyricview::{
     measure_text, measure_text_bold, push_rect, push_word_full, split_with_timing,
 };
 use crate::sdf::{CELL, PAD, RASTER_PX};
+use crate::lyricstyles::staff_score;
 
 // Cache the per-shot MG decoration scene (its vector commands are expensive to rebuild; the
 // actual per-frame emission is cheap). Keyed by seed + shot index, bounded to the last two.
@@ -1702,6 +1703,9 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     let min_d = ctx.width.min(ctx.height);
 
     let mut out: Vec<CharQuad> = Vec::with_capacity(160);
+    // Whether this frame's La Folia staff score has already been emitted — folia renders
+    // exactly one staff per shot, so only the first ♪ placement produces it.
+    let mut staff_drawn = false;
 
     // folia-style glyph settle window: 0.65–1.8s, capped at 72% of the shot.
     let shot_dur = (shot.end - shot.start).max(0.001);
@@ -1718,6 +1722,23 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         // folia coreAlpha = waiting ? 0 : 0.16 + progress*0.84 — glyphs stay visible while gliding.
         let core = if waiting { 0.0 } else { 0.16 + fly * 0.84 };
         if core <= 0.004 {
+            continue;
+        }
+        // ♪ (U+266A) ⇒ folia's INDEPENDENT La Folia staff-score vector animation. The note
+        // glyph must never fall through to the SDF atlas: it triggers a parallel five-line
+        // staff with a time-driven playback cursor and beat-pulsing noteheads
+        // (buildSonnetStaffView). folia renders exactly one staff per shot, so the first ♪
+        // placement emits it and later ♪ placements merely skip the SDF path.
+        if p.text.contains('\u{266A}') {
+            if !staff_drawn {
+                let staff_alpha = trans_alpha * core * mask_wipe;
+                if let Some(line) = input.lines.get(input.active_idx).or_else(|| input.lines.first()) {
+                    for e in staff_score::draw_staff_score(ctx, line, t) {
+                        staff_score::emit_staff_element(&mut out, p.x, p.y, staff_alpha, e);
+                    }
+                }
+                staff_drawn = true;
+            }
             continue;
         }
         // Accent = the word currently being sung.

@@ -9,3 +9,4 @@ pub mod mg_geo;
 pub mod mg_scene;
 pub mod mg_themed;
 pub mod sonnet;
+pub mod staff_score;

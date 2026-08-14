@@ -138,8 +138,7 @@ struct Uniforms {
     saturn_band: f32,     // 716
     saturn_alpha: f32,    // 720
     saturn_stripes: f32,  // 724
-    // 32 particles x 12 f32 (x, y, size, alpha, r, g, b, a, spin, vx, vy, pad) — 720..
-    particles: [f32; 1152],
+    // (particles moved to split storage binding 7 — see ParticlesBuf / u_particles)
     // ---- widgets ----
     widget_count: u32,
     widgets: [f32; 1280],
@@ -152,7 +151,6 @@ struct Uniforms {
     lyric_enabled: u32,
     lyric_time: f32,
     lyric_word_count: u32,
-    lyric_words: [f32; 65536],
     lyric_bounds: [f32; 4],
     lyric_fx: [f32; 9],
 }
@@ -940,7 +938,6 @@ impl RingRenderer {
             saturn_band: c.saturn_band.max(0.0),
             saturn_alpha: c.saturn_alpha.clamp(0.0, 1.0),
             saturn_stripes: c.saturn_stripes.clamp(0.0, 1.0),
-            particles: *particles,
             widget_count: self.widget_count,
             widgets: self.widget_data,
             bar_energy: self.bar_energy_data,
@@ -950,7 +947,6 @@ impl RingRenderer {
             lyric_enabled: self.lyric_enabled,
             lyric_time: self.lyric_time,
             lyric_word_count: self.lyric_word_count,
-            lyric_words: self.lyric_words_data,
             lyric_bounds: self.lyric_bounds_data,
             lyric_fx: self.lyric_fx_data,
         };
@@ -1173,7 +1169,6 @@ const SHADER_SRC: &str = stringify!(
         saturn_band: f32,
         saturn_alpha: f32,
         saturn_stripes: f32,
-        particles: array<f32, 1152>,
         widget_count: u32,
         widgets: array<f32, 1280>,
         bar_energy: array<f32, 64>,
@@ -1183,16 +1178,23 @@ const SHADER_SRC: &str = stringify!(
         lyric_enabled: u32,
         lyric_time: f32,
         lyric_word_count: u32,
-        lyric_words: array<f32, 65536>,
         lyric_bounds: array<f32, 4>,
         lyric_fx: array<f32, 9>,
     };
+
+    // #5b split storage structs: the two big arrays (lyric_words 256 KB, particles 4.5 KB)
+    // were lifted out of `Uniforms` so a steady-state frame uploads only ~16 KB to the
+    // main uniform and skips these unless their version/dirty flag flipped.
+    struct LyricWordsBuf { words: array<f32, 65536> };
+    struct ParticlesBuf { items: array<f32, 1152> };
 
     @group(0) @binding(1) var widget_texture: texture_2d<f32>;
     @group(0) @binding(2) var widget_sampler: sampler;
     @group(0) @binding(3) var lyric_texture: texture_2d<f32>;
 
     @group(0) @binding(0) var<storage, read> u: Uniforms;
+    @group(0) @binding(6) var<storage, read> u_lyric_words: LyricWordsBuf;
+    @group(0) @binding(7) var<storage, read> u_particles: ParticlesBuf;
 
     struct VsOut {
         @builtin(position) pos: vec4<f32>,
@@ -1541,16 +1543,16 @@ const SHADER_SRC: &str = stringify!(
             let trail_max = select(1.0, 0.0, u.particle_mode == 3u);
             for (var i = 0u; i < u.particle_count; i = i + 1u) {
                 let o = i * 12u;
-                let px = u.particles[o];
-                let py = u.particles[o + 1u];
-                let psize = u.particles[o + 2u];
-                let palpha = u.particles[o + 3u];
+                let px = u_particles.items[o];
+                let py = u_particles.items[o + 1u];
+                let psize = u_particles.items[o + 2u];
+                let palpha = u_particles.items[o + 3u];
                 if (palpha <= 0.004) {
                     continue;
                 }
-                let spin = u.particles[o + 8u];
-                let vx = u.particles[o + 9u];
-                let vy = u.particles[o + 10u];
+                let spin = u_particles.items[o + 8u];
+                let vx = u_particles.items[o + 9u];
+                let vy = u_particles.items[o + 10u];
                 var t = 0.0;
                 while (t <= trail_max) {
                     let ghost = vec2<f32>(px - vx * t * 0.05, py - vy * t * 0.05);
@@ -1575,7 +1577,7 @@ const SHADER_SRC: &str = stringify!(
                     let da = smoothstep(r + 1.0, max(r - 1.0, 0.0), sd) * palpha * (1.0 - t * 0.6);
                     if (da > p_a) {
                         p_a = da;
-                        p_col = vec3<f32>(u.particles[o + 4u], u.particles[o + 5u], u.particles[o + 6u]) * da;
+                        p_col = vec3<f32>(u_particles.items[o + 4u], u_particles.items[o + 5u], u_particles.items[o + 6u]) * da;
                     }
                     t = t + 1.0;
                 }
@@ -1939,13 +1941,13 @@ const SHADER_SRC: &str = stringify!(
                 // rejects below fire before we touch the survivor-only
                 // uv/rotate/tint/ext fields. Paired with `CharQuad::to_array` in
                 // src/lyricview.rs — indices must agree or the shader reads garbage.
-                let lslot = u.lyric_words[lo];
-                let lw = u.lyric_words[lo + 1u];
-                let lh = u.lyric_words[lo + 2u];
-                let lx = u.lyric_words[lo + 3u];
-                let ly = u.lyric_words[lo + 4u];
-                let lscale = u.lyric_words[lo + 5u];
-                let lalpha = u.lyric_words[lo + 6u];
+                let lslot = u_lyric_words.words[lo];
+                let lw = u_lyric_words.words[lo + 1u];
+                let lh = u_lyric_words.words[lo + 2u];
+                let lx = u_lyric_words.words[lo + 3u];
+                let ly = u_lyric_words.words[lo + 4u];
+                let lscale = u_lyric_words.words[lo + 5u];
+                let lalpha = u_lyric_words.words[lo + 6u];
                 if (lalpha <= 0.004 || lw <= 0.0 || lh <= 0.0) {
                     continue;
                 }
@@ -1958,14 +1960,14 @@ const SHADER_SRC: &str = stringify!(
                 // Survivor-only fields: glyph UV rect, rotation, shape vertices (ext)
                 // and tint (color). Read after both rejects so far / invisible quads
                 // skip ~3x the storage-array loads.
-                let luv_x = u.lyric_words[lo + 7u];
-                let luv_y = u.lyric_words[lo + 8u];
-                let luv_w = u.lyric_words[lo + 9u];
-                let luv_h = u.lyric_words[lo + 10u];
-                let lrot = u.lyric_words[lo + 11u];
-                let lv0 = vec2<f32>(u.lyric_words[lo + 16u], u.lyric_words[lo + 17u]);
-                let lv1 = vec2<f32>(u.lyric_words[lo + 18u], u.lyric_words[lo + 19u]);
-                let ltint = vec4<f32>(u.lyric_words[lo + 12u], u.lyric_words[lo + 13u], u.lyric_words[lo + 14u], u.lyric_words[lo + 15u]);
+                let luv_x = u_lyric_words.words[lo + 7u];
+                let luv_y = u_lyric_words.words[lo + 8u];
+                let luv_w = u_lyric_words.words[lo + 9u];
+                let luv_h = u_lyric_words.words[lo + 10u];
+                let lrot = u_lyric_words.words[lo + 11u];
+                let lv0 = vec2<f32>(u_lyric_words.words[lo + 16u], u_lyric_words.words[lo + 17u]);
+                let lv1 = vec2<f32>(u_lyric_words.words[lo + 18u], u_lyric_words.words[lo + 19u]);
+                let ltint = vec4<f32>(u_lyric_words.words[lo + 12u], u_lyric_words.words[lo + 13u], u_lyric_words.words[lo + 14u], u_lyric_words.words[lo + 15u]);
                 let ld = pk - vec2<f32>(lx, ly);
                 let lcs = cos(-lrot);
                 let lsn = sin(-lrot);

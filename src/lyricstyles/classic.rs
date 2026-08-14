@@ -223,6 +223,12 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         return StyleOutput::empty();
     }
     let t = ctx.time;
+    // #3b audio coupling: `ctx.audio` = `[bass, vocal, power]` (0..1), the per-frame energy
+    // folia exposes as `audioPower`/`audioBands` (Visualizer.tsx:293-294). Folia routes these
+    // only to `VisualizerShell`'s background; pulse-ring-nix has no shell layer, so we feed
+    // them straight into the lyric layout: a bass-driven vertical bob + a power-driven scale
+    // pulse and active-word glow halo boost (see baseline_y / active_glow below).
+    let (bass, _vocal, power) = (ctx.audio[0], ctx.audio[1], ctx.audio[2]);
     let scales = FontScales::from_height(ctx.height);
 
     // Folia classic renders the whole song as one scrolling marquee of line containers.
@@ -257,19 +263,25 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         .sum::<f32>()
         + gap * words.len().saturating_sub(1) as f32;
     let mut pen_x = ctx.width * 0.5 - total_w * 0.5;
-    let baseline_y = ctx.height * 0.5;
+    // #3b audio coupling: whole-line pulse-bob. `bass` 0..1 lifts the baseline up to ~6% of
+    // the main font size (a beat-driven jump); `power` adds a ~4% uniform scale pulse so the
+    // line visibly "breathes" to the track's energy on top of folia's lyric-timestamp poses.
+    let pulse = 1.0 + power * 0.04;
+    let baseline_y = ctx.height * 0.5 - bass * main_px * 0.06;
+    let active_glow = 0.55 + power * 0.45;
 
     // Per-word reveal: folia `layoutVariants` poses (tuning.rs WORD_*). Skeleton uses a hard
     // threshold on the word's `[start, end]` window — the eased per-char / per-grapheme glow
-    // sweep lands in #3c.
+    // sweep lands in #3c. The audio `pulse` multiplies the body scale so the whole line
+    // breathes; `active_glow` extends the active halo with the track's power.
     for w in &words {
         let word_w = measure_text(ctx.atlas, &w.text, main_px);
         let (alpha, scale, color, glow) = if t < w.start {
             (tuning::WORD_WAITING_OPACITY, tuning::WORD_WAITING_SCALE, ctx.colors.dim, 0.0)
         } else if t <= w.end {
-            (tuning::WORD_ACTIVE_OPACITY, tuning::ACTIVE_SCALE_MULT, ctx.colors.accent, 0.55)
+            (tuning::WORD_ACTIVE_OPACITY, tuning::ACTIVE_SCALE_MULT * pulse, ctx.colors.accent, active_glow)
         } else {
-            (tuning::WORD_PASSED_OPACITY_NORMAL, 1.0, ctx.colors.primary, 0.0)
+            (tuning::WORD_PASSED_OPACITY_NORMAL, pulse, ctx.colors.primary, 0.0)
         };
         if alpha > 0.004 {
             push_word_full(
@@ -317,5 +329,9 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         }
     }
 
-    StyleOutput { quads: out, fx: LyricFx::default() }
+    // #3b audio coupling: hand the lyric layer a power-proportional glow boost + a faint
+    // bass-driven grain (LyricFx is applied only to lyric quads — see draw.rs, matching
+    // folia's body-layer post-fx rather than the absent background shell).
+    let fx = LyricFx { glow: power * 0.35, noise: bass * 0.06, ..LyricFx::default() };
+    StyleOutput { quads: out, fx }
 }

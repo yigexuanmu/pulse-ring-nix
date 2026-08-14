@@ -611,10 +611,26 @@ fn template_scales(kind: ShotKind) -> (f32, f32) {
     }
 }
 
-/// Word "score" = fola scoreSonnetHeroSegment (visible length + duration).
+// ---------------------------------------------------------------- semantic role thresholds
+// Named-constant ports of folia's role-scoring/threshold magic numbers (previously inline
+// numerals in build_placements). The values reproduce folia exactly; only the names are new.
+//   SEMI_HERO_* : folia sonnetTypographyRoles.ts:51-55
+//   HERO_SCORE_* : folia sonnetTypographyRoles.ts:scoreSonnetHeroSegment
+const SEMI_HERO_MIN_GAP: usize = 2;            // |index - heroIndex| and |2nd - primary|
+const SEMI_HERO_MIN_VISIBLE_LENGTH: usize = 2; // visible-grapheme count floor for a candidate
+const SEMI_HERO_MIN_LINE_WORDS: usize = 4;      // below this word-like count -> no semi-heroes
+const SEMI_HERO_SCORE_RATIO: f32 = 0.35;       // threshold = hero score * ratio
+const SEMI_HERO_MULTI_WORD_COUNT: usize = 9;    // >=9 word-likes earn a second accent (other side)
+const HERO_SCORE_LENGTH_CAP: f32 = 8.0;         // min(visibleLen, 8)
+const HERO_SCORE_LENGTH_WEIGHT: f32 = 14.0;      // length score weight
+const HERO_SCORE_DURATION_CAP: f32 = 2.5;       // min(2.5, duration)
+const HERO_SCORE_DURATION_WEIGHT: f32 = 18.0;   // duration score weight
+
+/// Word "score" = folia scoreSonnetHeroSegment (visible length + duration).
 fn segment_score(text: &str, start: f32, end: f32) -> f32 {
     let visible = text.chars().filter(|c| !c.is_whitespace()).count() as f32;
-    (visible.min(8.0) * 14.0) + ((end - start).min(2.5).max(0.0) * 18.0)
+    (visible.min(HERO_SCORE_LENGTH_CAP) * HERO_SCORE_LENGTH_WEIGHT)
+        + ((end - start).min(HERO_SCORE_DURATION_CAP).max(0.0) * HERO_SCORE_DURATION_WEIGHT)
 }
 
 fn role_font_scale(role: Role, hero_scale: f32, support_scale: f32) -> f32 {
@@ -651,6 +667,20 @@ fn build_placements(
         return out;
     }
     let shot_words = all.len();
+    // #8 audit — semantic segmentation granularity vs folia. folia segments each line with
+    // Intl.Segmenter(undefined, { granularity: 'word' }) (sonnetSemantic.ts:16-22): for a CJK
+    // line that yields ONE word-like segment PER ideograph (the default-locale UAX#29 word
+    // boundary splits each CJK ideograph into its own word). The port instead groups consecutive
+    // CJK chars into a single display word (lyricview.rs:segment_words), so a CJK hero is a
+    // multi-char block rather than a single ideograph. Splitting CJK char-by-char here would
+    // restore folia's per-char role granularity BUT would reintroduce a deliberately-fixed
+    // visual bug: the giant-decoration copy (sonnetTypographyLayout.ts:49 decoration copies the
+    // hero segment text at up to 5.5x font scale) would echo a single hero ideograph huge — the
+    // same glyph twice at once (the "重复字形" artifact). The run-grouping is kept ON PURPOSE
+    // (documented here, not blindly reverted) so a CJK hero's giant echo is a multi-char ambient
+    // backdrop, not a duplicate ideograph. Trade-off: finer per-char role spread for CJK lines
+    // is lost vs folia; accepted for the cleaner hero backdrop. A targeted "skip giant for
+    // single-ideograph heroes" guard would unlock full folia CJK fidelity — noted as follow-up.
     // Global hero: the word with the highest segment score across the shot
     // (folia findSonnetHeroSegmentIndex on all segments).
     let mut hero = 0usize;
@@ -686,16 +716,16 @@ fn build_placements(
         .filter(|(text, _, _, _)| text.chars().any(|c| c.is_alphanumeric()))
         .count();
     let hero_score = segment_score(&all[hero].0, all[hero].1, all[hero].2);
-    let threshold = hero_score * 0.35;
+    let threshold = hero_score * SEMI_HERO_SCORE_RATIO;
     let hero_leans_early = hero <= (all.len() - 1) / 2;
-    let semi: Vec<usize> = if word_like_count >= 4 {
+    let semi: Vec<usize> = if word_like_count >= SEMI_HERO_MIN_LINE_WORDS {
         all.iter()
             .enumerate()
             .filter(|(i, (text, start, end, _))| {
                 *i != hero
                     && !text.chars().all(|c| !c.is_alphanumeric())
-                    && text.chars().filter(|c| !c.is_whitespace()).count() >= 2
-                    && i.abs_diff(hero) >= 2
+                    && text.chars().filter(|c| !c.is_whitespace()).count() >= SEMI_HERO_MIN_VISIBLE_LENGTH
+                    && i.abs_diff(hero) >= SEMI_HERO_MIN_GAP
                     && segment_score(text, *start, *end) >= threshold
                     && if hero_leans_early { *i > hero } else { *i < hero }
             })
@@ -715,8 +745,8 @@ fn build_placements(
     // Primary side ?? fallback to the opposite side (folia sonnetTypographyRoles.ts:100).
     if let Some(p) = best_of(&primary_side).or_else(|| best_of(&secondary_side)) {
         semi_heroes.push(p);
-        if word_like_count >= 9 {
-            if let Some(q) = best_of(&semi).filter(|&q| q != p && q.abs_diff(p) >= 2) {
+        if word_like_count >= SEMI_HERO_MULTI_WORD_COUNT {
+            if let Some(q) = best_of(&semi).filter(|&q| q != p && q.abs_diff(p) >= SEMI_HERO_MIN_GAP) {
                 semi_heroes.push(q);
             }
         }

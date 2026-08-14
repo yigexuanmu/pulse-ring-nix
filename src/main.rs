@@ -676,7 +676,7 @@ struct LyricFrame {
     time: f32,
     words: Vec<[f32; 20]>,
     /// Post-processing values for the lyric layer: [blur, glitch, noise, contrast].
-    fx: [f32; 8],
+    fx: [f32; 9],
     /// The SDF atlas gained glyphs this frame and should be re-uploaded to the renderer.
     atlas_dirty: bool,
 }
@@ -1262,7 +1262,7 @@ impl App {
             enabled: false,
             time: self.pos_sec,
             words: Vec::new(),
-            fx: [0.0; 8],
+            fx: [0.0; 9],
             atlas_dirty: false,
         };
         let style = self.cfg.style;
@@ -1329,9 +1329,9 @@ impl App {
             mg_decor: self.cfg.mg_decor,
             audio: self.lyric_audio,
             post: if self.cfg.post_enabled {
-                [self.cfg.post_grain, self.cfg.post_contrast, self.cfg.post_lens, self.cfg.post_rgb_shift, self.cfg.post_halftone, self.cfg.post_vignette]
+                [self.cfg.post_grain, self.cfg.post_contrast, self.cfg.post_lens_distortion, self.cfg.post_lens_dispersion, self.cfg.post_rgb_shift, self.cfg.post_halftone, self.cfg.post_vignette]
             } else {
-                [0.0; 6]
+                [0.0; 7]
             },
             font_weight: self.cfg.font_weight,
         };
@@ -1340,7 +1340,7 @@ impl App {
                 Some(d) => d,
                 None => match &virtual_data {
                     Some(v) => v,
-                    None => return LyricFrame { enabled: false, time: t, words: Vec::new(), fx: [0.0; 8], atlas_dirty },
+                    None => return LyricFrame { enabled: false, time: t, words: Vec::new(), fx: [0.0; 9], atlas_dirty },
                 },
             };
             let input = lyricview::StyleInput {

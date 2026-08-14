@@ -81,11 +81,15 @@ pub struct LyricFx {
     pub halftone: f32,
     /// Full-scene vignette amount (0..1).
     pub vignette: f32,
+    /// folia postProcessLensDistortion: full-frame radial barrel curvature (0..2).
+    pub lens_distortion: f32,
 }
 
 impl LyricFx {
-    pub fn to_array(&self) -> [f32; 8] {
-        [self.blur, self.glitch, self.noise, self.contrast, self.chromatic, self.rgb_shift, self.halftone, self.vignette]
+    pub fn to_array(&self) -> [f32; 9] {
+        // fx[8] = lens_distortion is appended so the existing WGSL u.lyric_fx[0..8] indices
+        // stay valid; the new WGSL barrel warp (`scene_at`) reads fx[8] for the curvature.
+        [self.blur, self.glitch, self.noise, self.contrast, self.chromatic, self.rgb_shift, self.halftone, self.vignette, self.lens_distortion]
     }
 }
 
@@ -619,7 +623,7 @@ pub struct StyleCtx<'a> {
     /// Audio energy [bass, vocal, power] (0..1) for music-reactive particles.
     pub audio: [f32; 3],
     /// Post-processing tuning [grain, contrast, lens, rgbShift, halftone, vignette].
-    pub post: [f32; 6],
+    pub post: [f32; 7],
     /// Manual global font weight (0 = per-role auto; 300/400/700/900 otherwise).
     pub font_weight: f32,
 }

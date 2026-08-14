@@ -162,23 +162,54 @@ struct Program {
     paras: Vec<(f32, f32, TransitionKind, f32)>,
 }
 
+// folia sonnetRandom — deterministic, stateless 32-bit FNV-1a + golden hash.
+// Every random selection in folia is *stateless*: each draw is
+// `hashSonnetSeed("{seed}:{para}:{shot}:{tag}")`, so the same lyric line at the same
+// passage always picks the same shot kind / variant / camera, with no PRNG state
+// drifting across the song. The previous 64-bit xorshift Seeded was stateful and
+// therefore drifted, mismatching folia on rebuild.
+const FNV_OFFSET: u32 = 2166136261;
+const FNV_PRIME: u32 = 16777619;
+const SONNET_GOLDEN: u32 = 2654435761;
+
+/// FNV-1a hash of a UTF-8 string (folia `hashSonnetSeed`).
+fn hash_sonnet_seed(s: &str) -> u32 {
+    let mut h = FNV_OFFSET;
+    for b in s.bytes() {
+        h ^= b as u32;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
+}
+/// Golden mix of `(seed ^ salt)` (folia `mixSonnetSeed`).
+fn mix_sonnet_seed(seed: u32, salt: u32) -> u32 {
+    (seed ^ salt).wrapping_mul(SONNET_GOLDEN)
+}
+/// Deterministic 0..1 jitter per `(seed, index, salt)` (folia `sonnetHash01`).
+fn sonnet_hash01(seed: u32, index: u32, salt: u32) -> f32 {
+    let s = seed.wrapping_add((index.wrapping_add(1)).wrapping_mul(97));
+    mix_sonnet_seed(s, salt) as f32 / 4294967296.0
+}
+
+// Local PRNG for *layout* jitter (fragment spread, poster rotation, MG decor
+// placement). folia uses `Math.random()` / `sonnetHash01` for these (stateless per
+// item), but the port chains a 32-bit golden mix drawn from the shot seed so the
+// layout is deterministic and rebuild-stable within a shot. Layout jitter only
+// affects *spatial spread* — never the program-level shot/camera picks that drive
+// "same lyric → same shot" — so a stateful chain here is harmless for fidelity.
 struct Seeded {
-    state: u64,
+    state: u32,
 }
 impl Seeded {
     fn new(seed: u64) -> Self {
-        Self { state: seed.wrapping_mul(0x9E3779B97F4A7C15) ^ 0x5DEECE66D }
+        Self { state: mix_sonnet_seed(seed as u32, 0x5EED) }
     }
-    fn next(&mut self) -> u64 {
-        let mut x = self.state;
-        x ^= x << 13;
-        x ^= x >> 7;
-        x ^= x << 17;
-        self.state = x;
-        x
+    fn next(&mut self) -> u32 {
+        self.state = mix_sonnet_seed(self.state, 0xBEEF);
+        self.state
     }
     fn unit(&mut self) -> f32 {
-        (self.next() >> 32) as f32 / u32::MAX as f32
+        self.next() as f32 / 4294967296.0
     }
 }
 
@@ -222,11 +253,10 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
     }
     para_bounds.push((para_start, lines.len()));
 
-    let mut rng = Seeded::new(seed);
     let mut shots: Vec<Shot> = Vec::new();
     let mut prev_kind: Option<ShotKind> = None;
     let mut prev_transition: Option<TransitionKind> = None;
-    for &(ps, pe) in &para_bounds {
+    for (para_idx, &(ps, pe)) in para_bounds.iter().enumerate() {
         // Paragraph kind (folia classifyParagraph): chorus / breath / verse heuristics.
         let para_dur = line_end(&lines[pe - 1], None) - lines[ps].start_ms as f32 / 1000.0;
         let para_words: usize = lines[ps..pe].iter().map(|l| split_with_timing(l, &LineTiming { start: l.start_ms as f32 / 1000.0, end: line_end(l, None), duration: 1.0 }).len()).sum();
@@ -237,7 +267,8 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
         let is_break = low.contains("bridge") || low.contains("break") || text_all.contains("间奏") || text_all.contains("桥");
         let is_breath = !is_chorus && !is_break && (para_dur <= 3.5 || para_words <= 3);
         let is_lift = !is_chorus && !is_break && (text_all.matches(['!', '?', '！', '？', '…']).count() >= 2 || para_words as f32 / para_dur.max(1.0) > 2.5);
-        let is_outro = pe >= lines.len() && para_dur > 10.0;
+        // folia classifyParagraph: the final paragraph is always 'outro' (no duration gate).
+        let is_outro = pe >= lines.len();
         let _ = (is_lift, is_outro);
         // Shot grouping thresholds. Previously (group.len() < 4 && dur <= 6s && para <= 18s)
         // a 3-line CJK verse hit the 4-line cap immediately and created a new shot, which
@@ -246,6 +277,7 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
         // shot and the scene stays stable long enough to read the lyrics.
         let mut group: Vec<usize> = Vec::new();
         let mut group_start: f32 = lines[ps].start_ms as f32 / 1000.0;
+        let mut shot_idx_in_para = 0usize;
         for idx in ps..pe {
             let end = line_end(&lines[idx], lines.get(idx + 1));
             let fits = group.len() < 6 && (end - group_start) <= 10.0 && (end - lines[ps].start_ms as f32 / 1000.0) <= 30.0;
@@ -255,23 +287,23 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
                 let first_shot = shots.is_empty();
                 let word_count: usize = group.iter().map(|&g| lines[g].text.split_whitespace().count()).sum();
                 let forced = if first_shot && is_breath && word_count <= 2 { Some(ShotKind::QuietTableau) } else { None };
-                push_shot(&mut shots, &mut rng, &mut prev_kind, &mut prev_transition, &group, lines, forced);
+                push_shot(&mut shots, &mut prev_kind, &mut prev_transition, &group, lines, forced, is_chorus, seed, para_idx, shot_idx_in_para);
+                shot_idx_in_para += 1;
                 group = vec![idx];
                 group_start = lines[idx].start_ms as f32 / 1000.0;
             }
         }
         if !group.is_empty() {
             let word_count: usize = group.iter().map(|&g| lines[g].text.split_whitespace().count()).sum();
+            // folia: forced is only the breath → quiet-tableau nudge; the chorus →
+            // type-impact swap is handled inside push_shot (no extra random draw).
             let forced = if shots.is_empty() && is_breath && word_count <= 2 {
                 Some(ShotKind::QuietTableau)
-            } else if is_chorus {
-                // folia: chorus swaps quiet-tableau to type-impact on this shot's own pick.
-                let pick = SHOT_KINDS[(rng.next() as usize) % SHOT_KINDS.len()];
-                if pick == ShotKind::QuietTableau { Some(ShotKind::TypeImpact) } else { None }
             } else {
                 None
             };
-            push_shot(&mut shots, &mut rng, &mut prev_kind, &mut prev_transition, &group, lines, forced);
+            push_shot(&mut shots, &mut prev_kind, &mut prev_transition, &group, lines, forced, is_chorus, seed, para_idx, shot_idx_in_para);
+            shot_idx_in_para += 1;
         }
     }
     // Paragraph-level transitions: one per paragraph boundary, alternating kinds (folia).
@@ -300,37 +332,38 @@ fn compile_program(lines: &[crate::lyrics::LyricLine], seed: u64) -> Program {
 
 fn push_shot(
     shots: &mut Vec<Shot>,
-    rng: &mut Seeded,
     prev_kind: &mut Option<ShotKind>,
     prev_transition: &mut Option<TransitionKind>,
     group: &[usize],
     lines: &[crate::lyrics::LyricLine],
     forced: Option<ShotKind>,
+    chorus: bool,
+    seed: u64,
+    para_idx: usize,
+    shot_idx: usize,
 ) {
     let start = lines[group[0]].start_ms as f32 / 1000.0;
     // Shot-boundary transition window (folia: min(0.24, max(0.14, gap*0.18))).
     let gap = shots.last().map(|s| start - s.start).unwrap_or(0.0);
     let twindow = (gap * 0.18).clamp(0.14, 0.24);
     let end = line_end(&lines[*group.last().unwrap()], None);
-    let mut kind = forced.unwrap_or_else(|| SHOT_KINDS[(rng.next() as usize) % SHOT_KINDS.len()]);
-    if Some(kind) == *prev_kind {
-        kind = SHOT_KINDS[(kind as usize + 1 + (rng.next() as usize) % (SHOT_KINDS.len() - 1)) % SHOT_KINDS.len()];
+    // folia chooseWithoutRepeat is stateless: a hash over `"{seed}:{para}:{shot}:{sig}"
+    // decides the kind, linearly probing forward past the previous kind. We mirror that so
+    // the same line at the same passage always renders the same shot across rebuilds.
+    let signature = group.iter().map(|&g| lines[g].text.as_str()).collect::<Vec<_>>().join("|");
+    let sig_seed = format!("{seed}:{para_idx}:{shot_idx}:{signature}");
+    let mut kind = forced.unwrap_or_else(|| choose_shot_kind(&sig_seed, *prev_kind));
+    // folia chorus override: a quiet-tableau pick in a chorus becomes type-impact.
+    if chorus && kind == ShotKind::QuietTableau {
+        kind = ShotKind::TypeImpact;
     }
     *prev_kind = Some(kind);
-    let variant = (rng.next() as u32) % 4;
-    let transition = if Some(TransitionKind::MonoGlitch) == *prev_transition {
-        TransitionKind::FastBlur
-    } else if Some(TransitionKind::FastBlur) == *prev_transition {
-        TransitionKind::CameraPull
-    } else if rng.unit() < 0.3 {
-        TransitionKind::MonoGlitch
-    } else if rng.unit() < 0.55 {
-        TransitionKind::FastBlur
-    } else {
-        TransitionKind::CameraPull
-    };
+    let variant = hash_sonnet_seed(&format!("{seed}:{para_idx}:{shot_idx}:variant")) % 4;
+    // folia transition pick — chooseWithoutRepeat over the 3 transition kinds.
+    let transition = choose_transition_kind(&format!("{seed}:{para_idx}:{shot_idx}:transition"), *prev_transition);
     *prev_transition = Some(transition);
-    let random = rng.next();
+    // folia camera random unpacking: one 32-bit FNV draw, spread across 4 bytes.
+    let random = hash_sonnet_seed(&format!("{seed}:{para_idx}:{shot_idx}:camera"));
     let (zoom_base, zoom_span) = match kind {
         ShotKind::PosterBlocks => (1.02, 0.16),
         ShotKind::QuietTableau => (1.12, 0.2),
@@ -338,7 +371,9 @@ fn push_shot(
     };
     let r_x = ((random & 255) as f32 / 255.0 - 0.5) * 0.18;
     let r_y = (((random >> 8) & 255) as f32 / 255.0 - 0.5) * 0.14;
-    let r_z = (((random >> 16) & 255) as f32 / 255.0) / 255.0;
+    // folia zoomRandom = ((random >>> 16) & 255) / 255 — a 0..1 value (the previous port
+    // divided by 255 twice, freezing zoom at `zoom_base` and wasting the span). Fixed.
+    let r_z = ((random >> 16) & 255) as f32 / 255.0;
     let r_rot = (((random >> 24) & 255) as f32 / 255.0 - 0.5) * 0.08;
     let camera = Camera {
         tx: r_x,
@@ -349,26 +384,40 @@ fn push_shot(
     shots.push(Shot { start, end, kind, variant, transition, twindow, line_range: group[0]..group[group.len() - 1] + 1, camera });
 }
 
-/// folia chooseWithoutRepeat: hash-seeded pick that avoids the previous kind.
+/// Paragraph-level transition kind (folia `resolveBoundaryKind` is a hash-seeded
+/// kind pick; we follow `chooseWithoutRepeat` to avoid repeating the previous
+/// paragraph's exit transition). Stateless FNV-1a over `"{seed}:para:{idx}"`.
 fn choose_transition_no_repeat(seed: u64, idx: u64, prev: Option<TransitionKind>) -> TransitionKind {
-    let mut h = 0xcbf29ce484222325u64 ^ (seed ^ idx.wrapping_mul(0x9E3779B97F4A7C15));
-    for _ in 0..4 {
-        h = h.wrapping_mul(0x100000001b3);
-        h ^= h >> 29;
-    }
-    let kinds = [
-        TransitionKind::MonoGlitch,
-        TransitionKind::FastBlur,
-        TransitionKind::CameraPull,
-    ];
-    let start = (h as usize) % kinds.len();
-    for k in 0..kinds.len() {
-        let c = kinds[(start + k) % kinds.len()];
+    choose_transition_kind(&format!("{seed}:para:{idx}"), prev)
+}
+
+/// folia `chooseWithoutRepeat` over the shot kinds.
+fn choose_shot_kind(sig_seed: &str, prev: Option<ShotKind>) -> ShotKind {
+    let start = (hash_sonnet_seed(sig_seed) as usize) % SHOT_KINDS.len();
+    for k in 0..SHOT_KINDS.len() {
+        let c = SHOT_KINDS[(start + k) % SHOT_KINDS.len()];
         if Some(c) != prev {
             return c;
         }
     }
-    kinds[start]
+    SHOT_KINDS[start]
+}
+
+/// folia `chooseWithoutRepeat` over the 3 transition kinds.
+fn choose_transition_kind(sig_seed: &str, prev: Option<TransitionKind>) -> TransitionKind {
+    const KINDS: [TransitionKind; 3] = [
+        TransitionKind::MonoGlitch,
+        TransitionKind::FastBlur,
+        TransitionKind::CameraPull,
+    ];
+    let start = (hash_sonnet_seed(sig_seed) as usize) % KINDS.len();
+    for k in 0..KINDS.len() {
+        let c = KINDS[(start + k) % KINDS.len()];
+        if Some(c) != prev {
+            return c;
+        }
+    }
+    KINDS[start]
 }
 
 fn find_shot(program: &Program, t: f32) -> Option<usize> {
@@ -1318,13 +1367,10 @@ fn camera_frame(kind: ShotKind, progress: f32, time: f32, shot: &Camera, breath:
     let pan_x = px + bx * breath;
     let pan_y = py + by * breath;
     let rot = shot.rot + pr + br * breath;
-    // Timeline pseudo-random shake (folia resolveTimelineShake); folia's runtime passes 0, we
-    // keep a whisper of it so long holds never feel frozen.
-    let sh_int = 0.003;
-    let sh_x = (time * 123.456).sin() * (time * 789.123).cos() * 0.02 * sh_int;
-    let sh_y = (time * 345.678).cos() * (time * 901.234).sin() * 0.02 * sh_int;
-    let sh_r = (time * 567.890).sin() * 0.005 * sh_int;
-    (scale, pan_x + sh_x, pan_y + sh_y, rot + sh_r)
+    // folia `resolveTimelineShake` is wired in the runtime but the folia runtime passes
+    // amplitude 0, so long holds sit perfectly still; drop our synthetic whisper so the
+    // port matches the calm cadence.
+    (scale, pan_x, pan_y, rot)
 }
 
 // ---------------------------------------------------------------- transitions
@@ -1574,12 +1620,13 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         blur: enter.blur.max(exit.blur),
         glitch: enter.glitch.max(exit.glitch),
         noise: ctx.post[0] * 0.35, // folia film grain: grain * 0.35
-        contrast: ctx.post[1] * 0.5 + (enter.blur + exit.blur).clamp(0.0, 0.25),
+        contrast: ctx.post[1] * 0.5, // folia postProcessContrast * 0.5 (the blur addend was a port-only fake)
         glow: 0.0,
-        chromatic: ctx.post[2] * 0.5, // lens dispersion + per-glyph CA entry
-        rgb_shift: ctx.post[3] * 0.8, // full-screen RGB shift print pass
-        halftone: ctx.post[4],
-        vignette: ctx.post[5],
+        chromatic: ctx.post[3], // folia postProcessLensDispersion: per-glyph chromatic dispersion
+        rgb_shift: ctx.post[4], // folia postProcessRgbShift: full-screen RGB shift print pass
+        halftone: ctx.post[5],
+        vignette: ctx.post[6],
+        lens_distortion: ctx.post[2], // folia postProcessLensDistortion: full-frame radial barrel
     };
 
     // Camera. Breath ramps in after the last glyph settles (folia resolveSonnetBreathWeight).
@@ -1643,22 +1690,33 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         }
         // Fly-in: offset from enter toward final; hero pops.
         let mut off = [p.enter[0] * (1.0 - fly), p.enter[1] * (1.0 - fly)];
-        // Support words sit slightly off the row normal (folia resolveSonnetSegmentNormalOffset,
-        // deterministic per word, ±0.3× font size along the layout normal).
+        // folia resolveSonnetSegmentNormalOffset: support words sit ±0.3× font size along the
+        // layout *normal* (rotation + π/2 for horizontal layouts; rotation for vertical). folia
+        // uses a stateless per-item random; we derive ours from the segment's start-time bits
+        // so it is deterministic and rebuild-stable. (The previous port only nudged Y, which
+        // pinned support words to the vertical axis and broke vertical and rotated layouts.)
         if p.role == Role::Support && !p.giant {
-            let r = (p.start * 12.9898).sin().mul_add(43758.5453, p.start.fract() * 101.0);
-            let r = r.fract();
-            off[1] += (r - 0.5) * p.size * 0.6;
+            let seg_seed = p.start.to_bits() ^ shot.start.to_bits();
+            let off_rand = sonnet_hash01(seg_seed, 0, 0x4F46) * 2.0 - 1.0; // -1..1
+            let normal_angle = p.rotation + if p.vertical { 0.0 } else { std::f32::consts::FRAC_PI_2 };
+            let dist = off_rand * p.size * 0.3;
+            off[0] += normal_angle.cos() * dist;
+            off[1] += normal_angle.sin() * dist;
         }
-        // Decoration depth: parallax against the camera pan — deeper layers move slower
-        // (folia zDepth is a deterministic random per segment).
-        let depth_r = (p.start * 7.13).sin().abs();
-        let depth = match p.role {
-            Role::Decoration => 0.3 + depth_r * 0.8,
-            Role::Support => 0.1 + depth_r * 0.25,
-            _ => 0.0,
+        // folia resolveSonnetSegmentDepth: only Decoration has depth, symmetric ±(0.5..1.3),
+        // drawn from a per-segment random — half of decor sits in front (+z) and half behind
+        // (−z), so the parallax pop never feels one-sided. (The previous port used
+        // sin(start*7.13).abs() supporting only +z, and incorrectly gave Support a depth
+        // term that folia leaves at 0.)
+        let depth = if p.role == Role::Decoration {
+            let seg_seed = p.start.to_bits() ^ shot.start.to_bits();
+            let r0 = sonnet_hash01(seg_seed, 1, 0x4448);
+            let r1 = sonnet_hash01(seg_seed, 2, 0x5040);
+            if r0 > 0.5 { 0.5 + r1 * 0.8 } else { -0.5 - r1 * 0.8 }
+        } else {
+            0.0
         };
-        if depth > 0.0 {
+        if depth != 0.0 {
             off[0] -= cam_px * min_d * fit * depth * 0.9;
             off[1] -= cam_py * min_d * fit * depth * 0.9;
         }

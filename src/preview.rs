@@ -84,7 +84,7 @@ pub fn render(text: &str, style: &str, time: f32, path: &str) -> Result<(), Stri
         mg_fixed: true,
         mg_decor: true,
         audio: [0.3, 0.3, 0.3],
-        post: [0.3, 0.5, 0.5, 0.3, 0.3, 0.5],
+        post: [0.3, 0.5, 0.4, 0.6, 0.3, 0.3, 0.5],
         font_weight: 0.0,
     };
     let input = StyleInput {

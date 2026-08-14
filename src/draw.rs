@@ -34,7 +34,7 @@ pub struct RingRenderer {
     lyric_word_count: u32,
     lyric_words_data: [f32; 65536],
     lyric_bounds_data: [f32; 4],
-    lyric_fx_data: [f32; 8],
+    lyric_fx_data: [f32; 9],
     capture_once: bool,
     capture_path: String,
     atlas_texture: Option<wgpu::Texture>,
@@ -117,7 +117,7 @@ struct Uniforms {
     lyric_word_count: u32,
     lyric_words: [f32; 65536],
     lyric_bounds: [f32; 4],
-    lyric_fx: [f32; 8],
+    lyric_fx: [f32; 9],
 }
 
 impl RingRenderer {
@@ -342,7 +342,7 @@ impl RingRenderer {
             lyric_word_count: 0,
             lyric_words_data: [0.0; 65536],
             lyric_bounds_data: [-1.0, -1.0, -1.0, -1.0],
-            lyric_fx_data: [0.0; 8],
+            lyric_fx_data: [0.0; 9],
             capture_once: false,
             capture_path: String::new(),
             atlas_texture: None,
@@ -392,7 +392,7 @@ impl RingRenderer {
     }
 
     /// Post-processing for the lyric layer: [blur, glitch, noise, contrast] in 0..1.
-    pub fn set_lyrics_fx(&mut self, fx: [f32; 8]) {
+    pub fn set_lyrics_fx(&mut self, fx: [f32; 9]) {
         self.lyric_fx_data = fx;
     }
 
@@ -941,7 +941,7 @@ const SHADER_SRC: &str = stringify!(
         lyric_word_count: u32,
         lyric_words: array<f32, 65536>,
         lyric_bounds: array<f32, 4>,
-        lyric_fx: array<f32, 8>,
+        lyric_fx: array<f32, 9>,
     };
 
     @group(0) @binding(1) var widget_texture: texture_2d<f32>;
@@ -1643,13 +1643,36 @@ const SHADER_SRC: &str = stringify!(
         return vec4<f32>(col, alpha);
     }
 
-    fn scene_at(p: vec2<f32>) -> vec4<f32> {        let ring_c = ring_at(p);
+    fn scene_at(p: vec2<f32>) -> vec4<f32> {
+        // folia sonnetLensFilter lensDistortion: a full-frame radial barrel warp. folia runs
+        // it as a texture-coordinate displacement filter over the whole rendered frame, so we
+        // mirror it by displacing the sample coordinate `pk` and routing ring + MG decor +
+        // lyrics through it — the entire scene bends together. Screen-aligned print passes
+        // (vignette / halftone / grain / glitch hash) and the lyric AABB fast-reject keep the
+        // un-warped `p` because their geometry is in compute/un-warped space; warping them
+        // would clip corner slivers of lyrics.
+        let lens_distortion = u.lyric_fx[8];
+        var pk = p;
+        if (lens_distortion > 0.0) {
+            let lc = u.resolution * 0.5;
+            let maxd = max(u.resolution.x, u.resolution.y);
+            let aspect = u.resolution.x / max(u.resolution.y, 1.0);
+            var centered = (p - lc) / maxd;
+            centered.x = centered.x * aspect;
+            let r2 = dot(centered, centered);
+            let curvature = min(lens_distortion, 2.0) * 0.32;
+            let radialScale = 1.0 - curvature * r2 + curvature * 0.16 * r2 * r2;
+            var warped = centered * radialScale;
+            warped.x = warped.x / aspect;
+            pk = lc + warped * maxd;
+        }
+        let ring_c = ring_at(pk);
         var ring_rgb = ring_c.rgb;
         let rgb_amt = u.lyric_fx[5];
         if (rgb_amt > 0.001) {
             let shift = vec2<f32>(1.25 * 0.9063, 1.25 * 0.4226) * rgb_amt;
-            let r = ring_at(p + shift);
-            let b = ring_at(p - shift);
+            let r = ring_at(pk + shift);
+            let b = ring_at(pk - shift);
             ring_rgb = vec3<f32>(r.r, ring_rgb.g, b.b);
         }
         // ---- lyrics: per-word textured quads sampled from the lyric line textures ----
@@ -1659,13 +1682,6 @@ const SHADER_SRC: &str = stringify!(
         var lyr_a = 0.0;
         var mg_col = vec3<f32>(0.0);
         var mg_a = 0.0;
-        // Lens distortion + dispersion (folia sonnetLensFilter): barrel warp of the lyric
-        // sampling position; the per-glyph CA channel adds the RGB split (dispersion).
-        let lc = u.resolution * 0.5;
-        let ld0 = (p - lc) / max(u.resolution.x, u.resolution.y);
-        let lr2 = dot(ld0, ld0);
-        let lens = 0.03 + u.lyric_fx[4] * 0.04;
-        let lpos = lc + (p - lc) * (1.0 + lens * lr2);
         // Fast reject: only pixels inside the lyrics' screen AABB run the per-quad loop.
         // Test against un-distorted `p` (the bounds are computed in un-distorted space);
         // using the post-lens `lpos` would push near-edge pixels outside the AABB and
@@ -1696,10 +1712,10 @@ const SHADER_SRC: &str = stringify!(
                 // Coarse axis-aligned reject: skip the rotation/slot work for far quads.
                 let lhalf_w = lw * lscale * 0.72;
                 let lhalf_h = lh * lscale * 0.72;
-                if (lpos.x < lx - lhalf_w || lpos.x > lx + lhalf_w || lpos.y < ly - lhalf_h || lpos.y > ly + lhalf_h) {
+                if (pk.x < lx - lhalf_w || pk.x > lx + lhalf_w || pk.y < ly - lhalf_h || pk.y > ly + lhalf_h) {
                     continue;
                 }
-                let ld = lpos - vec2<f32>(lx, ly);
+                let ld = pk - vec2<f32>(lx, ly);
                 let lcs = cos(-lrot);
                 let lsn = sin(-lrot);
                 var llx = ld.x * lcs - ld.y * lsn;

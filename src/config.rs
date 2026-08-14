@@ -378,11 +378,16 @@ pub struct Config {
     pub mg_bg: bool,
     pub mg_fixed: bool,
     pub mg_decor: bool,
-    /// Sonnet post-processing tuning (folia postProcessEnabled / grain / contrast / lens).
+    /// Sonnet post-processing tuning (folia postProcess stack).
     pub post_enabled: bool,
+    /// Film-grain noise (folia postProcessGrain, 0..1).
     pub post_grain: f32,
+    /// Contrast push (folia postProcessContrast, 0..1).
     pub post_contrast: f32,
-    pub post_lens: f32,
+    /// Radial barrel curvature: lens distortion (folia postProcessLensDistortion, 0..2).
+    pub post_lens_distortion: f32,
+    /// Radial chromatic dispersion: RGB edge separation (folia postProcessLensDispersion, 0..1).
+    pub post_lens_dispersion: f32,
     /// Manual global font weight override (folia normalizeFontWeight; 0 = per-role auto).
     pub font_weight: f32,
     /// Full-screen RGB shift amount (folia postProcessRgbShift).
@@ -455,14 +460,15 @@ impl Default for Config {
             mg_bg: true,
             mg_fixed: true,
             mg_decor: true,
-            post_enabled: true,
-            post_grain: 0.3,
-            post_contrast: 0.5,
-            post_lens: 0.5,
+            post_enabled: false,
+            post_grain: 0.2,
+            post_contrast: 0.0,
+            post_lens_distortion: 0.3,
+            post_lens_dispersion: 0.6,
             font_weight: 0.0,
             post_rgb_shift: 0.0,
-            post_halftone: 0.15,
-            post_vignette: 0.4,
+            post_halftone: 0.0,
+            post_vignette: 0.85,
         }
     }
 }
@@ -1003,9 +1009,17 @@ fn apply(cfg: &mut Config, key: &str, v: &Val) {
                 cfg.post_contrast = (*n).clamp(0.0, 1.0);
             }
         }
-        "postLens" | "postProcessLens" | "lens" => {
+        "postLensDistortion" | "postProcessLensDistortion" | "lensDistortion" => {
             if let Val::Num(n) = v {
-                cfg.post_lens = (*n).clamp(0.0, 1.0);
+                cfg.post_lens_distortion = (*n).clamp(0.0, 2.0);
+            }
+        }
+        "postLensDispersion" | "postProcessLensDispersion" | "lensDispersion" | "postLens" | "postProcessLens" | "lens" => {
+            // Legacy `postLens`/`lens` keys map onto dispersion (the closer of the two
+            // folia lens channels) so old configs keep the chromatic-edge look; the barrel
+            // curvature needs the explicit `lensDistortion` key.
+            if let Val::Num(n) = v {
+                cfg.post_lens_dispersion = (*n).clamp(0.0, 1.0);
             }
         }
         "fontWeight" | "fontWeightOverride" | "weight" => {

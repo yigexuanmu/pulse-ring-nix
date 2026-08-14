@@ -6,3 +6,4 @@ plugins/*/target/
 *.so
 # pi 编码 agent 运行时任务状态目录（不纳入版本管理）
 .pi/
+__pycache__/

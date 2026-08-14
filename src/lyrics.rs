@@ -10,6 +10,12 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::sync::mpsc;
 
+/// Pure-Rust lyric fetch layer (replaces the `python3 lyric_sources.py` subprocess). The
+/// source adapters are filled in incrementally; until wired in, [`fetch_lyrics`] still
+/// drives the legacy Python path so the project keeps building and rendering.
+#[path = "lyricfetch/mod.rs"]
+mod lyricfetch;
+
 /// One lyric line in the unified model (times in ms).
 #[derive(Debug, Clone)]
 pub struct LyricLine {

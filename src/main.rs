@@ -1575,10 +1575,15 @@ impl App {
         for p in &self.plugins {
             let out = p.call_transform(&render_bands);
             // Time-smooth the plugin output (strong low-pass) into the render copy.
+            // dt-aware exp smoothing (tau=0.048s attack / 0.203s release) — frame-rate
+            // independent, matched to the old alpha=0.5/0.15 blend at 30fps so 60fps
+            // doesn't halve the time constants. tau = 0.033 / -ln(1 - old_alpha).
             for i in 0..128 {
                 let v = out[i];
                 let s = self.plugin_smooth_bands[i];
-                let sm = if v > s { s * 0.5 + v * 0.5 } else { s * 0.85 + v * 0.15 };
+                let tau = if v > s { 0.048 } else { 0.203 };
+                let alpha = 1.0 - (-self.frame_dt / tau).exp();
+                let sm = s + (v - s) * alpha;
                 self.plugin_smooth_bands[i] = sm;
                 render_bands[i] = sm;
             }
@@ -1597,7 +1602,11 @@ impl App {
         let amp_avg = render_bands.iter().copied().sum::<f32>() / NBANDS as f32;
         // Time-domain low-pass: the ring band follows the music smoothly, so the particle
         // orbit swells and settles gently instead of twitching in/out.
-        self.ring_amp_smooth = self.ring_amp_smooth * 0.90 + amp_avg * 0.10;
+        // dt-aware exp smoothing (tau=0.1s) — frame-rate independent, so 60fps doesn't
+        // drift the time constant the way the old fixed alpha=0.10 (τ≈0.33s @ 30fps) would.
+        let tau = 0.1;
+        let alpha = 1.0 - (-self.frame_dt / tau).exp();
+        self.ring_amp_smooth += (amp_avg - self.ring_amp_smooth) * alpha;
         let particles = compute_particles(&self.cfg, elapsed, width, height, self.ring_amp_smooth);
 
         // Widgets need &mut self; do it before borrowing the renderer.

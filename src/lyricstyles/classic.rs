@@ -205,6 +205,19 @@ fn line_end(line: &crate::lyrics::LyricLine, next: Option<&crate::lyrics::LyricL
     end.max(start + 0.1)
 }
 
+/// `ease_in_out` via smoothstep (`t*t*(3-2t)`) — mirrors sonnet's cubic-bezier(0.65,0,0.35,1)
+/// ease approach (sonnet.rs:88) without pulling its private bezier solver into classic.
+/// Used by #3c1 line-container transition (enter pop + exit fade).
+fn ease_in_out(v: f32) -> f32 {
+    let t = v.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+#[inline]
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
 /// Build one frame of the classic lyric animation.
 ///
 /// **Skeleton (#3a)** — emits a visible centred layout of the currently-sung line plus a
@@ -246,6 +259,21 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         duration: (line_end(line, lines.get(active + 1)) - line.start_ms as f32 / 1000.0).max(0.1),
     };
 
+    // #3c1 line-container transition — folia `getClassicLineContainerMotion` 'normal' pose
+    // (tuning::TRANS_NORMAL_*): enter from {scale 0.9, blur 10px} over TRANS_NORMAL_EXIT_DUR,
+    // exit toward {scale 1.1, blur 20px} over the last TRANS_NORMAL_EXIT_DUR seconds. Opacity
+    // stays word-driven; the exit envelope `exit_alpha` dims words out. Eased via smoothstep
+    // (ease_in_out above), mirroring sonnet's ease approach.
+    let enter_t = ease_in_out(((t - timing.start) / tuning::TRANS_NORMAL_EXIT_DUR).clamp(0.0, 1.0));
+    let exit_t = ease_in_out(((timing.end - t) / tuning::TRANS_NORMAL_EXIT_DUR).clamp(0.0, 1.0));
+    let enter_scale = lerp(tuning::TRANS_NORMAL_ENTER_SCALE, 1.0, enter_t);
+    let exit_scale = lerp(1.0, tuning::TRANS_NORMAL_EXIT_SCALE, 1.0 - exit_t);
+    let line_scale = enter_scale * exit_scale;
+    let exit_alpha = exit_t; // 1 while settled, ->0 as the line ends.
+    let body_blur_px = (1.0 - enter_t) * tuning::TRANS_NORMAL_ENTER_BLUR
+        + (1.0 - exit_t) * tuning::TRANS_NORMAL_EXIT_BLUR;
+    let body_blur = (body_blur_px / 25.0).clamp(0.0, 1.0);
+
     // Main font size — folia classic `clamp(2.25rem, 6vw, 4.5rem)` = `clamp(36, 0.06*W, 72)`
     // (tuning.rs FONT_MAIN_*). Take `ctx.width * VW` then clamp to the rem bounds; the extra
     // clamp against `scales.main` (= H*0.16, the shared convention) keeps tall-portrait
@@ -276,12 +304,14 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     // breathes; `active_glow` extends the active halo with the track's power.
     for w in &words {
         let word_w = measure_text(ctx.atlas, &w.text, main_px);
+        // #3c1 line-container transition: `line_scale` (enter 0.9->1, exit 1->1.1)
+        // multiplies body scale; `exit_alpha` dims words out + recedes the accent glow on exit.
         let (alpha, scale, color, glow) = if t < w.start {
-            (tuning::WORD_WAITING_OPACITY, tuning::WORD_WAITING_SCALE, ctx.colors.dim, 0.0)
+            (tuning::WORD_WAITING_OPACITY * exit_alpha, tuning::WORD_WAITING_SCALE * line_scale, ctx.colors.dim, 0.0)
         } else if t <= w.end {
-            (tuning::WORD_ACTIVE_OPACITY, tuning::ACTIVE_SCALE_MULT * pulse, ctx.colors.accent, active_glow)
+            (tuning::WORD_ACTIVE_OPACITY * exit_alpha, tuning::ACTIVE_SCALE_MULT * pulse * line_scale, ctx.colors.accent, active_glow * exit_alpha)
         } else {
-            (tuning::WORD_PASSED_OPACITY_NORMAL, pulse, ctx.colors.primary, 0.0)
+            (tuning::WORD_PASSED_OPACITY_NORMAL * exit_alpha, pulse * line_scale, ctx.colors.primary, 0.0)
         };
         if alpha > 0.004 {
             push_word_full(
@@ -329,9 +359,10 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         }
     }
 
-    // #3b audio coupling: hand the lyric layer a power-proportional glow boost + a faint
-    // bass-driven grain (LyricFx is applied only to lyric quads — see draw.rs, matching
-    // folia's body-layer post-fx rather than the absent background shell).
-    let fx = LyricFx { glow: power * 0.35, noise: bass * 0.06, ..LyricFx::default() };
+    // #3b/#3c1 post-fx: power-driven glow + bass grain (#3b), plus the line-container
+    // body-layer blur (#3c1 enter-decay / exit-growth, encoded ~1px/25 units for draw.rs'
+    // glyph-only blur knob). LyricFx applies only to lyric quads, matching folia's body-layer
+    // post-fx rather than the absent VisualizerShell background.
+    let fx = LyricFx { blur: body_blur, glow: power * 0.35, noise: bass * 0.06, ..LyricFx::default() };
     StyleOutput { quads: out, fx }
 }

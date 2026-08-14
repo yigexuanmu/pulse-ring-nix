@@ -2165,7 +2165,18 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
 
     // Translation subtitle (plain text, no background pill).
     if !input.translation.is_empty() {
-        let current_line = shot.line_range.clone().find(|&li| lines[li].start_ms as f32 / 1000.0 <= t)
+        // Pick the ACTIVE sung line — the LAST line in the shot's line_range whose start has
+        // passed (folia `activeLine`). The port used `.find()` which returns the FIRST matching
+        // line, so a shot spanning several lines always displayed `line_range.start` and derived
+        // a_in/a_out from THAT line: as soon as the first line ended, a_out hit 0 and the
+        // subtitle dropped to the 0.35 floor for the rest of the shot, never cycling to the
+        // later lines — visibly frozen / “底部字幕缺字”. `rev().find()` mirrors rposition, giving
+        // the highest-index line whose start <= t, i.e. the line currently being sung.
+        let current_line = shot
+            .line_range
+            .clone()
+            .rev()
+            .find(|&li| lines[li].start_ms as f32 / 1000.0 <= t)
             .unwrap_or(shot.line_range.start);
         let timing = LineTiming {
             start: lines[current_line].start_ms as f32 / 1000.0,
@@ -2178,8 +2189,18 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         // Never fully hidden by shot transitions: clamp to a comfortable floor.
         let t_alpha = (0.95 * a_in.min(a_out)).max(0.35);
         if t_alpha > 0.004 {
-            let size = scales.subtitle;
-            let text_w = measure_text(ctx.atlas, input.translation, size);
+            let mut size = scales.subtitle;
+            let mut text_w = measure_text(ctx.atlas, input.translation, size);
+            // Fit the subtitle width to 92% of the stage before drawing. Long translations
+            // (dense CJK lines) overshot the stage and push_word_full emits glyphs past both
+            // edges — they are clipped by the layer transform, so the line visibly loses its
+            // first / last characters. Linear scaling: shrink the font once.
+            let max_w = ctx.width * 0.92;
+            if text_w > max_w {
+                let s = max_w / text_w;
+                size *= s;
+                text_w *= s;
+            }
             let bar_y = ctx.height * 0.90;
             push_word_full(
                 ctx.atlas, &mut out, input.translation,

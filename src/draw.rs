@@ -418,7 +418,8 @@ impl RingRenderer {
     }
 
     /// Upload the lyric layer state: enabled flag, current playback time and up to 3276 word
-    /// quads (20 f32 each: slot, uv(4), px(2), pos(2), scale, alpha, rotate, color(4), ext(4)).
+    /// quads (20 f32 each, AABB-first order paired with `CharQuad::to_array`:
+    /// slot, px(2), pos(2), scale, alpha, uv(4), rotate, color(4), ext(4)).
     pub fn set_lyrics(&mut self, enabled: bool, time: f32, words: &[[f32; 20]]) {
         self.lyric_enabled = enabled as u32;
         self.lyric_time = time;
@@ -432,13 +433,14 @@ impl RingRenderer {
             let o = i * 20;
             self.lyric_words_data[o..o + 20].copy_from_slice(word);
             // Rotation-safe AABB margin: a rotated quad's corners exceed the axis box by up to
-            // ~41%; 1.5x is a safe overdraw bound.
-            let half_x = word[5] * word[9].max(0.0) * 0.75;
-            let half_y = word[6] * word[9].max(0.0) * 0.75;
-            min_x = min_x.min(word[7] - half_x);
-            min_y = min_y.min(word[8] - half_y);
-            max_x = max_x.max(word[7] + half_x);
-            max_y = max_y.max(word[8] + half_y);
+            // ~41%; 1.5x is a safe overdraw bound. Indices follow the AABB-first layout
+            // (px=1/2, pos=3/4, scale=5) and must stay paired with `to_array`.
+            let half_x = word[1] * word[5].max(0.0) * 0.75;
+            let half_y = word[2] * word[5].max(0.0) * 0.75;
+            min_x = min_x.min(word[3] - half_x);
+            min_y = min_y.min(word[4] - half_y);
+            max_x = max_x.max(word[3] + half_x);
+            max_y = max_y.max(word[4] + half_y);
         }
         if n > 0 {
             self.lyric_bounds_data = [min_x, min_y, max_x, max_y];
@@ -1704,21 +1706,17 @@ const SHADER_SRC: &str = stringify!(
             && p.y >= u.lyric_bounds[1] && p.y <= u.lyric_bounds[3]) {
             for (var li = 0u; li < u.lyric_word_count; li = li + 1u) {
                 let lo = li * 20u;
+                // AABB + transform fields (offsets 0..6) come first so the per-quad
+                // rejects below fire before we touch the survivor-only
+                // uv/rotate/tint/ext fields. Paired with `CharQuad::to_array` in
+                // src/lyricview.rs — indices must agree or the shader reads garbage.
                 let lslot = u.lyric_words[lo];
-                let luv_x = u.lyric_words[lo + 1u];
-                let luv_y = u.lyric_words[lo + 2u];
-                let luv_w = u.lyric_words[lo + 3u];
-                let luv_h = u.lyric_words[lo + 4u];
-                let lw = u.lyric_words[lo + 5u];
-                let lh = u.lyric_words[lo + 6u];
-                let lx = u.lyric_words[lo + 7u];
-                let ly = u.lyric_words[lo + 8u];
-                let lscale = u.lyric_words[lo + 9u];
-                let lalpha = u.lyric_words[lo + 10u];
-                let lrot = u.lyric_words[lo + 11u];
-                let lv0 = vec2<f32>(u.lyric_words[lo + 16u], u.lyric_words[lo + 17u]);
-                let lv1 = vec2<f32>(u.lyric_words[lo + 18u], u.lyric_words[lo + 19u]);
-                let ltint = vec4<f32>(u.lyric_words[lo + 12u], u.lyric_words[lo + 13u], u.lyric_words[lo + 14u], u.lyric_words[lo + 15u]);
+                let lw = u.lyric_words[lo + 1u];
+                let lh = u.lyric_words[lo + 2u];
+                let lx = u.lyric_words[lo + 3u];
+                let ly = u.lyric_words[lo + 4u];
+                let lscale = u.lyric_words[lo + 5u];
+                let lalpha = u.lyric_words[lo + 6u];
                 if (lalpha <= 0.004 || lw <= 0.0 || lh <= 0.0) {
                     continue;
                 }
@@ -1728,6 +1726,17 @@ const SHADER_SRC: &str = stringify!(
                 if (pk.x < lx - lhalf_w || pk.x > lx + lhalf_w || pk.y < ly - lhalf_h || pk.y > ly + lhalf_h) {
                     continue;
                 }
+                // Survivor-only fields: glyph UV rect, rotation, shape vertices (ext)
+                // and tint (color). Read after both rejects so far / invisible quads
+                // skip ~3x the storage-array loads.
+                let luv_x = u.lyric_words[lo + 7u];
+                let luv_y = u.lyric_words[lo + 8u];
+                let luv_w = u.lyric_words[lo + 9u];
+                let luv_h = u.lyric_words[lo + 10u];
+                let lrot = u.lyric_words[lo + 11u];
+                let lv0 = vec2<f32>(u.lyric_words[lo + 16u], u.lyric_words[lo + 17u]);
+                let lv1 = vec2<f32>(u.lyric_words[lo + 18u], u.lyric_words[lo + 19u]);
+                let ltint = vec4<f32>(u.lyric_words[lo + 12u], u.lyric_words[lo + 13u], u.lyric_words[lo + 14u], u.lyric_words[lo + 15u]);
                 let ld = pk - vec2<f32>(lx, ly);
                 let lcs = cos(-lrot);
                 let lsn = sin(-lrot);

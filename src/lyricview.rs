@@ -38,13 +38,19 @@ pub struct CharQuad {
 
 impl CharQuad {
     pub fn to_array(&self) -> [f32; 20] {
+        // Field order is perf-sensitive: the WGSL `scene_at` lyric loop reads the
+        // AABB + transform fields (glow/slot, px, pos, scale, alpha) at offsets 0..6
+        // FIRST so it can reject out-of-view / invisible quads before touching the
+        // survivor-only fields (uv, rotate, color, ext). Keep this paired with the
+        // indices in src/draw.rs `scene_at` and `set_lyrics` — they must agree or the
+        // shader reads garbage.
         [
             self.glow,
-            self.uv[0], self.uv[1], self.uv[2], self.uv[3],
             self.px[0], self.px[1],
             self.pos[0], self.pos[1],
             self.scale,
             self.alpha,
+            self.uv[0], self.uv[1], self.uv[2], self.uv[3],
             self.rotate,
             self.color[0], self.color[1], self.color[2], self.color[3],
             self.ext[0], self.ext[1], self.ext[2], self.ext[3],

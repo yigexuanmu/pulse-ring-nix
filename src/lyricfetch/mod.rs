@@ -10,6 +10,7 @@
 use crate::lyrics::{LyricData, TrackRequest};
 
 pub(crate) mod lrc;
+pub(crate) mod lrclib;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -24,6 +25,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
     }
     match source.as_str() {
         "" | "auto" => fetch_auto(req),
+        "lrclib" => lrclib::fetch_lrclib(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }
@@ -84,6 +86,81 @@ pub(crate) fn duration_ms(value: &str) -> i64 {
     } else {
         v
     }
+}
+
+// ---- shared HTTP helpers (mirror lyric_sources.py module utils, lines 415-435) ----
+
+use std::time::Duration;
+
+/// Noctalia UA sent on every adapter request (lyric_sources.py:18).
+const USER_AGENT: &str = "Noctalia-Lyrics/1.0";
+
+/// Default per-adapter network timeout (lyric_sources.py:415 `timeout=15`).
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `form_urlencoded`-style percent encoding mirroring `urllib.parse.quote_plus` (used by
+/// `query_url`, lyric_sources.py:434): unreserved `A-Za-z0-9-_.~` stay, space -> `+`,
+/// everything else -> `%XX` of the UTF-8 byte (uppercase hex).
+fn percent_encode_form(value: &str) -> String {
+    use std::fmt::Write;
+    let mut buf = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                buf.push(*byte as char);
+            }
+            b' ' => buf.push('+'),
+            b => {
+                buf.push('%');
+                let _ = write!(buf, "{b:02X}");
+            }
+        }
+    }
+    buf
+}
+
+/// `query_url` (lyric_sources.py:434): join `base` with `?` (or `&` if already queried) and
+/// the form-encoded `params`; insertion order preserved (keys here are static ASCII literals).
+pub(crate) fn query_url(base: &str, params: &[(&str, String)]) -> String {
+    let sep = if base.contains('?') { '&' } else { '?' };
+    let mut out = String::from(base);
+    out.push(sep);
+    let mut first = true;
+    for (k, v) in params {
+        if !first {
+            out.push('&');
+        }
+        first = false;
+        out.push_str(k);
+        out.push('=');
+        out.push_str(&percent_encode_form(v));
+    }
+    out
+}
+
+/// `request_json` (lyric_sources.py:426): GET with the Noctalia UA + JSON accept headers,
+/// decode the body (stripping a `callback(...)` JSONP wrapper if present), parse JSON. POST
+/// form bodies land with the NetEase/QQ sources; this is the GET profile used by LRCLIB.
+pub(crate) fn request_json(url: &str, timeout: Duration) -> Result<serde_json::Value, String> {
+    let resp = ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .set(
+            "Accept",
+            "application/json, text/plain, application/xml, text/xml",
+        )
+        .timeout(timeout)
+        .call()
+        .map_err(|e| format!("request_json: {e}"))?;
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("request_json: read body: {e}"))?;
+    let text = body.trim();
+    let payload = if text.starts_with("callback(") && text.ends_with(')') {
+        &text["callback(".len()..text.len() - 1]
+    } else {
+        text
+    };
+    serde_json::from_str(payload).map_err(|e| format!("request_json: bad JSON: {e}"))
 }
 
 /// `finalize` (lyric_sources.py:131-166): keep lines with any visible text, sort timed-first,

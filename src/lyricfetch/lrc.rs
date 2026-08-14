@@ -61,6 +61,28 @@ pub(crate) fn parse_lrc(text: &str) -> Vec<LyricLine> {
     finalize(result, 0)
 }
 
+/// `parse_plain` (lyric_sources.py:186): split text into untimed lines (time = -1),
+/// dropping any whose `clean_text` is empty. Does NOT call `finalize` (matching Python).
+pub(crate) fn parse_plain(text: &str) -> Vec<LyricLine> {
+    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+    let mut out = Vec::new();
+    for raw in normalized.split('\n') {
+        let cleaned = clean_text(raw);
+        if cleaned.is_empty() {
+            continue;
+        }
+        out.push(LyricLine {
+            start_ms: -1,
+            duration_ms: 0,
+            text: cleaned,
+            translation: String::new(),
+            romanization: String::new(),
+            chars: Vec::new(),
+        });
+    }
+    out
+}
+
 /// Inline KRC-styled line `[start,dur]<...>body` (lyric_sources.py:204-227).
 fn krc_branch(krc: &Captures, offset: i64, out: &mut Vec<LyricLine>) {
     let start = number(&krc[1], 0);

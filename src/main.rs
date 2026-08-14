@@ -297,8 +297,8 @@ fn main() {
     };
 
     // Wait for the first configure (outputs sized) via blocking dispatch, then switch to a
-    // timed render loop (~30 fps) so the compositor only recomposites on our updates.
-    let interval = std::time::Duration::from_millis(33);
+    // timed render loop (~60 fps) so the compositor only recomposites on our updates.
+    let interval = std::time::Duration::from_millis(16);
     while !app.outputs.iter().any(|o| o.width > 0) {
         event_queue.blocking_dispatch(&mut app).unwrap();
         if !app.outputs.is_empty() && app.outputs.iter().all(|o| o.closed) {

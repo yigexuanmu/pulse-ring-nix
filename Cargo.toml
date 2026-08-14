@@ -28,6 +28,17 @@ rusttype = "0.9"
 libloading = "0.9.0"
 serde_json = "1"
 fontdue = "0.9"
+# Pure-Rust lyric fetch layer (replaces the bundled lyric_sources.py subprocess).
+# ureq 2.x `tls` feature = rustls backend + embedded webpki-roots (Mozilla CA bundle
+# baked into the binary), so HTTPS works with no SSL_CERT_FILE / cacert dependency.
+ureq = { version = "2.12", features = ["tls"] }
+base64 = "0.22"
+# Reuse the same minor versions already pulled transitively (wgpu/naga) so no
+# duplicate crates are compiled: quick-xml 0.41, regex 1.x, miniz_oxide 0.8
+# (flate2's zlib backend, used to inflate NetEase KRC blobs).
+quick-xml = "0.41"
+regex = "1"
+miniz_oxide = "0.8"
 
 [dev-dependencies]
 naga = "30.0.0"

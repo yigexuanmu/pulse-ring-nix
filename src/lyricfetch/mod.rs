@@ -11,6 +11,7 @@ use crate::lyrics::{LyricData, TrackRequest};
 
 pub(crate) mod lrc;
 pub(crate) mod lrclib;
+pub(crate) mod netease;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -26,6 +27,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
     match source.as_str() {
         "" | "auto" => fetch_auto(req),
         "lrclib" => lrclib::fetch_lrclib(req),
+        "netease" | "netease_public" => netease::fetch_netease(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }
@@ -138,16 +140,24 @@ pub(crate) fn query_url(base: &str, params: &[(&str, String)]) -> String {
     out
 }
 
-/// `request_json` (lyric_sources.py:426): GET with the Noctalia UA + JSON accept headers,
-/// decode the body (stripping a `callback(...)` JSONP wrapper if present), parse JSON. POST
-/// form bodies land with the NetEase/QQ sources; this is the GET profile used by LRCLIB.
-pub(crate) fn request_json(url: &str, timeout: Duration) -> Result<serde_json::Value, String> {
-    let resp = ureq::get(url)
+/// `request_json` (lyric_sources.py:426): GET with the Noctalia UA + JSON accept headers
+/// (plus any caller-supplied headers, e.g. NetEase's `Referer`), decode the body (stripping
+/// a `callback(...)` JSONP wrapper if present), parse JSON. POST form bodies land with the
+/// QQ/Kugou sources; this is the GET profile.
+pub(crate) fn request_json(
+    url: &str,
+    headers: Option<&[(&str, &str)]>,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
+    let mut req = ureq::get(url)
         .set("User-Agent", USER_AGENT)
-        .set(
-            "Accept",
-            "application/json, text/plain, application/xml, text/xml",
-        )
+        .set("Accept", "application/json, text/plain, application/xml, text/xml");
+    if let Some(extra) = headers {
+        for (k, v) in extra {
+            req = req.set(k, v);
+        }
+    }
+    let resp = req
         .timeout(timeout)
         .call()
         .map_err(|e| format!("request_json: {e}"))?;
@@ -161,6 +171,94 @@ pub(crate) fn request_json(url: &str, timeout: Duration) -> Result<serde_json::V
         text
     };
     serde_json::from_str(payload).map_err(|e| format!("request_json: bad JSON: {e}"))
+}
+
+/// `best_match` (lyric_sources.py:457-469): pick the item (by index) scoring highest against
+/// the wanted track — title exact=6/substr=3 (a zero skips the item), artist 4/2, album 2/1.
+/// Qualifying matches need >=3; ties keep the earliest item (Python's strict-greater min).
+pub(crate) fn best_match<T, TF, AF, LF>(
+    items: &[&T],
+    wanted_title: &str,
+    wanted_artist: &str,
+    wanted_album: &str,
+    title: TF,
+    artist: AF,
+    album: LF,
+) -> Option<usize>
+where
+    TF: Fn(&T) -> String,
+    AF: Fn(&T) -> String,
+    LF: Fn(&T) -> String,
+{
+    let w_title = normalize(wanted_title);
+    let w_artist = normalize(wanted_artist);
+    let w_album = normalize(wanted_album);
+    let mut best: Option<(usize, i64)> = None;
+    for (index, item) in items.iter().enumerate() {
+        let t = normalize(&title(item));
+        let a = normalize(&artist(item));
+        let al = normalize(&album(item));
+        let mut score: i64 = 0;
+        if !w_title.is_empty() && !t.is_empty() {
+            let t_score = if t == w_title {
+                6
+            } else if w_title.contains(&t) || t.contains(&w_title) {
+                3
+            } else {
+                0
+            };
+            if t_score == 0 {
+                continue;
+            }
+            score += t_score;
+        }
+        if !w_artist.is_empty() && !a.is_empty() {
+            score += if a == w_artist {
+                4
+            } else if w_artist.contains(&a) || a.contains(&w_artist) {
+                2
+            } else {
+                0
+            };
+        }
+        if !w_album.is_empty() && !al.is_empty() {
+            score += if al == w_album {
+                2
+            } else if w_album.contains(&al) || al.contains(&w_album) {
+                1
+            } else {
+                0
+            };
+        }
+        match best {
+            Some((_, bs)) if bs >= score => {}
+            _ => best = Some((index, score)),
+        }
+    }
+    best.and_then(|(i, s)| if s >= 3 { Some(i) } else { None })
+}
+
+/// Read a JSON object field as a cleaned string, tolerating numbers/bools — parity with
+/// Python `clean_text(item.get(k))`.
+pub(crate) fn json_str(v: &serde_json::Value, key: &str) -> String {
+    match v.get(key) {
+        Some(serde_json::Value::String(s)) => clean_text(s),
+        Some(other) => clean_text(&other.to_string()),
+        None => String::new(),
+    }
+}
+
+/// Python `number(value, default)` over a JSON value: a JSON number (int/float) or a numeric
+/// string; otherwise `default`.
+pub(crate) fn json_num(v: Option<&serde_json::Value>, default: i64) -> i64 {
+    match v {
+        Some(serde_json::Value::Number(n)) => n
+            .as_i64()
+            .or_else(|| n.as_f64().map(|f| f as i64))
+            .unwrap_or(default),
+        Some(serde_json::Value::String(s)) => number(s, default),
+        _ => default,
+    }
 }
 
 /// `finalize` (lyric_sources.py:131-166): keep lines with any visible text, sort timed-first,

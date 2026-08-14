@@ -27,7 +27,8 @@ pub(crate) fn fetch_lrclib(req: &TrackRequest) -> Result<LyricData, String> {
         params.push(("album_name", req.album.clone()));
     }
     let url = query_url("https://lrclib.net/api/search", &params); // :610
-    let data = request_json(&url, REQUEST_TIMEOUT).map_err(|e| format!("lrclib: {e}"))?;
+    let data =
+        request_json(&url, None, REQUEST_TIMEOUT).map_err(|e| format!("lrclib: {e}"))?;
     parse_lrclib_response(&data, req)
 }
 

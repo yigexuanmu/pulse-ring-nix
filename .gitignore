@@ -1,4 +1,6 @@
 /target
+# nix build 输出 symlink（不纳入版本管理）
+/result
 # 插件构建产物
 plugins/*/target/
 *.so

@@ -1768,11 +1768,16 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
             off[0] -= cam_px * min_d * fit * depth * 0.9;
             off[1] -= cam_py * min_d * fit * depth * 0.9;
         }
-        // Full-word entrance scale (folia: 0.86 + fly*0.14) — applied to all roles so the
-        // post-transition entrance is visible. Hero keeps its extra 1.0 → 1.2 pop on top.
-        let enter_scale = 0.86 + fly * 0.14;
+        // folia applies the entrance settle ONLY per-glyph (createSonnetPixiRuntime.ts:509,
+        // scale = 0.86 + glyphProgress*0.14 / 0.52 + glyphProgress*0.48); there is no full-
+        // word enter_scale. A prior port also multiplied in a word-level `enter_scale` here,
+        // which `push_word_full` then multiplied AGAIN by the per-glyph `char_scale` (see
+        // lyricview.rs:387 `quad_scale = quad_scale * scale_i`) — a double-applied settle
+        // that made every incoming glyph visibly jump (user report: 动画不顺滑、装饰突兀).
+        // Drop the word-level settle; the per-glyph settle below is folia's single source.
+        // Hero keeps its extra 1.0 → 1.2 pop on top (independent of the settle).
         let hero_pop = if p.role == Role::Hero { 1.0 + (1.0 - fly) * 0.2 } else { 1.0 };
-        let scale = fit * pop * enter_scale * hero_pop;
+        let scale = fit * pop * hero_pop;
         // folia resolveSonnetRoleFontWeight: manual global override else per-role weights.
         let weight = if ctx.font_weight > 0.0 {
             let w = ctx.font_weight.round();
@@ -1851,10 +1856,15 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         } else {
             Vec::new()
         };
-        // Per-glyph settle scale (folia: 0.86 + fly*0.14; type-impact emphasis 0.52 + fly*0.48).
-        // Pulled in to 0.97 + fly*0.03 — the old 0.86 swing made each incoming character
-        // look like an "extra" glyph at a different position; the ripple is now a subtle
-        // breathing-in rather than a visible size jump.
+        // Per-glyph settle scale — folia's single source of truth
+        // (createSonnetPixiRuntime.ts:509-510):
+        //   type-impact emphasis (hero/semi-hero): 0.52 + glyphProgress*0.48
+        //   everything else:                      0.86 + glyphProgress*0.14
+        // `glyphProgress` = resolveSegmentProgress = easeSonnetExpoOut((t-st)/settle)
+        // (sonnetMotion.ts:62), which matches our per-glyph `char_fly[i] = ease_expo_out(..)`.
+        // A prior port damped this to 0.97+fly*0.03 / 0.7+fly*0.3 to mask the jitter caused
+        // by the double-applied word-level enter_scale removed above. Now that the double
+        // application is gone, restore folia's true settle swing.
         let char_scale: Vec<f32> = if p.giant || char_fly.is_empty() {
             Vec::new()
         } else {
@@ -1862,9 +1872,9 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
                 .iter()
                 .map(|&fly_i| {
                     if emphasis && shot.kind == ShotKind::TypeImpact {
-                        0.7 + fly_i * 0.3
+                        0.52 + fly_i * 0.48
                     } else {
-                        0.97 + fly_i * 0.03
+                        0.86 + fly_i * 0.14
                     }
                 })
                 .collect()

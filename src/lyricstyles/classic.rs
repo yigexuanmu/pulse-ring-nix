@@ -259,6 +259,15 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         duration: (line_end(line, lines.get(active + 1)) - line.start_ms as f32 / 1000.0).max(0.1),
     };
 
+    // #3c2 lyricContainerFloat — folia whole-line ambient breathing (Visualizer.tsx:636-642,
+    // 'normal' {distance 14, duration 7}). Slow sinusoidal y-drift + scale swing keyed to the
+    // tuned duration + `breathingFloatMultiplier` (NOT audio — folia ties it to the
+    // multiplier, `:633`). Adds a gentle ambient emphasis atop the beat-driven #3b pulse.
+    let float_ang = t * 2.0 * std::f32::consts::PI / tuning::FLOAT_NORMAL_DURATION;
+    let float_y = -tuning::FLOAT_NORMAL_DISTANCE * 0.5 * float_ang.sin();
+    let float_scale = 1.0
+        + tuning::FLOAT_SCALE_SWING * tuning::BREATHING_FLOAT_MULTIPLIER * (float_ang * 2.0).sin();
+
     // #3c1 line-container transition — folia `getClassicLineContainerMotion` 'normal' pose
     // (tuning::TRANS_NORMAL_*): enter from {scale 0.9, blur 10px} over TRANS_NORMAL_EXIT_DUR,
     // exit toward {scale 1.1, blur 20px} over the last TRANS_NORMAL_EXIT_DUR seconds. Opacity
@@ -268,7 +277,7 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     let exit_t = ease_in_out(((timing.end - t) / tuning::TRANS_NORMAL_EXIT_DUR).clamp(0.0, 1.0));
     let enter_scale = lerp(tuning::TRANS_NORMAL_ENTER_SCALE, 1.0, enter_t);
     let exit_scale = lerp(1.0, tuning::TRANS_NORMAL_EXIT_SCALE, 1.0 - exit_t);
-    let line_scale = enter_scale * exit_scale;
+    let line_scale = enter_scale * exit_scale * float_scale;
     let exit_alpha = exit_t; // 1 while settled, ->0 as the line ends.
     let body_blur_px = (1.0 - enter_t) * tuning::TRANS_NORMAL_ENTER_BLUR
         + (1.0 - exit_t) * tuning::TRANS_NORMAL_EXIT_BLUR;
@@ -295,7 +304,7 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
     // the main font size (a beat-driven jump); `power` adds a ~4% uniform scale pulse so the
     // line visibly "breathes" to the track's energy on top of folia's lyric-timestamp poses.
     let pulse = 1.0 + power * 0.04;
-    let baseline_y = ctx.height * 0.5 - bass * main_px * 0.06;
+    let baseline_y = ctx.height * 0.5 - bass * main_px * 0.06 + float_y;
     let active_glow = 0.55 + power * 0.45;
 
     // Per-word reveal: folia `layoutVariants` poses (tuning.rs WORD_*). Skeleton uses a hard

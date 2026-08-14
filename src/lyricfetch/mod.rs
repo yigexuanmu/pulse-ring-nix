@@ -14,6 +14,7 @@ pub(crate) mod lrclib;
 pub(crate) mod netease;
 pub(crate) mod qqmusic;
 pub(crate) mod splayer;
+pub(crate) mod kugou;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -32,6 +33,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
         "netease" | "netease_public" => netease::fetch_netease(req),
         "qqmusic" => qqmusic::fetch_qqmusic(req),
         "splayer" => splayer::fetch_splayer(req),
+        "kugou" => kugou::fetch_kugou(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }

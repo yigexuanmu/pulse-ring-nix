@@ -108,6 +108,12 @@ struct App {
     /// when we start doesn't get every prior lyric "played through" during the smoothing
     /// ramp.
     pos_synced: bool,
+    /// Measured wall-clock delta of the previous frame (seconds), written by the main
+    /// loop every iteration and read by `update_pos` so the lyric playback timeline keeps
+    /// advancing correctly when a frame drops and the 33 ms tick budget is exceeded. The
+    /// old code passed a hardcoded `0.033`, so on multi-ms spikes the lyric position slid
+    /// behind the real song position (D.8 / G6).
+    frame_dt: f32,
     /// SDF glyph atlas backing real-time lyric text.
     glyph_atlas: sdf::GlyphAtlas,
     /// Last time lyric diagnostics were logged (seconds since start).
@@ -264,6 +270,7 @@ fn main() {
         pos_us,
         pos_sec: 0.0,
         pos_synced: false,
+        frame_dt: 0.033,
         glyph_atlas: sdf::GlyphAtlas::new_with_weights(
             &font_data,
             {
@@ -298,8 +305,16 @@ fn main() {
             return;
         }
     }
+    // Measured frame delta: the main loop now tracks the real wall-clock gap between
+    // consecutive iterations (including the sleep at the bottom) and hands it to the
+    // renderer so `update_pos` advances the lyric timeline by the true elapsed time
+    // instead of a fixed 0.033 — frame drops no longer leave the lyric curtain drifting.
+    let mut last_frame = std::time::Instant::now();
     loop {
         let before = std::time::Instant::now();
+        let dt = before.duration_since(last_frame).as_secs_f32().min(0.1);
+        last_frame = before;
+        app.frame_dt = dt;
         event_queue.dispatch_pending(&mut app).unwrap();
         app.tick();
         if !app.outputs.is_empty() && app.outputs.iter().all(|o| o.closed) {
@@ -1532,7 +1547,7 @@ impl App {
         }
 
         let elapsed = self.start.elapsed().as_secs_f32();
-        self.update_pos(0.033);
+        self.update_pos(self.frame_dt);
         if elapsed - self.last_music_poll > 2.0 {
             self.last_music_poll = elapsed;
             self.poll_music();

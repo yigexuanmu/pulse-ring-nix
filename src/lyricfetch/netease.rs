@@ -125,7 +125,7 @@ fn artists_join(x: &Value) -> String {
 }
 
 /// Which [`LyricLine`] side-channel [`merge_timed`] writes into.
-enum MergeField {
+pub(crate) enum MergeField {
     Translation,
     Romanization,
 }
@@ -135,7 +135,7 @@ enum MergeField {
 /// `tolerance` ms) — or the index-aligned *untimed* one — but only if the target's field is
 /// still empty. Mutates `primary` in place; ties on the closest match keep the first
 /// secondary line (Python `min`).
-fn merge_timed(
+pub(crate) fn merge_timed(
     primary: &mut [LyricLine],
     secondary: &[LyricLine],
     field: MergeField,

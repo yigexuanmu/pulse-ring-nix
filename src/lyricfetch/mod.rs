@@ -12,6 +12,7 @@ use crate::lyrics::{LyricData, TrackRequest};
 pub(crate) mod lrc;
 pub(crate) mod lrclib;
 pub(crate) mod netease;
+pub(crate) mod qqmusic;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -28,6 +29,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
         "" | "auto" => fetch_auto(req),
         "lrclib" => lrclib::fetch_lrclib(req),
         "netease" | "netease_public" => netease::fetch_netease(req),
+        "qqmusic" => qqmusic::fetch_qqmusic(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }

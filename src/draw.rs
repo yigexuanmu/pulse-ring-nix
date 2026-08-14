@@ -48,6 +48,21 @@ pub struct RingRenderer {
     // before any real texture has been uploaded — see the bind-group race fix (G1).
     placeholder_texture: wgpu::Texture,
     placeholder_view: wgpu::TextureView,
+    // Surface format cached so the offscreen (must match the surface's colour quality)
+    // and the blit pipeline target can be (re)created on resize/scale change without
+    // re-querying capabilities.
+    surface_format: wgpu::TextureFormat,
+    // render_scale offscreen: the scene is drawn here, then a fullscreen-triangle blit
+    // pass copies it to the surface. At render_scale = 1.0 this is full-res and the
+    // blit is a 1:1 texel copy (pixel-identical); < 1.0 renders fewer fragments.
+    offscreen: Option<wgpu::Texture>,
+    offscreen_view: Option<wgpu::TextureView>,
+    blit_pipeline: wgpu::RenderPipeline,
+    blit_bgl: wgpu::BindGroupLayout,
+    blit_bg: Option<wgpu::BindGroup>,
+    blit_uniform_buffer: wgpu::Buffer,
+    offscreen_w: u32,
+    offscreen_h: u32,
 }
 
 /// Shader uniforms. Matches `struct Uniforms` in ring.wgsl.
@@ -123,6 +138,16 @@ struct Uniforms {
     lyric_words: [f32; 65536],
     lyric_bounds: [f32; 4],
     lyric_fx: [f32; 9],
+}
+
+/// Scale uniform for the offscreen→surface blit pass. `scale = offscreen_size / surface_size`
+/// (per axis); at render_scale = 1.0 it is (1, 1) so the nearest `textureLoad` is an exact
+/// texel copy. Matches `struct BlitUniform` in ring.wgsl (uniform min-binding 16 B).
+#[repr(C)]
+#[derive(Copy, Clone, Pod, Zeroable)]
+struct BlitUniform {
+    scale: [f32; 2],
+    _pad: [f32; 2],
 }
 
 impl RingRenderer {
@@ -319,6 +344,80 @@ impl RingRenderer {
             cache: None,
         });
 
+        // ---- render_scale offscreen blit pipeline ----
+        // Uses entry points blit_vs/blit_fs appended to the same shader module. Its bind
+        // group (group 0) occupies bindings 4 (scale uniform) and 5 (offscreen texture),
+        // disjoint from the scene's 0..3 so the module has no duplicate (group, binding).
+        // The blit overwrites the surface with the offscreen texel (blend = None); over a
+        // transparent clear this equals the scene's premultiplied-over-transparent
+        // result, so render_scale = 1.0 is a bit-identical passthrough.
+        let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ring blit bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(16),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let blit_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ring blit pl"),
+            bind_group_layouts: &[Some(&blit_bgl)],
+            immediate_size: 0,
+        });
+        let blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("ring blit pipeline"),
+            layout: Some(&blit_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("blit_vs"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("blit_fs"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    // Overwrite: surface = offscreen texel (premultiplied), exactly what the
+                    // scene wrote over its transparent clear.
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        let blit_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("ring blit uniform"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         RingRenderer {
             surface,
             device,
@@ -358,6 +457,15 @@ impl RingRenderer {
             bind_group_layout: bind_group_layout.clone(),
             placeholder_texture: placeholder,
             placeholder_view: placeholder_view,
+            surface_format: format,
+            offscreen: None,
+            offscreen_view: None,
+            blit_pipeline,
+            blit_bgl,
+            blit_bg: None,
+            blit_uniform_buffer,
+            offscreen_w: 0,
+            offscreen_h: 0,
         }
     }
 
@@ -606,6 +714,45 @@ impl RingRenderer {
         self.surface.configure(&self.device, &self.config);
     }
 
+    /// Lazily (re)create the render-scale offscreen texture + view + blit bind group whenever
+    /// the target offscreen dimensions (`width*render_scale × height*render_scale`) change.
+    /// The offscreen mirrors the surface's colour format and sample count (1, the same as the
+    /// scene pipeline) so rendering the scene into it is byte-identical to rendering into the
+    /// surface; only the resolved resolution differs below 1.0.
+    fn ensure_offscreen(&mut self) {
+        let s = self.render_scale;
+        let ow = ((self.width as f32) * s).round().clamp(1.0, self.width as f32) as u32;
+        let oh = ((self.height as f32) * s).round().clamp(1.0, self.height as f32) as u32;
+        if self.offscreen.is_some() && self.offscreen_w == ow && self.offscreen_h == oh {
+            return;
+        }
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("ring offscreen"),
+            size: wgpu::Extent3d { width: ow, height: oh, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: self.surface_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ring blit bg"),
+            layout: &self.blit_bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 4, resource: self.blit_uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 5, resource: wgpu::BindingResource::TextureView(&view) },
+            ],
+        });
+        self.offscreen = Some(tex);
+        self.offscreen_view = Some(view);
+        self.blit_bg = Some(bg);
+        self.offscreen_w = ow;
+        self.offscreen_h = oh;
+    }
+
     pub fn render(
         &mut self,
         bands: &[f32; NBANDS],
@@ -777,27 +924,68 @@ impl RingRenderer {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("ring") });
 
-        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("ring pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                depth_slice: None,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    // Fully transparent clear — wallpaper shows through where the ring has alpha 0.
-                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        pass.set_pipeline(&self.pipeline);
-        pass.set_bind_group(0, &self.bind_group, &[]);
-        pass.draw(0..3, 0..1);
-        drop(pass);
+        // render_scale offscreen: draw the scene into `offscreen_view` (full-res at scale
+        // 1.0), then a fullscreen-triangle blit pass copies it to the surface. At scale 1.0
+        // the offscreen equals the surface resolution, uses the same colour format + sample
+        // count, and the blit does a nearest `textureLoad` — a byte-identical 1:1 copy.
+        self.ensure_offscreen();
+        let scale = [
+            self.offscreen_w as f32 / self.width.max(1) as f32,
+            self.offscreen_h as f32 / self.height.max(1) as f32,
+        ];
+        self.queue.write_buffer(
+            &self.blit_uniform_buffer,
+            0,
+            bytemuck::bytes_of(&BlitUniform { scale, _pad: [0.0, 0.0] }),
+        );
+        let offscreen_view = self.offscreen_view.as_ref().unwrap();
+
+        // 1) scene → offscreen
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ring pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: offscreen_view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        // Fully transparent clear — wallpaper shows through where the ring has alpha 0.
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.pipeline);
+            pass.set_bind_group(0, &self.bind_group, &[]);
+            pass.draw(0..3, 0..1);
+        }
+
+        // 2) blit → surface (1:1 nearest copy at render_scale = 1.0)
+        {
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("ring blit pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            pass.set_pipeline(&self.blit_pipeline);
+            pass.set_bind_group(0, self.blit_bg.as_ref().unwrap(), &[]);
+            pass.draw(0..3, 0..1);
+        }
 
         self.queue.submit(Some(encoder.finish()));
         if self.capture_once {
@@ -1914,6 +2102,41 @@ const SHADER_SRC: &str = stringify!(
         // scene_at applies the full-screen RGB shift to the ring background only (R/B at
         // ±1.25px on the 25° axis) while the lyric loop stays single-pass.
         return scene_at(in.pos.xy);
+    }
+
+    // ---- render_scale offscreen blit -------------------------------------
+    // The scene is rendered to an offscreen texture sized `resolution * render_scale`,
+    // then a second fullscreen-triangle pass LOADS (nearest, so the 1:1 path is an exact
+    // texel copy — pixel-identical at render_scale = 1.0) those texels and writes them
+    // to the surface. Bindings 4/5 are disjoint from the scene's 0..3 so the two
+    // pipelines share one module without duplicate (group, binding) declarations.
+    struct BlitUniform {
+        scale: vec2<f32>,
+        _pad: vec2<f32>,
+    }
+
+    @group(0) @binding(4) var<uniform> blit_uniform: BlitUniform;
+    @group(0) @binding(5) var offscreen_tex: texture_2d<f32>;
+
+    @vertex
+    fn blit_vs(@builtin(vertex_index) vi: u32) -> VsOut {
+        let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+        return VsOut(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0));
+    }
+
+    @fragment
+    fn blit_fs(@builtin(position) p: vec4<f32>) -> @location(0) vec4<f32> {
+        // Map each surface pixel to the nearest offscreen texel. At render_scale = 1.0
+        // `scale` = (1,1) and `p.xy - 0.5` lands exactly on a texel centre, so textureLoad
+        // returns that texel unchanged — a bit-identical 1:1 copy.
+        let dim = textureDimensions(offscreen_tex);
+        let raw = floor(p.xy * blit_uniform.scale);
+        let texel = vec2<i32>(clamp(
+            raw,
+            vec2<f32>(0.0),
+            vec2<f32>(f32(dim.x) - 1.0, f32(dim.y) - 1.0),
+        ));
+        return textureLoad(offscreen_tex, texel, 0);
     }
 );
 

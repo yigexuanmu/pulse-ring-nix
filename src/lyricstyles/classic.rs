@@ -32,7 +32,10 @@
 //!   shared palette (active→accent, passed→primary) — keyword colouring is a no-op until a
 //!   chorus/word-colour adapter appears.
 
-use crate::lyricview::{StyleCtx, StyleInput, StyleOutput};
+use crate::lyricview::{
+    CharQuad, FontScales, LineTiming, LyricFx, StyleCtx, StyleInput, StyleOutput, measure_text,
+    push_pill, push_word_full, split_with_timing,
+};
 
 // ============================================================================================
 // folia classic tuning constants — ported byte-for-byte from the folia-major source tree.
@@ -186,13 +189,133 @@ mod tuning {
     pub const FONT_SUB_MAX_PX: f32 = 20.0; // 1.25rem (`:345`)
 }
 
+/// End time for a lyric line — mirrors sonnet's `line_end` (sonnet.rs:216): the next line's
+/// start caps the duration, and an unknown-end line falls back to `start + 0.1s`.
+fn line_end(line: &crate::lyrics::LyricLine, next: Option<&crate::lyrics::LyricLine>) -> f32 {
+    let start = line.start_ms as f32 / 1000.0;
+    let mut end = start + line.duration_ms as f32 / 1000.0;
+    if line.duration_ms <= 0 {
+        if let Some(n) = next {
+            end = n.start_ms as f32 / 1000.0;
+        }
+    }
+    if let Some(n) = next {
+        end = end.min(n.start_ms as f32 / 1000.0);
+    }
+    end.max(start + 0.1)
+}
+
 /// Build one frame of the classic lyric animation.
 ///
-/// Skeleton: the `LyricStyle::Classic` variant + dispatch in `lyricview::build_frame` are
-/// wired, so `style = "classic"` builds standalone and never touches the sonnet engine. The
-/// per-word state machine, per-grapheme glow sweep, layout RNG, breathing float, line
-/// transition and translation subtitle are filled in by the next commit (`#3`). For now this
-/// returns an empty frame so the wallpaper still drives the ring/particle/widget layers.
-pub fn build_frame(_ctx: &StyleCtx, _input: &StyleInput) -> StyleOutput {
-    StyleOutput::empty()
+/// **Skeleton (#3a)** — emits a visible centred layout of the currently-sung line plus a
+/// translation subtitle bar, *without audio/FFT coupling*. Per-word reveal state follows
+/// folia classic's `layoutVariants` pose values (`tuning::WORD_*`): waiting words stay
+/// hidden (`opacity 0`, `scale 0.5`), the active word pops to full opacity at
+/// `ACTIVE_SCALE_MULT` (`*1.4`) with an accent colour + glow halo, and passed words settle
+/// to `WORD_PASSED_OPACITY_NORMAL` (`0.82`) in primary colour. This matches folia's
+/// "lyric-timestamp driven, not audio-coupled" behaviour noted in the module doc; audio
+/// (`audioPower`/`audioBands`) feeds only `VisualizerShell`'s background in folia and is
+/// wired in #3b.
+pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
+    let mut out: Vec<CharQuad> = Vec::new();
+    let lines = input.lines;
+    if lines.is_empty() {
+        return StyleOutput::empty();
+    }
+    let t = ctx.time;
+    let scales = FontScales::from_height(ctx.height);
+
+    // Folia classic renders the whole song as one scrolling marquee of line containers.
+    // This skeleton renders only the currently-sung line (the carousel + transitions land in
+    // #3c). The active line index mirrors sonnet's `current_line` resolution (sonnet.rs:2192)
+    // — the highest-index line whose start <= t.
+    let active = lines
+        .iter()
+        .rposition(|l| l.start_ms as f32 / 1000.0 <= t)
+        .unwrap_or(0);
+    let line = &lines[active];
+    let timing = LineTiming {
+        start: line.start_ms as f32 / 1000.0,
+        end: line_end(line, lines.get(active + 1)),
+        duration: (line_end(line, lines.get(active + 1)) - line.start_ms as f32 / 1000.0).max(0.1),
+    };
+
+    // Main font size — folia classic `clamp(2.25rem, 6vw, 4.5rem)` = `clamp(36, 0.06*W, 72)`
+    // (tuning.rs FONT_MAIN_*). Take `ctx.width * VW` then clamp to the rem bounds; the extra
+    // clamp against `scales.main` (= H*0.16, the shared convention) keeps tall-portrait
+    // stages from overflowing vertically.
+    let main_px = (ctx.width * tuning::FONT_MAIN_VW)
+        .clamp(tuning::FONT_MAIN_MIN_PX, tuning::FONT_MAIN_MAX_PX)
+        .min(scales.main);
+    let words = split_with_timing(line, &timing);
+    // folia `wordSpacing` packs words tighter — apply it on the half-em natural gap
+    // (tuning.rs WORD_SPACING). `gap` is the inter-word whitespace; one gap per word_count-1.
+    let gap = main_px * 0.5 * tuning::WORD_SPACING;
+    let total_w: f32 = words
+        .iter()
+        .map(|w| measure_text(ctx.atlas, &w.text, main_px))
+        .sum::<f32>()
+        + gap * words.len().saturating_sub(1) as f32;
+    let mut pen_x = ctx.width * 0.5 - total_w * 0.5;
+    let baseline_y = ctx.height * 0.5;
+
+    // Per-word reveal: folia `layoutVariants` poses (tuning.rs WORD_*). Skeleton uses a hard
+    // threshold on the word's `[start, end]` window — the eased per-char / per-grapheme glow
+    // sweep lands in #3c.
+    for w in &words {
+        let word_w = measure_text(ctx.atlas, &w.text, main_px);
+        let (alpha, scale, color, glow) = if t < w.start {
+            (tuning::WORD_WAITING_OPACITY, tuning::WORD_WAITING_SCALE, ctx.colors.dim, 0.0)
+        } else if t <= w.end {
+            (tuning::WORD_ACTIVE_OPACITY, tuning::ACTIVE_SCALE_MULT, ctx.colors.accent, 0.55)
+        } else {
+            (tuning::WORD_PASSED_OPACITY_NORMAL, 1.0, ctx.colors.primary, 0.0)
+        };
+        if alpha > 0.004 {
+            push_word_full(
+                ctx.atlas, &mut out, &w.text, pen_x, baseline_y,
+                main_px, 0, alpha, scale, 0.0, [0.0, 0.0], color, glow,
+                None, 0.0, 0.0, None, false, None, 0.0, None,
+            );
+        }
+        pen_x += word_w + gap;
+    }
+
+    // Translation subtitle bar — folia translation block, same pill+text pattern sonnet uses
+    // (sonnet.rs:2195-2230). Static for the skeleton (#3a); role/audio emphasis in #3b/#3c.
+    if !input.translation.is_empty() {
+        let sub_px = (ctx.width * tuning::FONT_SUB_VW)
+            .clamp(tuning::FONT_SUB_MIN_PX, tuning::FONT_SUB_MAX_PX)
+            .max(ctx.height * 0.03);
+        let fade = 0.25f32;
+        let a_in = ((t - timing.start) / fade).clamp(0.0, 1.0);
+        let a_out = ((timing.end - t) / fade).clamp(0.0, 1.0);
+        let sub_a = (0.95 * a_in.min(a_out)).max(0.35);
+        if sub_a > 0.004 {
+            let mut sub_w = measure_text(ctx.atlas, input.translation, sub_px);
+            let mut sub_size = sub_px;
+            // Fit the subtitle width to 92% of the stage (sonnet.rs:2207) so long CJK lines
+            // don't clip past the layer edges and lose their first/last glyphs.
+            let max_w = ctx.width * 0.92;
+            if sub_w > max_w {
+                let s = max_w / sub_w;
+                sub_size *= s;
+                sub_w *= s;
+            }
+            let bar_y = ctx.height * 0.90;
+            let padx = sub_size * 2.0;
+            push_pill(
+                &mut out, ctx.width * 0.5, bar_y,
+                sub_w + padx * 2.0, sub_size * 2.4, sub_a, ctx.colors.pill,
+            );
+            push_word_full(
+                ctx.atlas, &mut out, input.translation,
+                ctx.width * 0.5 - sub_w * 0.5, bar_y + sub_size * 0.35,
+                sub_size, 1, sub_a, 1.0, 0.0, [0.0, 0.0], ctx.colors.primary, 0.0,
+                None, 0.0, 0.0, None, false, None, 0.0, None,
+            );
+        }
+    }
+
+    StyleOutput { quads: out, fx: LyricFx::default() }
 }

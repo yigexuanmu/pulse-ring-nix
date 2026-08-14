@@ -43,6 +43,11 @@ pub struct RingRenderer {
     lyric_view: Option<wgpu::TextureView>,
     sampler: wgpu::Sampler,
     bind_group_layout: wgpu::BindGroupLayout,
+    // 1x1 placeholder kept alive so `refresh_texture_bindings` can always produce a valid
+    // bind group for both binding 1 (widget atlas) and binding 3 (lyric SDF atlas) even
+    // before any real texture has been uploaded — see the bind-group race fix (G1).
+    placeholder_texture: wgpu::Texture,
+    placeholder_view: wgpu::TextureView,
 }
 
 /// Shader uniforms. Matches `struct Uniforms` in ring.wgsl.
@@ -351,6 +356,8 @@ impl RingRenderer {
             lyric_view: None,
             sampler: sampler.clone(),
             bind_group_layout: bind_group_layout.clone(),
+            placeholder_texture: placeholder,
+            placeholder_view: placeholder_view,
         }
     }
 
@@ -442,19 +449,25 @@ impl RingRenderer {
     }
 
     fn refresh_texture_bindings(&mut self) {
-        if let Some(view) = &self.atlas_view {
-            let lyric = self.lyric_view.as_ref().unwrap_or(view);
-            self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("ring bg"),
-                layout: &self.bind_group_layout,
-                entries: &[
-                    wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buffer.as_entire_binding() },
-                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(view) },
-                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
-                    wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lyric) },
-                ],
-            });
-        }
+        // Always rebind with a real fallback. The old `if let Some(view) = &self.atlas_view`
+        // guard meant that until the first *widget* (cover) texture was uploaded, the whole
+        // bind group was skipped — so `upload_lyric_sdf` setting `lyric_view` for a cover-less
+        // / not-yet-arrived-cover track left binding 3 sampling the 1x1 placeholder, and the
+        // lyric SDF glyphs silently rendered as blank ("some songs don't render lyrics").
+        // Now both bindings get their proper view, falling back to the placeholder only when
+        // the specific atlas is genuinely absent.
+        let widget = self.atlas_view.as_ref().unwrap_or(&self.placeholder_view);
+        let lyric = self.lyric_view.as_ref().unwrap_or(&self.placeholder_view);
+        self.bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ring bg"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: self.uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(widget) },
+                wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+                wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lyric) },
+            ],
+        });
     }
 
     /// Upload dirty cells of the single-channel SDF glyph atlas. Each cell is CELL×CELL bytes

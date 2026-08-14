@@ -25,6 +25,45 @@ pub const ATLAS_PX: usize = GRID * CELL;
 /// for hundreds of ms. Remaining glyphs are deferred via `drain_pending` in subsequent frames.
 pub const MAX_NEW_PACKS_PER_FRAME: u32 = 4;
 
+/// EDT (Euclidean distance transform) per-frame budget state. Currently unused — extracted
+/// as a scaffold for the EDT background-thread work (see `docs/EDT_BG_DESIGN.md`, Phase A).
+/// The background thread will remove the per-frame cap; this struct is kept only to avoid
+/// breaking the API surface while the threaded path is wired up in a later PR.
+#[allow(dead_code)]
+pub struct EdtState {
+    /// Per-frame cap on newly packed glyphs (`MAX_NEW_PACKS_PER_FRAME`).
+    pub cap_per_frame: u32,
+    /// Budget remaining in the current frame; decremented by `try_consume`.
+    pub budget_remaining: u32,
+    /// Last reported packed-cell count (for diagnostics); unused in the scaffold.
+    pub last_packed_count: usize,
+}
+
+#[allow(dead_code)]
+impl EdtState {
+    pub fn new() -> Self {
+        Self {
+            cap_per_frame: MAX_NEW_PACKS_PER_FRAME,
+            budget_remaining: 0,
+            last_packed_count: 0,
+        }
+    }
+    /// Resets the per-frame budget at the start of each frame (mirrors `begin_frame`).
+    pub fn reset_budget(&mut self) {
+        self.budget_remaining = self.cap_per_frame;
+    }
+    /// Attempt to consume one unit of EDT budget. Returns `false` if exhausted.
+    pub fn try_consume(&mut self) -> bool {
+        if self.budget_remaining == 0 {
+            return false;
+        }
+        self.budget_remaining -= 1;
+        true
+    }
+    // TODO edt-bg: the background thread will remove `cap_per_frame`; this struct is kept
+    // only to avoid breaking the API surface while the threaded path is wired up.
+}
+
 /// A packed glyph: where its cell lives in the atlas and its font metrics at RASTER_PX.
 #[derive(Debug, Clone, Copy)]
 pub struct GlyphInfo {

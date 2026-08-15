@@ -17,7 +17,7 @@ Wayland 壁纸层上的音乐律动可视化 + 全屏歌词引擎（GPU 渲染�
 │  Rust 内核（每帧）                                          │
 │  ├─ 音频   audio.rs      PipeWire/ALSA monitor → FFT → 128 频段
 │  ├─ 元数据 main.rs       playerctl (MPRIS) → 曲目/封面/进度
-│  ├─ 歌词   lyrics.rs     子进程 lyric_sources.py → LyricData
+│  ├─ 歌词   lyrics.rs     内嵌 lyricfetch → LyricData（9 源）
 │  ├─ 动画   lyricstyles/  sonnet.rs 引擎 → Vec<CharQuad>
 │  ├─ 图集   sdf.rs        fontdue → SDF 四档字重 glyph atlas
 │  └─ 渲染   draw.rs       wgpu(WGSL) → wl-layer-shell
@@ -36,13 +36,13 @@ Wayland 壁纸层上的音乐律动可视化 + 全屏歌词引擎（GPU 渲染�
 | `config.rs` | ~1270 | QML 样式解析（`Config`）、`LyricStyle`、`pulse-ring sonnet true\|false` CLI、MG/后处理开关 |
 | `draw.rs` | ~1860 | wgpu 渲染器 + 内嵌 WGSL shader：脉冲环、widgets、歌词层、MG 装饰、全部后处理 |
 | `audio.rs` | 300 | cpal 采集（PipeWire monitor，`pactl` 解析 `PIPEWIRE_NODE`）、实时 FFT、128 对数频段 |
-| `lyrics.rs` | 257 | 歌词抓取 worker（子进程 `lyric_sources.py`）、统一行模型、LRCLIB 兜底 |
+| `lyrics.rs` | 124 | 歌词抓取 worker（内嵌 Rust `lyricfetch` 模块）、统一行模型、LRCLIB 兜底 |
 | `lyricview.rs` | 655 | 歌词渲染共享核心：`CharQuad`（每字 20 个 f32）、SDF 绘制原语、`StyleCtx/StyleInput`、相机变换 |
 | `sdf.rs` | 416 | 四档字重（regular/bold/black/light）SDF 图集：光栅化 → 有向距离场 → 打包 |
 | `lyricstyles/` | ~3900 | 动画样式；`sonnet.rs` 是主体，`mg*.rs` 是 MG 装饰背景 |
 | `preview.rs` | 333 | 无 GPU 预览：CPU 模拟 shader 数学输出 PNG |
 | `lua.rs` / `plugin.rs` | ~700 | Lua 行为层 / C ABI 动态插件 |
-| `lyrics/*.py` | ~1190 | 多源歌词适配器（LRCLIB/Netease/QQ/Kugou/…），纯 stdlib 子进程 CLI |
+| `lyricfetch/` | ~3150 | 内嵌多源 Rust 歌词适配器（9 源：LRCLIB/NetEase/QQ/Kugou/SPlayer/QiShui/TTML/Spotify/Apple/Musixmatch），in-process HTTP，无子进程 |
 
 ---
 
@@ -141,10 +141,9 @@ PipeWire/ALSA monitor（pactl 解析 PIPEWIRE_NODE）
 
 ---
 
-## 歌词获取（lyrics.rs + lyrics/lyric_sources.py）
+## 歌词获取（lyrics.rs + 内嵌 lyricfetch 模块）
 
-- `LyricWorker` 后台线程：曲目变化 → 子进程 `python3 lyric_sources.py <req.json>` → 统一 JSON
-- 多源链：`netEase / qq / kugou / lrclib / ttml / splayer…`（`lyric_sources.py` 内实现，纯 stdlib）
+- `LyricWorker` 后台线程：曲目变化 → 内嵌 Rust `lyricfetch` 模块（9 源：LRCLIB/NetEase/QQ/Kugou/SPlayer/QiShui/TTML/Spotify/Apple/Musixmatch）→ `LyricData`
 - 行模型 `LyricLine`：start_ms / duration_ms / text / translation / romanization / 逐字 chars 时间戳
 - 自动 LRCLIB 兜底；无匹配时启用虚拟 ♪ 谱线
 
@@ -201,7 +200,7 @@ nix develop -c cargo build   # 开发环境（含 alsa/wayland/xkbcommon）
 cargo build --release
 ```
 
-**systemd 用户服务**（依赖：python3、pactl、playerctl 需在 PATH）：
+**systemd 用户服务**（依赖：pactl、playerctl 需在 PATH）：
 
 ```bash
 systemctl --user start pulse-ring.service    # 运行
@@ -220,7 +219,6 @@ journalctl --user -u pulse-ring.service -f   # 日志
 | `PULSE_RING_DEBUG_PREVIEW` | 打印每帧 shot/placement/quad 明细 |
 | `PULSE_RING_CAPTURE=/path.png` | 首帧截图 |
 | `PULSE_RING_MG_VARIANT=N` | 强制指定 MG 几何 variant（0–47） |
-| `PULSE_RING_LYRIC_SCRIPT` | 指定歌词适配器路径 |
 | `PULSE_RING_DUMP_GLYPH` | ASCII 转储字形 SDF |
 
 测试：`cargo test`（含 WGSL 合法性校验、SDF 图集、MG 全 variant 构建）。

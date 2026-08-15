@@ -70,6 +70,10 @@ struct App {
     // Per-widget clock cache: (last_text, tex_w, tex_h, tex_index)
     clock_cache: [(String, u32, u32, u32); 8],
     texture_slots: Vec<Option<ImageData>>,
+    /// Per-slot dirty flag: true when the slot's ImageData content changed this frame
+    /// and needs re-upload to any renderer that hasn't seen this version yet.
+    /// Set at every texture_slots write site; cleared by each renderer after it uploads.
+    texture_slot_dirty: Vec<bool>,
     widget_uvs: [(f32, f32, f32, f32); 32],
     cover_rx: std::sync::mpsc::Receiver<ImageData>,
     last_cover_path: String,
@@ -245,6 +249,7 @@ fn main() {
         font,
         clock_cache: std::array::from_fn(|_| (String::new(), 0, 0, 0)),
         texture_slots: vec![None; 64],
+        texture_slot_dirty: vec![false; 64],
         widget_uvs: [(0.0, 0.0, 0.0, 0.0); 32],
         cover_rx: spawn_cover_thread(),
         last_cover_path: String::new(),
@@ -1108,6 +1113,7 @@ impl App {
                         data[o + 6] = tex_index as f32;
                         data[o + 11] = ih / iw; // aspect
                         self.texture_slots[tex_index as usize] = Some(img);
+                        self.texture_slot_dirty[tex_index as usize] = true;
                         tex_index += 1;
                     }
                 }
@@ -1125,6 +1131,7 @@ impl App {
                         let (iw, ih) = (img.w, img.h);
                         ti = tex_index;
                         self.texture_slots[ti as usize] = Some(img);
+                        self.texture_slot_dirty[ti as usize] = true;
                         self.clock_cache[slot] = (txt.clone(), iw, ih, ti);
                         data[o + 11] = ih as f32 / iw as f32;
                         if ti >= tex_index {
@@ -1455,6 +1462,7 @@ impl App {
                             img.rgba[dst..dst + (w as usize) * 4]
                                 .copy_from_slice(&self.plugin_buf[src..src + (w as usize) * 4]);
                         }
+                        self.texture_slot_dirty[ti] = true;
                     }
                     _ => {
                         let mut rgba = vec![0u8; needed];
@@ -1465,6 +1473,7 @@ impl App {
                                 .copy_from_slice(&self.plugin_buf[src..src + (w as usize) * 4]);
                         }
                         self.texture_slots[ti] = Some(ImageData { w, h, rgba });
+                        self.texture_slot_dirty[ti] = true;
                     }
                 }
             }
@@ -1655,26 +1664,31 @@ impl App {
                 }
             }
         }
-        // Upload every texture slot to THIS renderer every frame (multi-monitor safe):
-        // each renderer owns its own atlas, so no shared queue that one monitor drains.
+        // Upload only texture slots whose content changed since this renderer last saw them.
+        // Static plugin image slots (0..7) become dirty once at load and never again;
+        // dynamic plugin slots (8+i) become dirty only when the plugin reported req.update.
+        // This replaces the old "re-upload every slot every frame" §5 anti-pattern.
         for (ti, img) in self.texture_slots.iter().enumerate() {
-            if let Some(img) = img {
-                if let Some((ux, uy, uw, uh)) = renderer.upload_texture(ti, &img.rgba, img.w, img.h) {
-                    // find the widget slot(s) referencing this texture index
-                    for s in 0..32 {
-                        let wo = s * 40;
-                        if (widgets[wo + 6] - ti as f32).abs() < 0.01 {
-                            if ti >= 8 {
-                                log::info!("plugin tex {} -> widget slot {} uv=({:.3},{:.3},{:.3},{:.3})", ti, s, ux, uy, uw, uh);
+            if self.texture_slot_dirty[ti] {
+                if let Some(img) = img {
+                    if let Some((ux, uy, uw, uh)) = renderer.upload_texture(ti, &img.rgba, img.w, img.h) {
+                        // find the widget slot(s) referencing this texture index
+                        for s in 0..32 {
+                            let wo = s * 40;
+                            if (widgets[wo + 6] - ti as f32).abs() < 0.01 {
+                                if ti >= 8 {
+                                    log::info!("plugin tex {} -> widget slot {} uv=({:.3},{:.3},{:.3},{:.3})", ti, s, ux, uy, uw, uh);
+                                }
+                                widgets[wo + 7] = ux;
+                                widgets[wo + 8] = uy;
+                                widgets[wo + 9] = uw;
+                                widgets[wo + 10] = uh;
+                                self.widget_uvs[s] = (ux, uy, uw, uh);
                             }
-                            widgets[wo + 7] = ux;
-                            widgets[wo + 8] = uy;
-                            widgets[wo + 9] = uw;
-                            widgets[wo + 10] = uh;
-                            self.widget_uvs[s] = (ux, uy, uw, uh);
                         }
                     }
                 }
+                self.texture_slot_dirty[ti] = false;
             }
         }
         renderer.set_widgets(&widgets);

@@ -13,6 +13,10 @@ pub struct RingRenderer {
     config: wgpu::SurfaceConfiguration,
     pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
+    // #5b split storage buffers: lyric_words (256 KB) + particles (4.5 KB) live here
+    // instead of inline in the main Uniforms (so steady-state frames upload ~16 KB).
+    lyric_words_buffer: wgpu::Buffer,
+    particles_buffer: wgpu::Buffer,
     bind_group: wgpu::BindGroup,
     width: u32,
     height: u32,
@@ -221,6 +225,21 @@ impl RingRenderer {
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
+        // #5b: split storage buffers for the two big arrays lifted out of `Uniforms`.
+        // Sizes match the WGSL structs LyricWordsBuf { array<f32, 65536> } and
+        // ParticlesBuf { array<f32, 1152> } (4 B/element → 262144 B + 4608 B).
+        let lyric_words_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("lyric words"),
+            size: 65536 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("particles"),
+            size: 1152 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("ring bgl"),
@@ -258,6 +277,28 @@ impl RingRenderer {
                         sample_type: wgpu::TextureSampleType::Float { filterable: true },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
+                    },
+                    count: None,
+                },
+                // #5b: lyric_words + particles split out of the main Uniforms storage.
+                // read-only storage buffers, sized to match the WGSL structs (65536 / 1152 f32).
+                wgpu::BindGroupLayoutEntry {
+                    binding: 6,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(65536 * 4),
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 7,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: std::num::NonZeroU64::new(1152 * 4),
                     },
                     count: None,
                 },
@@ -306,6 +347,8 @@ impl RingRenderer {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&placeholder_view),
                 },
+                wgpu::BindGroupEntry { binding: 6, resource: lyric_words_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: particles_buffer.as_entire_binding() },
             ],
         });
 
@@ -440,6 +483,8 @@ impl RingRenderer {
             config,
             pipeline,
             uniform_buffer,
+            lyric_words_buffer,
+            particles_buffer,
             bind_group,
             width: 64,
             height: 64,
@@ -587,6 +632,11 @@ impl RingRenderer {
             self.lyric_words_version = self.lyric_words_version.wrapping_add(1);
             self.last_lyric_words = words[..n].to_vec();
         }
+        // #5b: upload the lyric_words_data array to the split storage buffer (binding 6).
+        // The 256 KB region was lifted out of `Uniforms`; without this upload the shader
+        // samples stale/zero memory and no lyric quad renders.
+        self.queue
+            .write_buffer(&self.lyric_words_buffer, 0, bytemuck::cast_slice(&self.lyric_words_data));
     }
 
     fn refresh_texture_bindings(&mut self) {
@@ -607,6 +657,8 @@ impl RingRenderer {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(widget) },
                 wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&self.sampler) },
                 wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::TextureView(lyric) },
+                wgpu::BindGroupEntry { binding: 6, resource: self.lyric_words_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 7, resource: self.particles_buffer.as_entire_binding() },
             ],
         });
     }
@@ -956,6 +1008,10 @@ impl RingRenderer {
         // the last-written particle cache is now current and the dirty flag can be cleared.
         self.last_particles = *particles;
         self.particles_dirty = false;
+        // #5b: upload particles slice to the split storage buffer (binding 7): lifted out of
+        // `Uniforms`; without this upload no particle renders.
+        self.queue
+            .write_buffer(&self.particles_buffer, 0, bytemuck::cast_slice(particles));
 
         let mut encoder = self
             .device

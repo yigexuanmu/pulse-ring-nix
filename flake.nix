@@ -44,9 +44,11 @@
           wayland-protocols
           wayland-scanner
           libxkbcommon
-          # Font rasterization deps (ab_glyph/rusttype build)
+          # Font rasterization deps (ab_glyph/rusttype build).
+          # NOTE: no `fontconfig` here — fonts are baked into the binary at build
+          # time via `postPatch` substituteInPlace (Nix store paths), so load_font()
+          # reads them directly with no runtime fc-match lookup.
           freetype
-          fontconfig
         ];
 
         # Runtime LD_LIBRARY_PATH so the binary finds gstreamer/vulkan plugins at runtime.
@@ -62,7 +64,6 @@
           mesa
           wayland
           libxkbcommon
-          fontconfig
           freetype
         ];
 
@@ -70,6 +71,29 @@
         rustToolchain = pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-src" "rust-analyzer" ];
         };
+
+        # Fonts baked into the binary at build time (postPatch substituteInPlace
+        # replaces the Arch/FHS hard-coded paths in src/main.rs with these Nix
+        # store paths). This mirrors the master-branch packaging and frees the
+        # runtime of any fontconfig/fc-match dependency.
+        fonts = with pkgs; {
+          mapleMono = maple-mono.NF-CN;
+          notoCJK = noto-fonts-cjk-sans;
+          notoSans = noto-fonts;
+          dejavu = dejavu_fonts;
+        };
+        fontPaths = {
+          mapleMono = "${fonts.mapleMono}/share/fonts/truetype/MapleMono-NF-CN-Regular.ttf";
+          notoCJK = "${fonts.notoCJK}/share/fonts/opentype/noto-cjk/NotoSansCJK-VF.otf.ttc";
+          notoSans = "${fonts.notoSans}/share/fonts/noto/NotoSans.ttf";
+          dejavu = "${fonts.dejavu}/share/fonts/truetype/DejaVuSans.ttf";
+        };
+
+        # Runtime PATH additions (wrapProgram --prefix PATH): `pactl`
+        # (pulseaudio) is what cpal needs to discover the PipeWire default sink
+        # + monitor source. Without it `audio: capture on None` fails and
+        # falls back to a silent fake sine — the spectrum bars won't track music.
+        runtimeBins = [ pkgs.pulseaudio ];
       in
       {
         devShells.default = pkgs.mkShell {
@@ -92,10 +116,11 @@
             # Use the Nix-provided Electron when running via `cargo run`, so the
             # dev loop needs no `npm install` in electron-wallpaper.
             export PULSE_RING_ELECTRON="${pkgs.electron}/bin/electron"
-            # load_font() shells out to `fc-match` (fontconfig) to locate any CJK
-            # font on NixOS — put fontconfig's bin on PATH so `cargo run` finds it
-            # the same way the installed wrapper does (`wrapProgram --prefix PATH`).
-            export PATH="${pkgs.fontconfig.bin}/bin:$PATH"
+            # `pactl` (pulseaudio) is needed at runtime to discover the default
+            # sink + monitor source so cpal can capture the PipeWire monitor.
+            # DevShell `cargo run` needs it on PATH the same way the installed
+            # wrapper does (wrapProgram --prefix PATH).
+            export PATH="${pkgs.lib.makeBinPath runtimeBins}:$PATH"
           '';
         };
 
@@ -107,6 +132,17 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
           };
+
+          # Bake Nix store font paths into the binary at build time (load_font()'s
+          # Arch/FHS hard-coded candidates don't exist on NixOS). This removes the
+          # runtime fontconfig/fc-match lookup entirely.
+          postPatch = ''
+            substituteInPlace src/main.rs \
+              --replace-fail "/usr/share/fonts/TTF/JetBrains-Maple-Mono-NF-XX-XX/JetBrainsMapleMono-Regular.ttf" "${fontPaths.mapleMono}" \
+              --replace-fail "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc" "${fontPaths.notoCJK}" \
+              --replace-fail "/usr/share/fonts/noto/NotoSans-Regular.ttf" "${fontPaths.notoSans}" \
+              --replace-fail "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf" "${fontPaths.dejavu}"
+          '';
 
           # makeWrapper is needed by postInstall to wrap the binary with runtime
           # LD_LIBRARY_PATH / GST_PLUGIN_PATH; native libraries stay as in buildInputs.
@@ -142,7 +178,7 @@
             wrapProgram $out/bin/pulse-ring \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}" \
               --prefix GST_PLUGIN_PATH : "${pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" runtimeLibs}" \
-              --prefix PATH : "${pkgs.fontconfig.bin}/bin" \
+              --prefix PATH : "${pkgs.lib.makeBinPath runtimeBins}" \
               --set PULSE_RING_ELECTRON "${pkgs.electron}/bin/electron"
           '';
 

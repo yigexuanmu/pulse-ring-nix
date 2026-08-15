@@ -1216,29 +1216,9 @@ struct ImageData {
     rgba: Vec<u8>,
 }
 
-/// Load a system font for clock + lyric raster rendering. Must contain the
-/// CJK glyph '中' (U+4E2D) so widget text and lyrics render correctly.
-///
-/// Lookup order (first usable wins):
-///   1) `PULSE_RING_FONT` env var — explicit override, handy for debugging.
-///   2) Fontconfig query `:charset=4e2d` — the only portable source on NixOS,
-///      where fonts live in `/nix/store/.../share/fonts/` and the Arch/FHS
-///      paths below don't exist.
-///   3) Hardcoded Arch/FHS candidates — kept for non-NixOS distros.
+/// Load a system font for clock rendering (Noto Sans, fallback DejaVu).
 fn load_font() -> rusttype::Font<'static> {
-    // 1) Explicit override.
-    if let Ok(p) = std::env::var("PULSE_RING_FONT") {
-        if let Some(f) = try_load_font_file(&p) {
-            return f;
-        }
-    }
-    // 2) Fontconfig: ask for any face that can render '中'.
-    if let Some(path) = fc_match_cjk_font() {
-        if let Some(f) = try_load_font_file(&path) {
-            return f;
-        }
-    }
-    // 3) Arch/FHS hardcoded fallback.
+    // JetBrains Maple Mono (contains Chinese + Latin glyphs).
     let candidates = [
         "/usr/share/fonts/TTF/JetBrains-Maple-Mono-NF-XX-XX/JetBrainsMapleMono-Regular.ttf",
         "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
@@ -1246,51 +1226,23 @@ fn load_font() -> rusttype::Font<'static> {
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
     ];
     for p in candidates {
-        if let Some(f) = try_load_font_file(p) {
-            return f;
-        }
-    }
-    panic!(
-        "no usable system font found — set PULSE_RING_FONT=/path/to/cjk.ttf (e.g. a Noto CJK .ttc) or install fontconfig + a CJK font"
-    );
-}
-
-/// Try to load a font file (TTF/OTF/TTC) that can render '中'.
-/// For TTC collections, iterate face indices 0..8; for single-font files,
-/// index 0 succeeds and the rest return None, so the loop is cheap.
-fn try_load_font_file(path: &str) -> Option<rusttype::Font<'static>> {
-    let data = std::fs::read(path).ok()?;
-    for idx in 0..8u32 {
-        if let Some(f) = rusttype::Font::try_from_vec_and_index(data.clone(), idx) {
-            if f.glyph('中').id().0 > 0 {
-                return Some(f);
+        if let Ok(data) = std::fs::read(p) {
+            if p.ends_with(".ttc") {
+                for idx in 0..8 {
+                    if let Some(f) = rusttype::Font::try_from_vec_and_index(data.clone(), idx) {
+                        if f.glyph('中').id().0 > 0 {
+                            return f;
+                        }
+                    }
+                }
+            } else if let Some(f) = rusttype::Font::try_from_vec(data) {
+                if f.glyph('中').id().0 > 0 {
+                    return f;
+                }
             }
         }
     }
-    None
-}
-
-/// Ask fontconfig for the file path of any installed font that can render the
-/// CJK ideograph '中' (U+4E2D). Returns None if `fc-match` is absent or yields
-/// no usable path. This is the only portable way to locate fonts on NixOS.
-fn fc_match_cjk_font() -> Option<String> {
-    let out = std::process::Command::new("fc-match")
-        .arg("-f")
-        .arg("%{file}")
-        .arg(":charset=4e2d")
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout);
-    let s = s.trim();
-    // fc-match prints an empty string or a literal placeholder when it can't
-    // resolve; reject anything that doesn't look like a real file path.
-    if s.is_empty() || s.starts_with('<') || s.contains('%') {
-        return None;
-    }
-    Some(s.to_string())
+    panic!("no usable system font found");
 }
 
 /// Decode a PNG file to RGBA.

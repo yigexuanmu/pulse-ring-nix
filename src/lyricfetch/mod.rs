@@ -38,6 +38,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
         "splayer" => splayer::fetch_splayer(req),
         "kugou" => kugou::fetch_kugou(req),
         "qishui" => qishui::fetch_qishui(req),
+        "ttml" => ttml::fetch_ttml(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }

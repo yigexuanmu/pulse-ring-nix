@@ -91,6 +91,10 @@ struct App {
     last_music_poll: f32,
     lyric_worker_tx: std::sync::mpsc::Sender<lyrics::TrackRequest>,
     lyric_rx: std::sync::mpsc::Receiver<Result<lyrics::LyricData, String>>,
+    // EDT background worker (Phase B, docs/EDT_BG_DESIGN.md): main->worker SPSC request.
+    edt_worker_tx: std::sync::mpsc::Sender<sdf::EdtRequest>,
+    // EDT background worker: worker->main SPSC result (R8 bytes + GlyphInfo for upload).
+    edt_rx: std::sync::mpsc::Receiver<sdf::EdtResult>,
     /// Parsed lyrics for the current track (None = no track / not matched yet).
     lyrics: Option<lyrics::LyricData>,
     /// Identity of the track whose lyrics are cached (title|artist).
@@ -211,6 +215,11 @@ fn main() {
             .expect("spawn position thread");
     }
     let font_data = crate::load_font_data();
+    // EDT background worker (Phase B): spawn before the App literal so the font handle
+    // can be shared (moved into the worker) and reused as App.font. Placeholder EDT
+    // body for now; the real rasterise + edt_signed path is a followup commit.
+    let font = std::sync::Arc::new(load_font());
+    let edt_worker = sdf::EdtWorker::spawn(font.clone());
     let mut app = App {
         compositor,
         layer_shell,
@@ -227,7 +236,7 @@ fn main() {
         display_handle: raw_display_handle,
         outputs: Vec::new(),
         image_cache: Vec::new(),
-        font: std::sync::Arc::new(load_font()),
+        font,
         clock_cache: std::array::from_fn(|_| (String::new(), 0, 0, 0)),
         texture_slots: vec![None; 64],
         widget_uvs: [(0.0, 0.0, 0.0, 0.0); 32],
@@ -248,6 +257,8 @@ fn main() {
         last_music_poll: -10.0,
         lyric_worker_tx: lyric_worker.tx,
         lyric_rx: lyric_worker.rx,
+        edt_worker_tx: edt_worker.tx,
+        edt_rx: edt_worker.rx,
         lyrics: None,
         lyric_key: String::new(),
         pos_us,

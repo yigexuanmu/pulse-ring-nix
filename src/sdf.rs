@@ -101,7 +101,7 @@ impl EdtWorker {
     /// Spawn the EDT background thread. The worker loop pops `EdtRequest`, runs the
     /// 128×128 EDT, packs R8 bytes, and ships back `EdtResult`. The main thread owns
     /// GPU upload (it drains `rx` and calls `queue.write_texture`).
-    pub fn spawn(font: std::sync::Arc<Font>) -> Self {
+    pub fn spawn(font: std::sync::Arc<rusttype::Font<'static>>) -> Self {
         let (req_tx, req_rx) = mpsc::channel::<EdtRequest>();
         let (res_tx, res_rx) = mpsc::channel::<EdtResult>();
         std::thread::Builder::new()

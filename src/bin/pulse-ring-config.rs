@@ -1,44 +1,27 @@
 // pulse-ring-config — GTK4 + libadwaita 配置 GUI (独立进程)
-// 负责读写 ~/.config/pulse-ring/pulse-ring.qml + folia-lyrics.json，双语。
+// 负责读写 ~/.config/pulse-ring/pulse-ring.qml，中英双语。
 //
-// Phase 1 骨架：最小 libadwaita 窗口，验证 GTK4 构建链通。后续按
-// docs/settings-gui-design.md 逐步填充各 PreferencePage。
+// 拉入上游 Config 定义与 config_gui 模块。结构见 docs/settings-gui-design.md。
 
+#[path = "../config.rs"]
+mod config;
+
+#[path = "../config_gui/mod.rs"]
+mod config_gui;
+
+use libadwaita as adw;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use libadwaita as adw;
 
 fn main() {
+    // config.rs uses log::warn!/info! — enable RUST_LOG if user wants verbose output.
+    let _ = env_logger::try_init();
+
     let app = adw::Application::builder()
         .application_id("io.github.pulsering.Config")
         .build();
-    app.connect_activate(|app| build_ui(app));
+    app.connect_activate(|app| {
+        config_gui::build_main_window(app);
+    });
     app.run();
-}
-
-fn build_ui(app: &adw::Application) {
-    let win = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("pulse-ring 配置 / Settings")
-        .default_width(900)
-        .default_height(640)
-        .build();
-
-    let header = adw::HeaderBar::new();
-    let toolbar_view = adw::ToolbarView::new();
-    toolbar_view.add_top_bar(&header);
-
-    let status = gtk4::Label::new(Some("GUI skeleton — GTK4 build chain OK"));
-    status.set_margin_top(40);
-    status.set_margin_bottom(40);
-
-    let content = adw::StatusPage::builder()
-        .title("pulse-ring 配置")
-        .description("GUI 骨架加载成功。各配置页待填充。 / Skeleton loaded; pages pending.")
-        .child(&status)
-        .build();
-
-    toolbar_view.set_content(Some(&content));
-    win.set_content(Some(&toolbar_view));
-    win.present();
 }

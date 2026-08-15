@@ -10,20 +10,19 @@
 //! track duration — the same double-finalize Python applies via `success(...)`.
 //!
 //! Parity scope notes:
-//! - Deviation from `lyric_sources.py`: the Python `request(...)` helper (lines 415-435)
-//!   returns the raw body + charset; this codebase exposes only `request_json` (which parses
-//!   JSON). QiShui replies LRC/plain text, so we keep a local raw-body GET (`get_text`) that
-//!   mirrors `request_json`'s Noctalia-UA + timeout profile but skips the JSON decode.
+//! - Fetch path: the Python `request(...)` helper (lyric_sources.py:415-435) returns the raw
+//!   body + charset; this codebase exposes a shared `request_data` (lyricfetch::mod) that
+//!   mirrors `request_json`'s Noctalia-UA + timeout profile but returns raw bytes (no JSON
+//!   decode) — matching what QiShui needs (it replies LRC/plain-text, not JSON). The optional
+//!   `QISHUI_TOKEN` is sent as `Authorization: Bearer <token>` via the caller-header slice.
 //! - URL validation is done with a manual scheme+host check rather than the `url` crate,
 //!   to avoid introducing a new dependency (equivalent to `urllib.parse.urlparse`'s
 //!   scheme/`netloc` presence check).
 //! - QiShui has no cover-art concept in `crate::lyrics::LyricData` (it carries only
 //!   `source` + `lines`), matching the LRCLIB/Kugou adapters' treatment of cover fields.
 
-use std::time::Duration;
-
 use super::lrc::{parse_lrc, parse_plain};
-use super::{finalize, REQUEST_TIMEOUT};
+use super::{finalize, request_data, REQUEST_TIMEOUT};
 use crate::lyrics::{LyricData, TrackRequest};
 
 /// Adapter entry: render the QiShui template URL and fetch lyrics for `req`.
@@ -48,14 +47,25 @@ pub(crate) fn fetch_qishui(req: &TrackRequest) -> Result<LyricData, String> {
         .ok()
         .filter(|s| !s.trim().is_empty());
 
-    // GET the endpoint with the Noctalia UA (and bearer if present). Mirrors request_json's
-    // header/timeout profile but returns the raw body text (QiShui replies LRC, not JSON).
-    let text = get_text(
-        &url,
-        token.as_deref(),
-        REQUEST_TIMEOUT,
-    )
-    .map_err(|e| format!("qishui: {e}"))?; // :796-799
+    // Build a caller-header slice carrying `Authorization` when a bearer is present, then
+    // fetch the raw body via the shared `request_data` helper (lyric_sources.py:415) —
+    // mirroring `request_json`'s Noctalia-UA + timeout profile but skipping the JSON decode
+    // (QiShui replies LRC/plain-text, not JSON). `into_string` already lossy-converts to
+    // UTF-8, so the returned bytes are UTF-8 regardless of the declared charset.
+    let mut headers: Vec<(&str, &str)> = Vec::new();
+    let mut auth_buf = String::new();
+    if let Some(t) = token.as_deref() {
+        auth_buf = format!("Bearer {t}");
+        headers.push(("Authorization", auth_buf.as_str()));
+    }
+    let headers_opt: Option<&[(&str, &str)]> = if headers.is_empty() {
+        None
+    } else {
+        Some(&headers[..])
+    };
+    let (body, _charset) = request_data(&url, headers_opt, REQUEST_TIMEOUT)
+        .map_err(|e| format!("qishui: {e}"))?; // :796-799
+    let text = String::from_utf8_lossy(&body);
 
     parse_qishui_body(&text, req.duration_ms)
 }
@@ -117,24 +127,6 @@ fn validate_http_url(url: &str) -> Result<(), String> {
         return Err("qishui: invalid endpoint".to_string());
     }
     Ok(())
-}
-
-/// Raw-body GET — mirrors `request_json` (lyric_sources.py:426) but skips JSON parsing and
-/// returns the body as a UTF-8-lossy string (ureq's `into_string` is already lossy). The
-/// optional `bearer` token is sent as `Authorization: Bearer <token>` (:794-795).
-fn get_text(url: &str, bearer: Option<&str>, timeout: Duration) -> Result<String, String> {
-    let mut req = ureq::get(url)
-        .set("User-Agent", "Noctalia-Lyrics/1.0")
-        .set("Accept", "text/plain, application/xml, text/xml, */*");
-    if let Some(token) = bearer {
-        req = req.set("Authorization", &format!("Bearer {token}"));
-    }
-    let resp = req
-        .timeout(timeout)
-        .call()
-        .map_err(|e| format!("request: {e}"))?;
-    resp.into_string()
-        .map_err(|e| format!("read body: {e}"))
 }
 
 #[cfg(test)]

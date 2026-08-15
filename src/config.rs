@@ -21,8 +21,11 @@ pub enum LyricStyle {
 }
 
 impl Default for LyricStyle {
+    /// The classic worktree defaults to `Classic` so that the classic lyric engine runs
+    /// out of the box when no `style:` key is present in the active config (and when no
+    /// config file is readable at all). An explicit `style:` key still wins via `apply`.
     fn default() -> Self {
-        LyricStyle::Off
+        LyricStyle::Classic
     }
 }
 
@@ -374,7 +377,7 @@ pub struct Config {
     pub x_offset: f32,
     pub y_offset: f32,
     // ---- lyrics ----
-    /// Lyric animation style: off / sonnet.
+    /// Lyric animation style: off / sonnet / classic.
     pub style: LyricStyle,
     /// Lyric source id passed to lyric_sources.py (lrclib / netease / ttml / ...).
     pub lyric_source: String,
@@ -460,7 +463,7 @@ impl Default for Config {
             smoothness: 2.0,
             x_offset: 0.0,
             y_offset: 0.0,
-            style: LyricStyle::Off,
+            style: LyricStyle::Classic,
             lyric_source: "netease".to_string(),
             ttml_url: String::new(),
             mg_bg: true,

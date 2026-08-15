@@ -7,3 +7,6 @@ plugins/*/target/
 # Node / Electron dependencies and logs
 node_modules/
 npm-debug.log*
+
+# pi agent session artifacts
+.pi/

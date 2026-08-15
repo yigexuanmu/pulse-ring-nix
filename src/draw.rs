@@ -88,6 +88,14 @@ pub struct RingRenderer {
     /// 1x1 transparent view used when no wallpaper is configured (transparent base).
     wallpaper_placeholder_view: wgpu::TextureView,
     wallpaper_mode: u32,
+    // ---- folia overlay layer (middle): lyrics visualizer drawn ABOVE the wallpaper
+    // and BELOW the rings. A separate texture so an image wallpaper and the folia
+    // viz can coexist (3-layer composite: wallpaper < folia < ring).
+    overlay_texture: Option<wgpu::Texture>,
+    overlay_view: Option<wgpu::TextureView>,
+    overlay_pipeline: Option<wgpu::RenderPipeline>,
+    overlay_bind_group: Option<wgpu::BindGroup>,
+    overlay_dirty: bool,
 }
 
 /// Uniforms for the wallpaper transition pass (GLSL `TransitionUniforms` block).
@@ -437,6 +445,11 @@ impl RingRenderer {
             static_wallpaper_bind_group: None,
             transition_name: String::new(),
             wallpaper_aspect: 1.0,
+            overlay_texture: None,
+            overlay_view: None,
+            overlay_pipeline: None,
+            overlay_bind_group: None,
+            overlay_dirty: false,
         }
     }
 
@@ -756,6 +769,174 @@ impl RingRenderer {
         }
         // Size changed (e.g. video resolution switch): fall back to a full re-upload.
         self.upload_wallpaper(rgba, w, h);
+    }
+
+    /// Upload (or replace) the folia overlay frame (RGBA, screen-sized). No mipmaps —
+    /// it's a per-frame stream from the Electron offscreen renderer, so a single
+    /// level is enough and avoids per-frame mipmap blits.
+    pub fn upload_overlay(&mut self, rgba: &[u8], w: u32, h: u32) {
+        if w == 0 || h == 0 {
+            return;
+        }
+        // Reuse the staging buffer path if size matches (the common per-frame case).
+        let same_size = self
+            .overlay_texture
+            .as_ref()
+            .map(|t| t.width() == w && t.height() == h)
+            .unwrap_or(false);
+        if same_size {
+            let Some(tex) = &self.overlay_texture else { return };
+            self.queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: tex,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                rgba,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(w * 4),
+                    rows_per_image: Some(h),
+                },
+                wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            );
+            self.overlay_dirty = true;
+            return;
+        }
+        // First frame or size changed: (re)create the texture.
+        let tex = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("folia overlay"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &tex,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(w * 4),
+                rows_per_image: Some(h),
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
+        self.overlay_texture = Some(tex);
+        self.overlay_view = Some(view);
+        self.overlay_dirty = true;
+    }
+
+    /// Lazily build the overlay sampler/pipeline (alpha-blended, full-screen). The
+    /// folia page is rendered with a transparent body, so its RGBA alpha channel
+    /// drives the blend — areas with no lyric content are fully transparent.
+    fn ensure_overlay_pass(&mut self) {
+        if self.overlay_pipeline.is_some() {
+            return;
+        }
+        let Some(view) = self.overlay_view.as_ref() else { return };
+        let layout = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("overlay bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let bg = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("overlay bg"),
+            layout: &layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&self.sampler) },
+            ],
+        });
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("overlay"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+                @group(0) @binding(0) var t: texture_2d<f32>;
+                @group(0) @binding(1) var s: sampler;
+                struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+                @vertex
+                fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+                    let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+                    return VsOut(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), p);
+                }
+                @fragment
+                fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                    return textureSample(t, s, vec2<f32>(uv.x, 1.0 - uv.y));
+                }
+                "#
+                .into(),
+            ),
+        });
+        let pl = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("overlay pl"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("overlay"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.config.format,
+                    // Standard pre-multiplied alpha over the wallpaper below.
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.overlay_pipeline = Some(pipeline);
+        self.overlay_bind_group = Some(bg);
+    }
+
+    /// Drop the overlay (e.g. when the folia web wallpaper stops) so the wallpaper
+    // shows through cleanly again.
+    pub fn clear_overlay(&mut self) {
+        self.overlay_texture = None;
+        self.overlay_view = None;
+        // Keep the pipeline (it binds the view via bind_group; rebuild on next upload).
+        self.overlay_bind_group = None;
+        self.overlay_pipeline = None;
+        self.overlay_dirty = false;
     }
 
     /// Wallpaper fit mode: 0 = cover (crop), 1 = contain (letterbox), 2 = stretch.
@@ -1287,9 +1468,42 @@ impl RingRenderer {
             drop(wp_pass);
         }
 
-        // Pass 2: rings/particles/widgets. With a wallpaper, load its pixels and blend
-        // over it; without one, keep the transparent clear (compositor wallpaper shows).
-        let load_op = if has_wallpaper {
+        // Pass 1.5: folia overlay (lyrics visualizer). Drawn ABOVE the wallpaper and
+        // BELOW the rings via standard alpha blending. Only runs when the Electron
+        // offscreen renderer has produced a frame this tick. LoadOp::Load preserves
+        // the wallpaper pixels underneath.
+        let has_overlay = self.overlay_texture.is_some();
+        if has_overlay {
+            self.ensure_overlay_pass();
+            if let (Some(p), Some(b)) = (self.overlay_pipeline.as_ref(), self.overlay_bind_group.as_ref()) {
+                let mut ov_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("overlay pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                ov_pass.set_pipeline(p);
+                ov_pass.set_bind_group(0, b, &[]);
+                ov_pass.draw(0..3, 0..1);
+                drop(ov_pass);
+            }
+            self.overlay_dirty = false;
+        }
+
+        // Pass 2: rings/particles/widgets. With a wallpaper or overlay, load its pixels
+        // and blend over it; without either, keep the transparent clear (compositor
+        // wallpaper shows).
+        let load_op = if has_wallpaper || has_overlay {
             wgpu::LoadOp::Load
         } else {
             wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT)

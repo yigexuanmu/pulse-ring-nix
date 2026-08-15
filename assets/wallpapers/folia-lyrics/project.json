@@ -1,0 +1,8 @@
+{
+  "type": "scene",
+  "title": "Folia 歌词可视化",
+  "file": "../../../folia-wallpaper/dist/index.html",
+  "audio": true,
+  "resolution": "1920x1080",
+  "params": { "visualizerMode": "sonnet" }
+}

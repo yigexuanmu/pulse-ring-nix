@@ -5,7 +5,10 @@
 //   [4 字节 LE 宽][4 字节 LE 高][宽*高*4 字节 RGBA]
 // 从 stdin 读取带类型的消息：
 //   0x00 + 128 x f32 + energy f32
-//   0x01 + u32 JSON 长度 + JSON
+//   0x01 + u32 JSON 长度 + JSON (config → pulse-config)
+//   0x02 + u32 JSON 长度 + JSON (lyrics  → pulse-lyrics)
+//   0x03 + u32 JSON 长度 + JSON (playback → pulse-playback)
+//   0x04 + u32 JSON 长度 + JSON (theme   → pulse-theme)
 
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
@@ -16,6 +19,9 @@ const height = parseInt(process.argv[4] || '1080', 10);
 
 let win = null;
 let latestConfig = null;
+let latestLyrics = null;
+let latestPlayback = null;
+let latestTheme = null;
 
 let queue = [];
 let writing = false;
@@ -102,7 +108,9 @@ process.stdin.on('data', (chunk) => {
       continue;
     }
 
-    if (tag === 1) {
+    // Tags 1-4 share the same envelope: u32 LE JSON length + JSON bytes.
+    // 1=config, 2=lyrics, 3=playback, 4=theme. Dropped on parse error.
+    if (tag >= 1 && tag <= 4) {
       if (input.buf.length < 5) break;
       const len = input.buf.readUInt32LE(1);
       if (len === 0 || len > 1024 * 1024) {
@@ -110,12 +118,18 @@ process.stdin.on('data', (chunk) => {
         continue;
       }
       if (input.buf.length < 5 + len) break;
-      try {
-        const cfg = JSON.parse(input.buf.slice(5, 5 + len).toString('utf8'));
-        latestConfig = cfg;
-        if (win && !win.isDestroyed()) win.webContents.send('pulse-config', cfg);
-      } catch (_) {}
+      let payload = null;
+      try { payload = JSON.parse(input.buf.slice(5, 5 + len).toString('utf8')); } catch (_) {}
       input.buf = input.buf.slice(5 + len);
+      if (payload == null || !win || win.isDestroyed()) continue;
+      const channel = { 1: 'pulse-config', 2: 'pulse-lyrics', 3: 'pulse-playback', 4: 'pulse-theme' }[tag];
+      if (channel) {
+        if (tag === 1) latestConfig = payload;
+        else if (tag === 2) latestLyrics = payload;
+        else if (tag === 3) latestPlayback = payload;
+        else if (tag === 4) latestTheme = payload;
+        win.webContents.send(channel, payload);
+      }
       continue;
     }
 
@@ -146,6 +160,9 @@ app.whenReady().then(() => {
   win.loadFile(htmlPath);
   win.webContents.on('did-finish-load', () => {
     if (latestConfig) win.webContents.send('pulse-config', latestConfig);
+    if (latestLyrics) win.webContents.send('pulse-lyrics', latestLyrics);
+    if (latestPlayback) win.webContents.send('pulse-playback', latestPlayback);
+    if (latestTheme) win.webContents.send('pulse-theme', latestTheme);
   });
 
   // 隐藏窗口的离屏 paint 事件只触发前 1-2 帧就停止（Electron 已知行为），

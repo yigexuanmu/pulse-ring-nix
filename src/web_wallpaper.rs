@@ -54,6 +54,35 @@ impl WebWallpaperPlayer {
         let _ = stdin.write_all(&[1u8]);
         let _ = stdin.write_all(&buf);
     }
+
+    /// Send resolved lyrics (JSON) to the page via `window.pulseRing.onLyrics`.
+    /// Frame type tag: 2 (length-prefixed JSON, same envelope as config).
+    pub fn send_lyrics(&mut self, json: &str) {
+        self.send_tagged_json(2u8, json);
+    }
+
+    /// Send playback state (JSON) to the page via `window.pulseRing.onPlayback`.
+    /// Frame type tag: 3 (length-prefixed JSON).
+    pub fn send_playback(&mut self, json: &str) {
+        self.send_tagged_json(3u8, json);
+    }
+
+    /// Send visualizer theme (JSON) to the page via `window.pulseRing.onTheme`.
+    /// Frame type tag: 4 (length-prefixed JSON).
+    pub fn send_theme(&mut self, json: &str) {
+        self.send_tagged_json(4u8, json);
+    }
+
+    fn send_tagged_json(&mut self, tag: u8, json: &str) {
+        let Some(stdin) = self.stdin.as_mut() else { return };
+        use std::io::Write;
+        let bytes = json.as_bytes();
+        let mut buf = Vec::with_capacity(4 + bytes.len());
+        buf.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+        buf.extend_from_slice(bytes);
+        let _ = stdin.write_all(&[tag]);
+        let _ = stdin.write_all(&buf);
+    }
 }
 
 impl Drop for WebWallpaperPlayer {

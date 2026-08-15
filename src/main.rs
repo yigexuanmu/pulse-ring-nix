@@ -24,6 +24,7 @@ use wayland_client::{
 mod audio;
 mod config;
 mod draw;
+mod folia_bridge;
 mod lua;
 mod lyrics;
 mod plugin;
@@ -219,6 +220,11 @@ struct App {
     wallpaper_image: Option<ImageData>,
     /// Set when the wallpaper changed and every renderer's texture needs an upload.
     wallpaper_dirty: bool,
+    /// Folia lyrics-overlay frame (Electron offscreen web wallpaper): the middle
+    /// layer, drawn ABOVE the image/video wallpaper and BELOW the rings. Separate
+    /// from wallpaper_image so an image wallpaper and the folia viz can coexist.
+    folia_overlay_image: Option<ImageData>,
+    folia_overlay_dirty: bool,
     /// Video wallpaper player (None when the current wallpaper is an image).
     video_player: Option<video_wallpaper::VideoPlayer>,
     /// True on the first frame of a new video session — it should trigger a
@@ -279,6 +285,15 @@ struct App {
     lyric_t_prev: f32,
     /// Background MPRIS state (title/artist/position/status).
     music_rx: std::sync::mpsc::Receiver<MusicSnapshot>,
+    // ---- folia lyric-visualizer bridge (Electron web wallpaper) ----
+    /// Last track key pushed to folia, to detect track changes.
+    folia_last_track: String,
+    /// Last lyric-line count pushed (re-push when lyrics change).
+    folia_last_lyric_lines: usize,
+    /// Wall-clock of the last playback push (throttle to ~2Hz).
+    folia_last_pb_push: f32,
+    /// Retained duration (seconds) of the current track (MPRIS polls it).
+    folia_duration: f32,
 }
 
 fn main() {
@@ -449,6 +464,8 @@ fn main() {
         cover_aspect: 1.0,
         wallpaper_image,
         wallpaper_dirty,
+        folia_overlay_image: None,
+        folia_overlay_dirty: false,
         video_player,
         video_first_frame,
         web_player,
@@ -500,6 +517,10 @@ fn main() {
         lyric_line_changed_at: 0.0,
         lyric_t_prev: -1000.0,
         music_rx,
+        folia_last_track: String::new(),
+        folia_last_lyric_lines: usize::MAX,
+        folia_last_pb_push: -10.0,
+        folia_duration: 0.0,
     };
 
     // Wait for the first configure (outputs sized) via blocking dispatch, then switch to a
@@ -2103,6 +2124,7 @@ impl App {
             self.lyric_cur_idx = -1;
         }
         self.music.position_sec = snap.position_sec;
+        self.folia_duration = snap.duration_sec.max(0.0);
         self.lyric_pos_poll_elapsed = self.start.elapsed().as_secs_f32();
         self.music.playing = snap.playing;
         // Drain lyric fetch results; only accept the one matching the current track.
@@ -2114,6 +2136,53 @@ impl App {
                     self.lyric_data.as_ref().map_or(0, |d| d.lines.len())
                 );
             }
+        }
+    }
+
+    /// Push lyrics / playback / theme to the folia web wallpaper (Electron offscreen).
+    /// Called every frame from tick(); self-throttling for playback. Lyrics are re-pushed
+    /// when the track changes or the lyric document changes. Theme rides the track change.
+    fn push_folia_state(&mut self) {
+        let has_player = self.web_player.is_some() || self.scene_player.is_some();
+        if !has_player {
+            return;
+        }
+        let now = self.start.elapsed().as_secs_f32();
+        let track_key = format!("{}\u{1}{}", self.music.title, self.music.artist);
+        let track_changed = track_key != self.folia_last_track;
+        let lyric_lines = self.lyric_data.as_ref().map_or(0, |d| d.lines.len());
+        let lyric_changed = lyric_lines != self.folia_last_lyric_lines;
+
+        if track_changed {
+            self.folia_last_track = track_key;
+            let colors = &self.cfg.colors;
+            let sens = self.cfg.sensitivity;
+            folia_bridge::send_theme(self.web_player.as_mut(), colors, sens);
+            folia_bridge::send_theme(self.scene_player.as_mut(), colors, sens);
+        }
+
+        // Lyrics: re-push on track change or when the lyric document changes (fetch completed).
+        if track_changed || lyric_changed {
+            self.folia_last_lyric_lines = lyric_lines;
+            if let Some(data) = &self.lyric_data {
+                folia_bridge::send_lyrics(self.web_player.as_mut(), data);
+                folia_bridge::send_lyrics(self.scene_player.as_mut(), data);
+            }
+        }
+
+        // Playback: throttle to ~2Hz (folia extrapolates the clock client-side, so 2Hz anchor
+        // re-sync is plenty; a track change forces an immediate flush).
+        let dt = (now - self.folia_last_pb_push).max(0.0);
+        if track_changed || dt >= 0.5 {
+            self.folia_last_pb_push = now;
+            let (pos, dur, playing) = (self.music.position_sec, self.folia_duration, self.music.playing);
+            let (title, artist, album) = (
+                self.music.title.clone(),
+                self.music.artist.clone(),
+                self.music.album.clone(),
+            );
+            folia_bridge::send_playback(self.web_player.as_mut(), pos, dur, playing, &title, &artist, &album, None);
+            folia_bridge::send_playback(self.scene_player.as_mut(), pos, dur, playing, &title, &artist, &album, None);
         }
     }
 
@@ -2215,6 +2284,8 @@ impl App {
         if let Some(player) = &mut self.web_player {
             player.send_audio(&self.bands, energy_max);
         }
+        // Push lyrics / playback / theme to the folia web wallpaper (throttled).
+        self.push_folia_state();
         let idle = energy_max < 0.002;
         let now = self.start.elapsed().as_secs_f32();
         self.idle_since = if idle {
@@ -2250,37 +2321,35 @@ impl App {
         }
         if let Some(player) = &mut self.scene_player {
             if let Some(frame) = web_wallpaper::drain_web(&player.rx) {
-                self.wallpaper_image = Some(ImageData {
+                self.folia_overlay_image = Some(ImageData {
                     w: frame.width,
                     h: frame.height,
                     rgba: frame.rgba,
                 });
-                self.wallpaper_dirty = true;
+                self.folia_overlay_dirty = true;
                 if self.scene_first_frame {
                     self.scene_first_frame = false;
-                    self.wallpaper_force_upload = true;
                 }
             }
         }
         if let Some(player) = &mut self.web_player {
             if let Some(frame) = web_wallpaper::drain_web(&player.rx) {
-                self.wallpaper_image = Some(ImageData {
+                self.folia_overlay_image = Some(ImageData {
                     w: frame.width,
                     h: frame.height,
                     rgba: frame.rgba,
                 });
-                self.wallpaper_dirty = true;
+                self.folia_overlay_dirty = true;
                 if self.web_first_frame {
                     self.web_first_frame = false;
-                    self.wallpaper_force_upload = true;
                 }
             }
         }
         self.tick_wallpaper_rotation();
         let scene = self.compute_scene();
-        // With an image wallpaper configured, every monitor shows it (wallpaper-engine
-        // behaviour) — render all outputs regardless of the renderScreen visualisation cap.
-        let target = if self.wallpaper_image.is_some() { -1 } else { self.cfg.render_screen };
+        // With an image wallpaper OR folia overlay configured, every monitor shows it
+        // (wallpaper-engine behaviour) — render all outputs regardless of the renderScreen cap.
+        let target = if self.wallpaper_image.is_some() || self.folia_overlay_image.is_some() { -1 } else { self.cfg.render_screen };
         if target >= 0 {
             let idx = target as usize;
             if idx < self.outputs.len() && !self.outputs[idx].closed && self.outputs[idx].width > 0 {
@@ -2293,8 +2362,9 @@ impl App {
                 }
             }
         }
-        // Every renderer has seen the wallpaper this frame; clear the change flag.
+        // Every renderer has seen the wallpaper/overlay this frame; clear the change flags.
         self.wallpaper_dirty = false;
+        self.folia_overlay_dirty = false;
         if self.profile_enabled {
             self.profile.max_frame = self.profile.max_frame.max(t0.elapsed().as_secs_f32());
         }
@@ -2320,6 +2390,13 @@ impl App {
             let path = &self.wallpaper_list[self.wallpaper_idx];
             self.video_player = None;
             self.web_player = None;
+            // Stale folia overlay from the previous web wallpaper must be dropped so it
+            // doesn't linger over the next image wallpaper.
+            self.folia_overlay_image = None;
+            self.folia_overlay_dirty = false;
+            for r in self.outputs.iter_mut() {
+                r.renderer.clear_overlay();
+            }
             let rwp = resolve_wallpaper(path);
             if rwp.kind == "image" || rwp.kind == "video" {
                 apply_pack_style(&mut self.cfg, rwp.qml.as_deref(), rwp.lua.as_deref());
@@ -2553,6 +2630,14 @@ fn pull_audio(&mut self) {
                 crate::config::WallpaperMode::Stretch => 2,
                 _ => 0,
             });
+        }
+        // Folia lyrics overlay (middle layer): upload a fresh frame when one arrived
+        // this tick. The renderer creates/reuses the overlay texture internally and
+        // skips the pass when no overlay is present (overlay_texture is None).
+        if self.folia_overlay_dirty {
+            if let Some(img) = &self.folia_overlay_image {
+                renderer.upload_overlay(&img.rgba, img.w, img.h);
+            }
         }
         renderer.set_widgets(&widgets);
         let widget_bounds = compute_widget_bounds(&scene.widgets_cfg, width, height);

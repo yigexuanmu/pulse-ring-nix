@@ -422,13 +422,14 @@ fn choose_transition_kind(sig_seed: &str, prev: Option<TransitionKind>) -> Trans
 }
 
 fn find_shot(program: &Program, t: f32) -> Option<usize> {
-    let mut idx = None;
-    for (i, s) in program.shots.iter().enumerate() {
-        if t >= s.start {
-            idx = Some(i);
+    // 优先返回 [start, end) 包含 t 的 shot；间隙期间返回 None，
+    // 让 build_frame 走空白/已淡出稳态，避免 A+1 段落串回已结束的 A 末 shot。
+    for (i, s) in program.shots.iter().enumerate().rev() {
+        if t >= s.start && t < s.end {
+            return Some(i);
         }
     }
-    idx
+    None
 }
 
 /// The word whose timing window contains `time`, or the nearest one.

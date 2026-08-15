@@ -213,6 +213,10 @@ struct App {
     font: std::sync::Arc<rusttype::Font<'static>>,
     texture_slots: Vec<TextureSlotState>,
     cover_rx: std::sync::mpsc::Receiver<ImageData>,
+    /// Compact base-64 JPEG data-URL preview of the latest album cover, fed to the
+    /// folia lyric page as `coverUrl` so it can extract album colors. Written by
+    /// the cover thread; read (cloned) on each folia playback push.
+    folia_cover_url: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     last_cover_path: String,
     cover_loaded: bool,
     cover_aspect: f32,
@@ -438,6 +442,9 @@ fn main() {
         }
     }
     let wallpaper_dirty = wallpaper_dirty || video_player.is_some() || web_player.is_some();
+    // Cover thread returns the GPU-texture RGBA channel plus a shared base-64
+    // data-URL preview that the folia lyric page reads as the cover image.
+    let (spawn_cover_thread_rx, spawn_cover_thread_url) = spawn_cover_thread();
     let mut app = App {
         compositor,
         layer_shell,
@@ -458,7 +465,8 @@ fn main() {
         texture_slots: (0..draw::ATLAS_CAPACITY)
             .map(|_| TextureSlotState::default())
             .collect(),
-        cover_rx: spawn_cover_thread(),
+        cover_rx: spawn_cover_thread_rx,
+        folia_cover_url: spawn_cover_thread_url,
         last_cover_path: String::new(),
         cover_loaded: false,
         cover_aspect: 1.0,
@@ -1083,8 +1091,18 @@ fn spawn_lyric_raster_thread() -> (
 }
 
 /// Poll the MPRIS cover via `playerctl` every 2s, decode it, send RGBA through a channel.
-fn spawn_cover_thread() -> std::sync::mpsc::Receiver<ImageData> {
+/// Also builds a compact base-64 data-URL preview (256×256 JPEG) into the shared
+/// `cover_url` so the folia lyric page can extract album colors without CORS/
+/// canvas-taint issues that `file://` URLs cause under Electron's default web
+/// security. `extractColors` samples a 50×50 grid, so 256×256 is plenty and keeps
+/// the per-frame stdin load tiny (a few KiB).
+fn spawn_cover_thread() -> (
+    std::sync::mpsc::Receiver<ImageData>,
+    std::sync::Arc<std::sync::Mutex<Option<String>>>,
+) {
     let (tx, rx) = std::sync::mpsc::channel();
+    let cover_url = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let cu = cover_url.clone();
     std::thread::spawn(move || {
         let mut last: Option<String> = None;
         loop {
@@ -1100,6 +1118,12 @@ fn spawn_cover_thread() -> std::sync::mpsc::Receiver<ImageData> {
                 if last.as_deref() != Some(&path) {
                     last = Some(path.clone());
                     log::info!("cover: new art {path}");
+                    // Refresh the data-URL preview for the folia lyric page.
+                    if let Some(data_url) = build_cover_data_url(&path) {
+                        if let Ok(mut g) = cu.lock() {
+                            *g = Some(data_url);
+                        }
+                    }
                     match load_image_path(&path) {
                         Some(img) => { log::info!("cover: decoded {}x{}", img.w, img.h); let _ = tx.send(img); }
                         None => log::warn!("cover: decode failed {path}"),
@@ -1111,7 +1135,29 @@ fn spawn_cover_thread() -> std::sync::mpsc::Receiver<ImageData> {
             std::thread::sleep(std::time::Duration::from_secs(2));
         }
     });
-    rx
+    (rx, cover_url)
+}
+
+/// Build a compact `data:image/jpeg;base64,...` URL from a local cover file, scaled
+/// to fit inside 256×256 (aspect preserved). Returns None when the file can't be
+/// read or decoded (e.g. unsupported WEBP/GIF under the crate's narrow feature set).
+fn build_cover_data_url(path: &str) -> Option<String> {
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    let expanded = path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1);
+    let bytes = std::fs::read(&expanded).ok()?;
+    if bytes.is_empty() {
+        return None;
+    }
+    // `image` is built with only png+jpeg here; load_from_memory handles both.
+    let img = image::load_from_memory(&bytes).ok()?;
+    let thumb = img.thumbnail(256, 256);
+    let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+    thumb.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
+    let out = buf.into_inner();
+    if out.is_empty() {
+        return None;
+    }
+    Some(format!("data:image/jpeg;base64,{}", STANDARD.encode(&out)))
 }
 
 /// Decode a PNG or JPEG file into RGBA (scaled to fit 256 slot).
@@ -2181,8 +2227,12 @@ impl App {
                 self.music.artist.clone(),
                 self.music.album.clone(),
             );
-            folia_bridge::send_playback(self.web_player.as_mut(), pos, dur, playing, &title, &artist, &album, None);
-            folia_bridge::send_playback(self.scene_player.as_mut(), pos, dur, playing, &title, &artist, &album, None);
+            // Album cover as a compact data URL (256×256 JPEG) for the folia page's
+            // color extraction — None until the cover thread has seen any art.
+            let cover_url = self.folia_cover_url.lock().ok().and_then(|g| g.clone());
+            let cu = cover_url.as_deref();
+            folia_bridge::send_playback(self.web_player.as_mut(), pos, dur, playing, &title, &artist, &album, cu);
+            folia_bridge::send_playback(self.scene_player.as_mut(), pos, dur, playing, &title, &artist, &album, cu);
         }
     }
 

@@ -156,3 +156,11 @@ pulse-ring 采用 **AGPL-3.0-only**（与所参考项目 Folia/SPlayer/Kaleidux 
 
 - **帧率**：始终 30fps（`PULSE_RING_MAX_FPS=60` 可开 60fps），空闲动画（呼吸/自转/粒子/时钟）保持流畅；若想省电，可显式设置 `PULSE_RING_IDLE_FPS=15` 在静音 2 秒后降帧（可选，默认不降）
 - **性能剖析**：`PULSE_RING_PROFILE=1` 运行，每 60 帧输出各阶段耗时（pull_audio/lua/plugins/particles/widgets/render）
+
+---
+
+## Folia 歌词可视化集成（Neo 分支新增）
+
+在壁纸层上方、中心律动环下方渲染 folia-major 的全部 11 种歌词可视化模式（classic/cadenza/partita/fume/claddagh/cappella/tilt/monet/diorama/pendolo/sonnet）。数据全由 pulse-ring 自带管线驱动（MPRIS + LRC + 封面 + PipeWire FFT），folia 端不联网。
+
+详见 **[docs/folia-lyrics.md](docs/folia-lyrics.md)** —— 包含安装、启用、**切换模式**、monet 封面取色、重建 bundle、故障排查。

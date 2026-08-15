@@ -20,6 +20,7 @@ pub(crate) mod qishui;
 pub(crate) mod ttml;
 pub(crate) mod spotify;
 pub(crate) mod apple_music;
+pub(crate) mod musixmatch;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -43,6 +44,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
         "ttml" => ttml::fetch_ttml(req),
         "spotify" => spotify::fetch_spotify(req),
         "apple_music" => apple_music::fetch_apple_music(req),
+        "musixmatch" => musixmatch::fetch_musixmatch(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }

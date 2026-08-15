@@ -39,6 +39,14 @@ export interface PulseRingPlayback {
   seed?: string;
 }
 
+export interface PulseRingConfig {
+  // The visualizer mode to render (e.g. 'sonnet', 'monet', 'classic'). Driven by
+  // project.json `params.visualizerMode` when the folia-lyrics pack is resolved.
+  visualizerMode?: string;
+  // Any other manifest params are passed through untouched.
+  [key: string]: unknown;
+}
+
 // A minimal folia Theme shape (the fields visualizers actually read).
 export interface PulseRingTheme {
   name?: string;
@@ -60,7 +68,8 @@ export interface PulseRingApi {
   onAudio: (cb: (d: PulseRingAudio) => void) => () => void;
   onBands: (cb: (d: PulseRingAudio) => void) => () => void;
   getAudioData: () => PulseRingAudio | null;
-  onConfig: (cb: (cfg: unknown) => void) => () => void;
+  onConfig: (cb: (cfg: PulseRingConfig) => void) => () => void;
+  getConfig: () => PulseRingConfig | null;
   onLyrics: (cb: (d: PulseRingLyricData | null) => void) => () => void;
   onPlayback: (cb: (d: PulseRingPlayback | null) => void) => () => void;
   onTheme: (cb: (d: PulseRingTheme | null) => void) => () => void;

@@ -6,6 +6,7 @@ import { findLatestActiveLineIndex } from './utils/appPlaybackHelpers';
 import type { Line, Theme } from './types';
 import type { VisualizerBackgroundConfig } from './components/visualizer/backgrounds/definition';
 import type { VisualizerMode } from './types';
+import type { PulseRingConfig } from './pulseRing';
 import { usePulseRingSource } from './hooks/usePulseRingSource';
 
 // pulse-ring folia wallpaper shell.
@@ -33,13 +34,16 @@ const compute5Band = (bands: Float32Array) => {
   };
 };
 
-// Resolve the active visualizer mode:
-//   1) global __FOLIA_MODE__ (pinned to window by preload from config)
-//   2) ?mode= query param
-//   3) 'classic' default
-const resolveMode = (): VisualizerMode => {
-  const w = window as unknown as { __FOLIA_MODE__?: string };
-  if (w.__FOLIA_MODE__) return w.__FOLIA_MODE__ as VisualizerMode;
+// Resolve the initial visualizer mode for THIS mount only:
+//   1) ?mode=<m> URL param  — highest priority AND locked for the session.
+//      A URL author can force a mode regardless of the manifest below.
+//   2) 'classic'             — until a config (project.json params) arrives.
+// When no `?mode=` is given, a later config carrying `visualizerMode` (from
+// project.json `params`) updates the mode via the onConfig subscription below.
+// NOTE: We intentionally do NOT read window.__FOLIA_MODE__ — under Electron's
+// default contextIsolation the preload's window is isolated and the page never
+// sees it. Use the `window.pulseRing` API (onConfig/getConfig) instead.
+const resolveInitialMode = (): VisualizerMode => {
   try {
     const p = new URLSearchParams(location.search).get('mode');
     if (p) return p as VisualizerMode;
@@ -47,11 +51,31 @@ const resolveMode = (): VisualizerMode => {
   return 'classic';
 };
 
+const hasUrlMode = (() => {
+  try { return Boolean(new URLSearchParams(location.search).get('mode')); } catch { return false; }
+})();
+
 const TRANSPARENT_BG: VisualizerBackgroundConfig = { mode: null, transparent: true };
 
 const PulseRingObsApp: React.FC = () => {
   const { state, theme, getCurrentTimeSec } = usePulseRingSource();
-  const mode = useMemo(resolveMode, []);
+  const [mode, setMode] = useState<VisualizerMode>(resolveInitialMode);
+
+  // React to a config (project.json params) carrying visualizerMode, unless the
+  // URL pinned a mode via ?mode=. config lags behind mount (it's replayed on
+  // did-finish-load), so also read a cached value the preload may already hold.
+  // Either source updates the mode state; VisualizerRenderer re-renders on it.
+  useEffect(() => {
+    if (hasUrlMode) return;
+    const api = window.pulseRing;
+    if (!api) return;
+    const applyConfig = (cfg: PulseRingConfig | null) => {
+      const m = cfg && typeof cfg.visualizerMode === 'string' ? cfg.visualizerMode : null;
+      if (m) setMode(m as VisualizerMode);
+    };
+    applyConfig(api.getConfig?.() ?? null);
+    return api.onConfig?.(applyConfig);
+  }, []);
 
   const [currentLineIndex, setCurrentLineIndex] = useState(-1);
   const currentLineIndexRef = useRef(-1);

@@ -5,6 +5,11 @@
 //   window.pulseRing.onLyrics((lyrics) => { ... })   // 已解析歌词 (LyricData 形状)
 //   window.pulseRing.onPlayback((pb) => { ... })     // MPRIS 播放进度时钟
 //   window.pulseRing.onTheme((theme) => { ... })      // 可视化主题配色
+//
+// 切换歌词可视化模式：config 在页面里经 onConfig 订阅拿到（例如
+// project.json 的 params.visualizerMode），页面再据此切 mode。不能在
+// preload 里写 window.__FOLIA_MODE__——contextIsolation 默认开启，preload
+// 的 window 是隔离世界，主页面读不到。
 const { contextBridge, ipcRenderer } = require('electron');
 
 const subscribe = (channel, map, cb) => {
@@ -21,6 +26,7 @@ let latestAudio = Object.freeze({
 let latestLyrics = null;
 let latestPlayback = null;
 let latestTheme = null;
+let latestConfig = null;
 
 ipcRenderer.on('pulse-bands', (_event, data) => {
   latestAudio = Object.freeze({
@@ -36,6 +42,7 @@ ipcRenderer.on('pulse-bands', (_event, data) => {
 ipcRenderer.on('pulse-lyrics', (_event, data) => { latestLyrics = data; });
 ipcRenderer.on('pulse-playback', (_event, data) => { latestPlayback = data; });
 ipcRenderer.on('pulse-theme', (_event, data) => { latestTheme = data; });
+ipcRenderer.on('pulse-config', (_event, data) => { latestConfig = data; });
 
 const onAudio = (cb) => subscribe('pulse-bands', (data) => ({
   bands: new Float32Array(data.bands),
@@ -52,6 +59,7 @@ contextBridge.exposeInMainWorld('pulseRing', {
   onBands: onAudio,
   getAudioData: () => latestAudio,
   onConfig: (cb) => subscribe('pulse-config', (cfg) => cfg, cb),
+  getConfig: () => latestConfig,
   onLyrics: (cb) => subscribe('pulse-lyrics', (lyrics) => lyrics, cb),
   onPlayback: (cb) => subscribe('pulse-playback', (pb) => pb, cb),
   onTheme: (cb) => subscribe('pulse-theme', (theme) => theme, cb),

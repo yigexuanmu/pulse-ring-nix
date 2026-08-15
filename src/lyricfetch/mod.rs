@@ -9,6 +9,7 @@
 
 use crate::lyrics::{LyricData, TrackRequest};
 
+pub(crate) mod jsonparse;
 pub(crate) mod lrc;
 pub(crate) mod lrclib;
 pub(crate) mod netease;
@@ -16,6 +17,7 @@ pub(crate) mod qqmusic;
 pub(crate) mod splayer;
 pub(crate) mod kugou;
 pub(crate) mod qishui;
+pub(crate) mod ttml;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///

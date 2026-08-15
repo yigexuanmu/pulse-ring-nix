@@ -15,6 +15,7 @@ pub(crate) mod netease;
 pub(crate) mod qqmusic;
 pub(crate) mod splayer;
 pub(crate) mod kugou;
+pub(crate) mod qishui;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -34,6 +35,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
         "qqmusic" => qqmusic::fetch_qqmusic(req),
         "splayer" => splayer::fetch_splayer(req),
         "kugou" => kugou::fetch_kugou(req),
+        "qishui" => qishui::fetch_qishui(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }

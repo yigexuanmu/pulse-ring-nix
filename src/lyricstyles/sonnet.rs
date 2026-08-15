@@ -1744,15 +1744,19 @@ pub fn build_frame(ctx: &StyleCtx, input: &StyleInput) -> StyleOutput {
         }
         // Accent = the word currently being sung.
         let sung = t >= p.start && t <= p.end;
-        let (color, glow, pop) = if sung {
-            (ctx.colors.accent, 1.0, 1.18)
-        } else {
-            match p.role {
-                Role::Hero => (ctx.colors.accent, 0.65, 1.08),
-                Role::SemiHero => (ctx.colors.primary, 0.0, 1.0),
-                Role::Support => (ctx.colors.dim, 0.0, 1.0),
-                Role::Decoration => ([1.0, 1.0, 1.0, if p.giant { 0.22 } else { 0.5 }], 0.0, 0.92),
-            }
+        // Decoration is an ambient echo of the hero word, NEVER the sung line itself.
+        // Even while the hero is inside its sung window the echo must keep its ambient
+        // color/alpha (white 0.22 giant / 0.5), otherwise the same lyric text draws twice
+        // at full accent brightness — once hero-size, once 4× giant — which reads to the
+        // user as "歌词重复渲染". The previous `if sung { accent } else { match }` path let
+        // Decoration fall through to the `sung` arm during the sung window, lighting the
+        // giant echo at full accent (alpha ~1.0) instead of ambient (~0.22).
+        let (color, glow, pop) = match (p.role, sung) {
+            (Role::Decoration, _) => ([1.0, 1.0, 1.0, if p.giant { 0.22 } else { 0.5 }], 0.0, 0.92),
+            (_, true) => (ctx.colors.accent, 1.0, 1.18),
+            (Role::Hero, false) => (ctx.colors.accent, 0.65, 1.08),
+            (Role::SemiHero, false) => (ctx.colors.primary, 0.0, 1.0),
+            (Role::Support, false) => (ctx.colors.dim, 0.0, 1.0),
         };
         let alpha = trans_alpha * core * color[3] * mask_wipe;
         if alpha <= 0.004 {

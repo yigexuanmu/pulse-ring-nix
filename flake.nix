@@ -49,6 +49,14 @@
           # time via `postPatch` substituteInPlace (Nix store paths), so load_font()
           # reads them directly with no runtime fc-match lookup.
           freetype
+          # GTK4 / libadwaita: 配置 GUI (bin: pulse-ring-config) 所需的 native libs.
+          # gtk4-rs / libadwaita-rs 是纯 Rust crate, 但通过 system-deps 在构建期
+          # 用 pkg-config 查这些系统库; 运行时也需在 LD_LIBRARY_PATH.
+          gtk4
+          libadwaita
+          graphene
+          harfbuzz
+          gdk-pixbuf
         ];
 
         # Runtime LD_LIBRARY_PATH so the binary finds gstreamer/vulkan plugins at runtime.
@@ -65,6 +73,12 @@
           wayland
           libxkbcommon
           freetype
+          # GTK4 / libadwaita runtime libs for pulse-ring-config GUI.
+          gtk4
+          libadwaita
+          graphene
+          harfbuzz
+          gdk-pixbuf
         ];
 
         # Rust toolchain pinned via overlay (stable, matches Cargo edition 2024).

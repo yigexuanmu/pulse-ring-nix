@@ -50,10 +50,12 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
 }
 
 fn fetch_auto(req: &TrackRequest) -> Result<LyricData, String> {
-    Err(format!(
-        "lyricfetch: auto chain not yet ported (track '{}')",
-        req.title
-    ))
+    // Mirror python LyricWorker fallback order: primary source chain.
+    // First try netease (default), then lrclib as fallback.
+    if let Ok(d) = netease::fetch_netease(req) {
+        return Ok(d);
+    }
+    lrclib::fetch_lrclib(req).map_err(|e| format!("lyricfetch auto: {e}"))
 }
 
 // ---- shared helpers (mirror lyric_sources.py module utils, lines 28-60) ----

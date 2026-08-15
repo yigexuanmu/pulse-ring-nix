@@ -92,6 +92,10 @@
             # Use the Nix-provided Electron when running via `cargo run`, so the
             # dev loop needs no `npm install` in electron-wallpaper.
             export PULSE_RING_ELECTRON="${pkgs.electron}/bin/electron"
+            # load_font() shells out to `fc-match` (fontconfig) to locate any CJK
+            # font on NixOS — put fontconfig's bin on PATH so `cargo run` finds it
+            # the same way the installed wrapper does (`wrapProgram --prefix PATH`).
+            export PATH="${pkgs.fontconfig.bin}/bin:$PATH"
           '';
         };
 

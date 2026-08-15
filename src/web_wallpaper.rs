@@ -98,9 +98,20 @@ impl Drop for WebWallpaperPlayer {
     }
 }
 
-/// Use the Electron version pinned by this project. A system-wide Electron can
-/// have a different Chromium/Node ABI and must never affect wallpaper behavior.
+/// Resolve the Electron binary used to run the offscreen wallpaper helper.
+///
+/// Priority:
+///   1. `PULSE_RING_ELECTRON` env var (set by the Nix wrapper to `pkgs.electron`).
+///      This is mandatory for an *installed* binary, where `CARGO_MANIFEST_DIR`
+///      is a stale build-time source path that no longer exists at runtime.
+///   2. The npm-installed Electron pinned by this project
+///      (`electron-wallpaper/node_modules/.bin/electron`). Used when running via
+///      `cargo run` from the source tree after `npm install` in electron-wallpaper.
+///      Keeps a pinned Chromium/Node ABI for developers who want exact control.
 fn electron_binary() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("PULSE_RING_ELECTRON") {
+        return std::path::PathBuf::from(p);
+    }
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("electron-wallpaper/node_modules/.bin/electron")
 }
@@ -110,7 +121,7 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
     let electron = electron_binary();
     if !electron.is_file() {
         return Err(format!(
-            "project Electron not found at {} (run npm install in electron-wallpaper)",
+            "Electron not found at {} (set PULSE_RING_ELECTRON to an electron binary, or run npm install in electron-wallpaper)",
             electron.display()
         ));
     }

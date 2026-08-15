@@ -7,3 +7,10 @@ plugins/*/target/
 # pi 编码 agent 运行时任务状态目录（不纳入版本管理）
 .pi/
 __pycache__/
+# agent/审计文档不 commit
+AUDIT.md
+HANDOFF.md
+docs/EDT_BG_DESIGN.md
+NO_LYRICS_AUDIT.md
+PERF_AUDIT.md
+lyrics/fixtures.json

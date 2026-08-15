@@ -138,6 +138,7 @@
             wrapProgram $out/bin/pulse-ring \
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}" \
               --prefix GST_PLUGIN_PATH : "${pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" runtimeLibs}" \
+              --prefix PATH : "${pkgs.fontconfig.bin}/bin" \
               --set PULSE_RING_ELECTRON "${pkgs.electron}/bin/electron"
           '';
 

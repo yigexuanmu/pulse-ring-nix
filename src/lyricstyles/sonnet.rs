@@ -924,7 +924,7 @@ fn cross_fill_column(p: &mut [Placement], idx: &[usize], hero: usize, hero_scale
     }
     let grown: f32 = idx.iter().map(|&i| p[i].h).sum();
     let pitch = if idx.len() > 1 {
-        ((available * 0.95 - grown) / (idx.len() as f32 - 1.0)).max(0.0).min(sgap * 2.0)
+        ((available * 0.95 - grown) / (idx.len() as f32 - 1.0)).max(0.0).min(sgap * 1.4)
     } else {
         0.0
     };

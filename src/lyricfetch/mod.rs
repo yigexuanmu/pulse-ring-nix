@@ -18,6 +18,7 @@ pub(crate) mod splayer;
 pub(crate) mod kugou;
 pub(crate) mod qishui;
 pub(crate) mod ttml;
+pub(crate) mod spotify;
 
 /// Fetch lyrics for `req`, dispatching by `req.source`.
 ///
@@ -39,6 +40,7 @@ pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
         "kugou" => kugou::fetch_kugou(req),
         "qishui" => qishui::fetch_qishui(req),
         "ttml" => ttml::fetch_ttml(req),
+        "spotify" => spotify::fetch_spotify(req),
         // Source adapters are filled in incrementally; unported ids fall through cleanly.
         _ => Err(format!("lyricfetch: source '{source}' not yet ported")),
     }

@@ -522,6 +522,16 @@ mod tests {
         let data = font_bytes();
         let mut atlas = GlyphAtlas::new(&data, None).unwrap();
         atlas.ensure_text("Hello 你好", 0);
+        // Per-frame EDT budget (MAX_NEW_PACKS_PER_FRAME=4) defers glyphs past the
+        // cap to `pending`; the main loop drains them each frame via `begin_frame`.
+        // Drive the frame loop here so all of "Hello 你好" is packed before we assert.
+        loop {
+            let before = atlas.glyph_count();
+            atlas.begin_frame();
+            if atlas.glyph_count() == before {
+                break;  // no progress → pending drained
+            }
+        }
         assert!(atlas.is_dirty());
         atlas.clear_dirty();
         assert!(atlas.glyph('H', 0).is_some());

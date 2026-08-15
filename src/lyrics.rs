@@ -88,6 +88,11 @@ pub fn resolve_script() -> Option<PathBuf> {
 
 /// Run the adapter for a single request and parse its stdout JSON into [`LyricData`].
 pub fn fetch_lyrics(script: &PathBuf, request: &TrackRequest) -> Result<LyricData, String> {
+    // Prefer the native in-process Rust adapter (clean-room port of lyric_sources.py).
+    // On Err (source not ported / network / parse), fall back to the python3 subprocess.
+    if let Ok(data) = lyricfetch::fetch(request) {
+        return Ok(data);
+    }
     let payload = serde_json::json!({
         "source": request.source,
         "track": {

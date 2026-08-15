@@ -27,7 +27,6 @@ pub(crate) mod musixmatch;
 /// Mirrors `lyric_sources.py::main` (lines 973-1018): lower-cases the source id, looks up the
 /// adapter in the chain, and reports a clean `Err` (never panics) for unknown / unported
 /// sources so the caller can fall back to the next source or report "no lyrics".
-#[allow(dead_code)] // wired in a later commit
 pub(crate) fn fetch(req: &TrackRequest) -> Result<LyricData, String> {
     let source = req.source.trim().to_ascii_lowercase();
     if req.title.trim().is_empty() && !matches!(source.as_str(), "" | "auto") {

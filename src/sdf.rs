@@ -6,6 +6,7 @@
 //! shared foundation the sonnet style (and future styles) draw from.
 
 use std::collections::HashMap;
+use std::sync::mpsc;
 
 use fontdue::{Font, FontSettings, Metrics};
 
@@ -62,6 +63,78 @@ impl EdtState {
     }
     // TODO edt-bg: the background thread will remove `cap_per_frame`; this struct is kept
     // only to avoid breaking the API surface while the threaded path is wired up.
+}
+
+/// Pending glyph request pushed from main thread to EDT worker (Phase B).
+///
+/// The main thread produces these (which character + target atlas cell) and the
+/// background worker consumes them to run the 128×128 EDT off the render thread.
+#[derive(Debug, Clone)]
+pub struct EdtRequest {
+    pub ch: char,
+    pub font_size_px: u32,
+    pub cell_idx: usize,
+}
+
+/// Rasterised EDT result returned from worker to main thread (Phase B).
+///
+/// The worker ships raw R8 bytes (not a wgpu buffer) so the main thread performs the
+/// GPU upload — wgpu buffers cannot cross threads (design risk 1).
+#[derive(Debug)]
+pub struct EdtResult {
+    pub cell_idx: usize,
+    pub bytes: Vec<u8>,
+    pub glyph: GlyphInfo,
+}
+
+/// EDT background worker: main→worker SPSC (`tx`) + worker→main SPSC (`rx`).
+///
+/// See `docs/EDT_BG_DESIGN.md` Phase B. This initial commit ships a placeholder EDT
+/// result (zeroed bytes + zeroed metrics); the real rasterise + `edt_signed` path
+/// is wired up once the main-thread drain (Phase B followup) lands.
+pub struct EdtWorker {
+    pub tx: mpsc::Sender<EdtRequest>,
+    pub rx: mpsc::Receiver<EdtResult>,
+}
+
+impl EdtWorker {
+    /// Spawn the EDT background thread. The worker loop pops `EdtRequest`, runs the
+    /// 128×128 EDT, packs R8 bytes, and ships back `EdtResult`. The main thread owns
+    /// GPU upload (it drains `rx` and calls `queue.write_texture`).
+    pub fn spawn(font: std::sync::Arc<Font>) -> Self {
+        let (req_tx, req_rx) = mpsc::channel::<EdtRequest>();
+        let (res_tx, res_rx) = mpsc::channel::<EdtResult>();
+        std::thread::Builder::new()
+            .name("pulse-ring-edt".into())
+            .spawn(move || {
+                // `font` is held by the worker for the full rasterise/EDT path
+                // (Phase B followup); the placeholder below doesn't need it yet.
+                let _ = &font;
+                loop {
+                    let req = match req_rx.recv() {
+                        Ok(r) => r,
+                        Err(_) => break, // channel closed: worker exit
+                    };
+                    // TODO edt-bg (Phase B followup): rasterise `req.ch` via fontdue,
+                    // run edt_signed, and pack real R8 bytes. Until then ship a zeroed
+                    // placeholder so the SPSC + thread wiring can be validated first.
+                    let _ = res_tx.send(EdtResult {
+                        cell_idx: req.cell_idx,
+                        bytes: vec![0u8; CELL * CELL],
+                        glyph: GlyphInfo {
+                            uv: [0.0; 4],
+                            gw: 0.0,
+                            gh: 0.0,
+                            xmin: 0.0,
+                            ymin: 0.0,
+                            advance: 0.0,
+                        },
+                    });
+                }
+            })
+            .expect("spawn EDT worker thread");
+        Self { tx: req_tx, rx: res_rx }
+    }
 }
 
 /// A packed glyph: where its cell lives in the atlas and its font metrics at RASTER_PX.

@@ -181,6 +181,50 @@ pub(crate) fn request_json(
     serde_json::from_str(payload).map_err(|e| format!("request_json: bad JSON: {e}"))
 }
 
+/// `request_data` (lyric_sources.py:415): GET the raw body bytes (NOT parsed as JSON). QiShui
+/// + TTML use this to pull LRC / plain-text / TTML payloads that aren't JSON. Mirrors
+/// `request_json`'s Noctalia-UA + timeout profile but swaps JSON accept headers for a
+/// text-friendly Accept and returns the body bytes + the response charset (decoded UTF-8:
+/// `Response::into_string` already lossy-converts to UTF-8 using the declared charset, so the
+/// returned bytes are UTF-8 regardless; the charset is surfaced for callers that want to
+/// re-tag the body — currently ignored by QiShui).
+pub(crate) fn request_data(
+    url: &str,
+    headers: Option<&[(&str, &str)]>,
+    timeout: Duration,
+) -> Result<(Vec<u8>, String), String> {
+    let mut req = ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .set("Accept", "text/plain, application/xml, text/xml, */*");
+    if let Some(extra) = headers {
+        for (k, v) in extra {
+            req = req.set(k, v);
+        }
+    }
+    let resp = req
+        .timeout(timeout)
+        .call()
+        .map_err(|e| format!("request_data: {e}"))?;
+    // Sniff the charset off Content-Type BEFORE consuming `resp` with `into_string` (the
+    // borrow over the Content-Type header ends at `.to_string()`, freeing resp below).
+    let charset = resp
+        .header("Content-Type")
+        .and_then(|ct| ct.split("charset=").nth(1))
+        .map(|s| {
+            s.trim()
+                .split(|c| c == ';' || c == ' ')
+                .next()
+                .unwrap_or("")
+                .to_string()
+        })
+        .unwrap_or_else(|| "utf-8".to_string());
+    let body = resp
+        .into_string()
+        .map_err(|e| format!("request_data: read body: {e}"))?
+        .into_bytes();
+    Ok((body, charset))
+}
+
 /// `best_match` (lyric_sources.py:457-469): pick the item (by index) scoring highest against
 /// the wanted track — title exact=6/substr=3 (a zero skips the item), artist 4/2, album 2/1.
 /// Qualifying matches need >=3; ties keep the earliest item (Python's strict-greater min).

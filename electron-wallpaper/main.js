@@ -157,17 +157,16 @@ app.commandLine.appendSwitch('ozone-platform', 'wayland');
 app.disableHardwareAcceleration();
 
 app.whenReady().then(() => {
-  // backgroundColor: 默认不设时 Electron 用白色背景；folia 页面顶层 div 是
-  // transparent，React 在离屏模式下若不加黑底会被白色吞掉页面内容不可见。
-  // 黑底让 folia 内容浮起来；后续 overlay 用 alpha 合成，黑色 alpha=1 区域会
-  // 覆盖壁纸（符合「歌词层在壁纸上方」的层级）。
+  // transparent: 歌词层除歌词特效本身外应当全透明，让底层壁纸透出。
+  // RGBA 帧透明区域 alpha=0，Rust overlay pass 用 ALPHA_BLENDING 合成时
+  // alpha=0 的像素不贡献，底层壁纸原样保留。只设 transparent 即可，
+  // 不要设 backgroundColor（任何不透明底色都会涂死透明区域）。
   win = new BrowserWindow({
     width,
     height,
     show: false,
     frame: false,
-    transparent: false,
-    backgroundColor: '#000000',
+    transparent: true,
     webPreferences: {
       offscreen: true,
       backgroundThrottling: false,

@@ -20,6 +20,7 @@
 pub mod analysis;
 pub mod bidi;
 pub mod bidi_data;
+pub mod line_text;
 
 /// Placeholder for the shared `Intl.Segmenter('word')` (Phase 2.6 layout.rs
 /// takes ownership of it via analysis.rs). Removed once `analysis.rs` builds

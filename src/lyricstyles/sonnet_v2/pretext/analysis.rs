@@ -193,17 +193,42 @@ pub fn can_continue_keep_all_text_run(previous_text: &str, break_after_punctuati
 }
 
 /// Aggregate of `([text], [isWordLike], [kind], [start])` arrays (TS `MergedSegmentation`).
+/// Carries the parallel tracking arrays `build_merged_segmentation` maintains during
+/// per-piece dispatch (text_parts for deferred single-char runs, per-segment
+/// ContainsCJK / ContainsArabicScript / EndsWithClosingQuote / EndsWithMyanmarMedialGlue / HasArabicNoSpacePunctuation).
 pub struct MergedSegmentation {
     pub len: usize,
     pub texts: Vec<String>,
+    pub text_parts: Vec<Vec<String>>,
     pub is_word_like: Vec<bool>,
     pub kinds: Vec<SegmentBreakKind>,
     pub starts: Vec<usize>,
+    pub single_char_run_chars: Vec<Option<char>>,
+    pub single_char_run_lengths: Vec<usize>,
+    pub contains_cjk: Vec<bool>,
+    pub contains_arabic_script: Vec<bool>,
+    pub ends_with_closing_quote: Vec<bool>,
+    pub ends_with_myanmar_medial_glue: Vec<bool>,
+    pub has_arabic_no_space_punctuation: Vec<bool>,
 }
 
 impl MergedSegmentation {
     pub fn empty() -> Self {
-        Self { len: 0, texts: vec![], is_word_like: vec![], kinds: vec![], starts: vec![] }
+        Self {
+            len: 0,
+            texts: vec![],
+            text_parts: vec![],
+            is_word_like: vec![],
+            kinds: vec![],
+            starts: vec![],
+            single_char_run_chars: vec![],
+            single_char_run_lengths: vec![],
+            contains_cjk: vec![],
+            contains_arabic_script: vec![],
+            ends_with_closing_quote: vec![],
+            ends_with_myanmar_medial_glue: vec![],
+            has_arabic_no_space_punctuation: vec![],
+        }
     }
 }
 
@@ -372,28 +397,223 @@ pub fn normalize_whitespace_pre_wrap(text: &str) -> String {
 /// kinsoku / closing-quote / URL-like / numeric merge passes are added
 /// in subsequent commits; this minimal pass already yields correct
 /// word-level segments (CJK + Latin) and whitespace kinds.
+/// `joinTextParts(parts)` — return parts[0] when singleton (avoid concat alloc),
+/// else concatenate all parts into one string. Byte-identical to pretext.
+pub fn join_text_parts(parts: &[String]) -> String {
+    if parts.len() == 1 {
+        return parts[0].clone();
+    }
+    let total: usize = parts.iter().map(String::len).sum();
+    let mut out = String::with_capacity(total);
+    for p in parts { out.push_str(p); }
+    out
+}
+
+/// `joinReversedPrefixParts(prefixParts, tail)` — prepend prefix parts in reverse order,
+/// then call `joinTextParts`. Byte-identical order to pretext analysis.ts.
+pub fn join_reversed_prefix_parts(prefix_parts: &[String], tail: &str) -> String {
+    let total: usize = prefix_parts.iter().map(String::len).sum::<usize>() + tail.len();
+    let mut out = String::with_capacity(total);
+    for i in (0..prefix_parts.len()).rev() {
+        out.push_str(&prefix_parts[i]);
+    }
+    out.push_str(tail);
+    out
+}
+
 fn build_merged_segmentation(
     normalized: &str,
-    _profile: AnalysisProfile,
+    profile: AnalysisProfile,
     wsp: WhiteSpaceProfile,
 ) -> MergedSegmentation {
-    let mut texts: Vec<String> = vec![];
-    let mut is_word_like: Vec<bool> = vec![];
-    let mut kinds: Vec<SegmentBreakKind> = vec![];
-    let mut starts: Vec<usize> = vec![];
+    // 12 parallel arrays kept as flat locals so the `materialize_deferred_single_char_run`
+    // borrow of (texts, run_chars, run_lengths) doesn't alias the others.
+    let mut m_texts: Vec<String> = vec![];
+    let mut m_text_parts: Vec<Vec<String>> = vec![];
+    let mut m_is_word_like: Vec<bool> = vec![];
+    let mut m_kinds: Vec<SegmentBreakKind> = vec![];
+    let mut m_starts: Vec<usize> = vec![];
+    let mut m_run_chars: Vec<Option<char>> = vec![];
+    let mut m_run_lengths: Vec<usize> = vec![];
+    let mut m_contains_cjk: Vec<bool> = vec![];
+    let mut m_contains_arabic: Vec<bool> = vec![];
+    let mut m_ends_close_quote: Vec<bool> = vec![];
+    let mut m_ends_myanmar: Vec<bool> = vec![];
+    let mut m_has_arabic_no_space_punct: Vec<bool> = vec![];
     let norm_ptr = normalized.as_ptr() as usize;
-    for seg in normalized.split_word_bounds() {
-        let start = seg.as_ptr() as usize - norm_ptr;
-        let kind = classify_segment(seg, wsp);
-        let is_word = kind == SegmentBreakKind::Text
-            && seg.chars().any(|c| c.is_alphanumeric());
-        texts.push(seg.to_string());
-        is_word_like.push(is_word);
-        kinds.push(kind);
-        starts.push(start);
+    let mut merged_len: usize = 0;
+
+    for word_segment in normalized.split_word_bounds() {
+        let s_index = word_segment.as_ptr() as usize - norm_ptr;
+        let s_is_word_like = classify_segment(word_segment, wsp) == SegmentBreakKind::Text
+            && word_segment.chars().any(|c| c.is_alphanumeric());
+        for (piece_text, piece_word_like, piece_kind, piece_start) in
+            split_segment_by_break_kind(word_segment, s_is_word_like, s_index, wsp)
+        {
+            let is_text = piece_kind == SegmentBreakKind::Text;
+            let repeatable = get_repeatable_single_char_run_char(&piece_text, piece_word_like, piece_kind);
+            let piece_contains_cjk = is_cjk(&piece_text);
+            let piece_contains_arabic = contains_arabic_script(&piece_text);
+            let piece_last_cp = get_last_code_point(&piece_text);
+            let piece_ends_close_quote = ends_with_closing_quote(&piece_text);
+            let piece_ends_myanmar = ends_with_myanmar_medial_glue(&piece_text);
+            let has_prev = merged_len > 0;
+            let prev_index = merged_len.saturating_sub(1);
+
+            let mut acted = false;
+            if has_prev && m_kinds[prev_index] == SegmentBreakKind::Text {
+                let branch_a = profile.carry_cjk_after_closing_quote
+                    && is_text && piece_contains_cjk
+                    && m_contains_cjk[prev_index]
+                    && m_ends_close_quote[prev_index];
+                let branch_b = is_text
+                    && is_cjk_line_start_prohibited_segment(&piece_text)
+                    && m_contains_cjk[prev_index];
+                let branch_c = is_text && m_ends_myanmar[prev_index];
+                let branch_d = is_text && piece_word_like && piece_contains_arabic
+                    && m_has_arabic_no_space_punct[prev_index];
+                let branch_e = repeatable.is_some()
+                    && m_run_chars[prev_index] == repeatable;
+                let branch_f = is_text && !piece_word_like && !m_contains_cjk[prev_index]
+                    && (is_left_sticky_punctuation_segment(&piece_text)
+                        || (piece_text == "-" && m_is_word_like[prev_index]));
+                if branch_a || branch_b || branch_c || branch_d || branch_f {
+                    // appendPieceToPrevious — materialize deferred single-char run.
+                    if m_run_chars[prev_index].is_some() {
+                        let materialized = materialize_deferred_single_char_run(
+                            &mut m_texts, &mut m_run_chars, &mut m_run_lengths, prev_index);
+                        m_text_parts[prev_index] = vec![materialized];
+                        m_run_chars[prev_index] = None;
+                    }
+                    m_text_parts[prev_index].push(piece_text.clone());
+                    m_is_word_like[prev_index] |= piece_word_like;
+                    m_contains_cjk[prev_index] |= piece_contains_cjk;
+                    m_contains_arabic[prev_index] |= piece_contains_arabic;
+                    m_ends_close_quote[prev_index] = piece_ends_close_quote;
+                    m_ends_myanmar[prev_index] = piece_ends_myanmar;
+                    m_has_arabic_no_space_punct[prev_index] = has_arabic_no_space_punctuation(
+                        m_contains_arabic[prev_index], piece_last_cp);
+                    if branch_d { m_is_word_like[prev_index] = true; }
+                    acted = true;
+                } else if branch_e {
+                    m_run_lengths[prev_index] = m_run_lengths[prev_index].max(1).saturating_add(1);
+                    acted = true;
+                }
+            }
+            if !acted {
+                m_texts.push(piece_text.clone());
+                m_text_parts.push(vec![piece_text.clone()]);
+                m_is_word_like.push(piece_word_like);
+                m_kinds.push(piece_kind);
+                m_starts.push(piece_start);
+                m_run_chars.push(repeatable);
+                m_run_lengths.push(if repeatable.is_some() { 1 } else { 0 });
+                m_contains_cjk.push(piece_contains_cjk);
+                m_contains_arabic.push(piece_contains_arabic);
+                m_ends_close_quote.push(piece_ends_close_quote);
+                m_ends_myanmar.push(piece_ends_myanmar);
+                m_has_arabic_no_space_punct.push(
+                    has_arabic_no_space_punctuation(piece_contains_arabic, piece_last_cp));
+                merged_len += 1;
+            }
+        }
     }
-    let len = texts.len();
-    MergedSegmentation { len, texts, is_word_like, kinds, starts }
+
+    // Materialize remaining deferred single-char runs + join text_parts → texts.
+    for i in 0..merged_len {
+        if m_run_chars[i].is_some() {
+            let _ = materialize_deferred_single_char_run(
+                &mut m_texts, &mut m_run_chars, &mut m_run_lengths, i);
+            m_text_parts[i] = vec![m_texts[i].clone()];
+        } else {
+            m_texts[i] = join_text_parts(&m_text_parts[i]);
+        }
+    }
+
+    // Escaped-quote glue: fold an escaped quote cluster onto a preceding non-CJK text run.
+    let mut i = 1;
+    while i < merged_len {
+        if m_kinds[i] == SegmentBreakKind::Text
+            && !m_is_word_like[i]
+            && is_escaped_quote_cluster_segment(&m_texts[i])
+            && m_kinds[i - 1] == SegmentBreakKind::Text
+            && !m_contains_cjk[i - 1]
+        {
+            let tail = m_texts[i].clone();
+            m_texts[i - 1].push_str(&tail);
+            m_is_word_like[i - 1] |= m_is_word_like[i];
+            m_texts[i].clear();
+        }
+        i += 1;
+    }
+
+    // Forward-sticky carry: defer trailing sticky clusters to the following live segment.
+    let mut forward_sticky_prefix_parts: Vec<Option<Vec<String>>> = (0..merged_len).map(|_| None).collect();
+    let mut next_live_index: i64 = -1;
+    let mut i: i64 = merged_len as i64 - 1;
+    while i >= 0 {
+        let idx = i as usize;
+        if m_texts[idx].is_empty() { i -= 1; continue; }
+        if m_kinds[idx] == SegmentBreakKind::Text
+            && !m_is_word_like[idx]
+            && next_live_index >= 0
+            && m_kinds[next_live_index as usize] == SegmentBreakKind::Text
+            && (is_forward_sticky_cluster_segment(&m_texts[idx])
+                || (m_texts[idx] == "-" && starts_with_decimal_digit(&m_texts[next_live_index as usize])))
+        {
+            let live = next_live_index as usize;
+            let mut parts = forward_sticky_prefix_parts[live].take().unwrap_or_default();
+            parts.push(m_texts[idx].clone());
+            forward_sticky_prefix_parts[live] = Some(parts);
+            m_starts[live] = m_starts[idx];
+            m_texts[idx].clear();
+        } else {
+            next_live_index = i;
+        }
+        i -= 1;
+    }
+    for i in 0..merged_len {
+        if let Some(parts) = forward_sticky_prefix_parts[i].take() {
+            m_texts[i] = join_reversed_prefix_parts(&parts, &m_texts[i]);
+        }
+    }
+
+    // Compact (drop emptied text entries).
+    let mut compact = 0usize;
+    for read in 0..merged_len {
+        if m_texts[read].is_empty() { continue; }
+        if compact != read {
+            m_texts[compact] = m_texts[read].clone();
+            m_is_word_like[compact] = m_is_word_like[read];
+            m_kinds[compact] = m_kinds[read];
+            m_starts[compact] = m_starts[read];
+        }
+        compact += 1;
+    }
+    merged_len = compact;
+    // TODO Phase 2.2: pipeline downstream passes (merge_url_like_runs / merge_url_query_runs /
+    //   merge_numeric_runs / split_hyphenated_numeric_runs / merge_no_space_word_chains /
+    //   carry_trailing_forward_sticky_across_cjk_boundary) — ported in follow-up commits.
+
+    m_texts.truncate(merged_len);
+    m_is_word_like.truncate(merged_len);
+    m_kinds.truncate(merged_len);
+    m_starts.truncate(merged_len);
+    MergedSegmentation {
+        len: merged_len,
+        texts: m_texts,
+        text_parts: m_text_parts,
+        is_word_like: m_is_word_like,
+        kinds: m_kinds,
+        starts: m_starts,
+        single_char_run_chars: m_run_chars,
+        single_char_run_lengths: m_run_lengths,
+        contains_cjk: m_contains_cjk,
+        contains_arabic_script: m_contains_arabic,
+        ends_with_closing_quote: m_ends_close_quote,
+        ends_with_myanmar_medial_glue: m_ends_myanmar,
+        has_arabic_no_space_punctuation: m_has_arabic_no_space_punct,
+    }
 }
 
 /// Minimal `classifySegmentBreakChar` — classifies a whole word-bounded
@@ -810,6 +1030,16 @@ fn merge_keep_all_text_segments(
         is_word_like: segmentation.is_word_like.clone(),
         kinds: segmentation.kinds.clone(),
         starts: segmentation.starts.clone(),
+        // Phase 2.2 stub: KeepAll currently returns a passthrough; downstream passes
+        // of build_merged_segmentation are identity stubs until follow-up commits.
+        text_parts: segmentation.text_parts.clone(),
+        single_char_run_chars: segmentation.single_char_run_chars.clone(),
+        single_char_run_lengths: segmentation.single_char_run_lengths.clone(),
+        contains_cjk: segmentation.contains_cjk.clone(),
+        contains_arabic_script: segmentation.contains_arabic_script.clone(),
+        ends_with_closing_quote: segmentation.ends_with_closing_quote.clone(),
+        ends_with_myanmar_medial_glue: segmentation.ends_with_myanmar_medial_glue.clone(),
+        has_arabic_no_space_punctuation: segmentation.has_arabic_no_space_punctuation.clone(),
     }
 }
 
@@ -1066,5 +1296,35 @@ mod tests {
         assert_eq!(split_leading_space_and_marks(" a"), None); // tail not all marks
         assert_eq!(split_leading_space_and_marks("a\u{300}"), None); // no leading space
         assert_eq!(split_leading_space_and_marks("ab"), None);
+    }
+
+    /// `build_merged_segmentation` driver: CJK sticky-punct attaches to preceding CJK text run
+    /// (branch_b — kinsoku line-start prohibited segment).
+    #[test]
+    fn driver_sticky_punct_attaches_to_cjk_run() {
+        let wsp = get_white_space_profile(WhiteSpaceMode::Normal);
+        let seg = build_merged_segmentation(
+            "你好，world",
+            AnalysisProfile { carry_cjk_after_closing_quote: true, break_keep_all_after_punctuation: false },
+            wsp,
+        );
+        // split_word_bounds emits ["你", "好", "，", "world"] (UAX#29 splits CJK char-by-char);
+        // branch_b glues the kinsokuStart/sticky-punct '，' onto the preceding CJK run "好" → 3 entries.
+        let texts: Vec<&str> = seg.texts.iter().map(String::as_str).collect();
+        assert_eq!(texts, vec!["你", "好，", "world"]);
+        assert_eq!(seg.len, 3);
+    }
+
+    /// Driver: plain Latin word + ASCII space + Latin word stays split at the space segment.
+    #[test]
+    fn driver_latin_with_space_keeps_three_segments() {
+        let wsp = get_white_space_profile(WhiteSpaceMode::Normal);
+        let seg = build_merged_segmentation(
+            "hello world",
+            AnalysisProfile { carry_cjk_after_closing_quote: false, break_keep_all_after_punctuation: false },
+            wsp,
+        );
+        // "hello" (text) + " " (space) + "world" (text) = 3 entries; no sticky merge.
+        assert_eq!(seg.len, 3);
     }
 }

@@ -872,3 +872,32 @@ Phase 2.5 的 bidi.ts（175 行）+ line_text.ts（107 行）+ Phase 2.4 measure
 | `layout.ts` | 914 | `prepare` / `prepareWithSegments` / `layoutWithLines` —— pretext 入口 | 全部已 ported 的 |
 
 下一续接顺序（按依赖）：`rich-inline.ts` → `line-break.ts` → `layout.ts`（这最后一个是 pretext 入口，依赖前两者）。每文件独立 commit + test。layout.ts 收尾后 Phase 2 完结，进 Phase 3（纯算法层 sonnetProgram/motion/semantic）。
+
+## 进度日志 (turn 6 — Phase 2.6 COMPLETED)
+
+**HEAD `8ae94b7` on origin/feat/sonnet-1to1-rewrite.** 30 commits past `c644f4c`.
+
+### Phase 2.6 — line_break.rs ✅ landed
+- `src/lyricstyles/sonnet_v2/pretext/line_break.rs` 1641 lines (port of pretext line-break.ts 1236 lines).
+- Structure: 5 types + 17 free helpers + `SimpleWalker` / `RawWalker` / `ChunkStepper` structs (with `&mut self` methods mirroring TS nested closures with shared mutable state) + `step_prepared_simple_line_geometry` (standalone simple-path fold) + 4 public APIs (`step_prepared_line_geometry_from_chunk`, `step_prepared_line_geometry`, `measure_prepared_line_geometry`, plus `LineGeometryStats`).
+- **118 tests green** (was 114; +4 new line_break tests verifying chunk vs simple-path parity, empty-prepared guard, pending-break-overflow folding).
+- Key port fidelity notes:
+  - `finishLine()` in TS returns inside `if (currentLine !== null) return currentLine` — Rust `finish_line_default()` returns `Option<f32>` (`None` when `hasContent` is false) and the caller short-circuits on `Some`.
+  - `pendingBreakFitWidth` / `pendingBreakPaintWidth` captured into locals before passing to `finish_line()` to satisfy borrow-checker (TS reads originals while mutating cursor).
+  - `ChunkStepper::run` snapshots `cursor.segment_index` / `cursor.grapheme_index` into locals before constructing `Self` (cursor borrowed by the struct field).
+- Knocks out the largest single pretext file. Remaining pretext: `layout.ts` (914) + `rich_inline.ts` (518).
+
+### Pretext status: 6/8 files ported, 6423 LOC shipshape on origin
+| File | TS lines | Rust lines | Status |
+|---|---|---|---|
+| bidi_data (2.1) | 996 | 831 | ✅ |
+| analysis (2.2) | 1458 | 2679 | ✅ all 8 merge passes |
+| line_text (2.5a) | 107 | 285 | ✅ |
+| measurement (2.4) | 275 | 594 | ✅ (FontMeasurementState owns cache) |
+| **line_break (2.6)** | **1236** | **1641** | **✅ THIS TURN** |
+| bidi (2.5b) | 175 | 318 | ✅ |
+| layout (2.7) | 914 | 0 | NEXT |
+| rich_inline (2.8) | 518 | 0 | after layout |
+
+### Next session continuation seed
+**Port `layout.rs`** (port of layout.ts — 914 lines): types `PreparedText` / `PreparedSegmentView` / `MeasuredTextUnit` / `PreparedTextWithSegments` / `AnalysisProfile`-shaped builder, `measureNaturalWidth` / `prepare` / `prepareWithSegments` / `measureAnalysis` (self-contained per the read-through notes — they only need `analysis` + `measurement` exports, both done). The `layoutWithLines` / `layout` line-break-dependent public APIs land with line-break integration (or as a stub returning the walker delegation already present in line_break.rs).

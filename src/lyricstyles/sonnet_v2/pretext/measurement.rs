@@ -76,6 +76,13 @@ impl Default for EngineProfile {
     }
 }
 
+/// `getEngineProfile()` — pretext measurement.ts:71. Rust has no
+/// `navigator` global → the TS `typeof navigator === 'undefined'` branch is
+/// the byte-identical fallback. Returns the static non-browser profile.
+pub fn get_engine_profile() -> EngineProfile {
+    EngineProfile::non_browser()
+}
+
 impl EngineProfile {
     /// `getEngineProfile()` — pretext measurement.ts:71 `typeof navigator ===
     /// 'undefined'` branch. byte-identical fallback profile.
@@ -219,7 +226,7 @@ fn count_emoji_graphemes(text: &str) -> usize {
 }
 
 /// `getEmojiCount(seg, metrics)` — pretext measurement.ts:155.
-fn get_emoji_count(seg: &str, metrics: &mut SegmentMetrics) -> usize {
+pub fn get_emoji_count(seg: &str, metrics: &mut SegmentMetrics) -> usize {
     if let Some(c) = metrics.emoji_count {
         return c;
     }
@@ -333,26 +340,89 @@ pub fn get_segment_breakable_fit_advances<B: MeasureBackend>(
     Some(advances)
 }
 
-/// `getFontMeasurementState(font, needsEmojiCorrection)` — pretext
-/// measurement.ts:247. Rust port has no DOM-canvas divergence, so
-/// `emoji_correction` is always 0 (the no-`document` TS branch).
-pub fn get_font_measurement_state(
-    font_str: &str,
-    needs_emoji_correction: bool,
-) -> (f32, f32) {
-    // emoji_correction is 0 in any non-DOM environment; preserve byte-faithful
-    // behaviour but accept the flag for API compatibility.
-    let _ = needs_emoji_correction;
-    let font_size = parse_font_size(font_str);
-    let emoji_correction = 0.0f32;
-    (font_size, emoji_correction)
+/// `FontMeasurementState` — owns the resolved per-font cache and resolved
+/// `emojiCorrection` / `fontSize` for a measurement session. Mirrors the
+/// object returned by pretext `getFontMeasurementState` so layout.ts's
+/// `const { cache, emojiCorrection } = getFontMeasurementState(font, ...)
+/// can be destructured 1:1 in Rust.
+pub struct FontMeasurementState<'a, B: MeasureBackend> {
+    pub backend: &'a B,
+    pub font_str: &'a str,
+    pub font_size: f32,
+    pub emoji_correction: f32,
+    pub segment_cache: HashMap<String, SegmentMetrics>,
 }
 
-/// `getEmojiCorrection(font, fontSize)` — pretext measurement.ts:135. Always 0
-/// in the no-DOM fallback (byte-faithful with the TS no-document branch).
-fn get_emoji_correction(_font_str: &str, _font_size: f32) -> f32 {
-    0.0
+/// `getFontMeasurementState(font, needsEmojiCorrection)` — pretext
+/// measurement.ts:247. Returns the cache handle plus font_size and
+/// resolved emojiCorrection. In the no-DOM Rust path (`emoji_correction = 0`)
+/// the downstream `getCorrectedSegmentWidth` short-circuits to
+/// `metrics.width`, byte-faithful with the TS no-`document` branch.
+pub fn get_font_measurement_state<'a, B: MeasureBackend>(
+    caches: &'a mut MeasurementCaches,
+    backend: &'a B,
+    font_str: &'a str,
+    needs_emoji_correction: bool,
+) -> FontMeasurementState<'a, B> {
+    let _ = needs_emoji_correction; // Rust has no DOM-canvas divergence
+    let font_size = parse_font_size(font_str);
+    let emoji_correction = get_emoji_correction(font_str, font_size);
+    let segment_cache = caches.get_segment_metric_cache(font_str);
+    FontMeasurementState {
+        backend,
+        font_str,
+        font_size,
+        emoji_correction,
+        segment_cache,
+    }
 }
+
+impl<'a, B: MeasureBackend> FontMeasurementState<'a, B> {
+    /// Convenience: `getSegmentMetrics(seg, cache)` — pretext
+    /// measurement.ts:65. Reads the cache; on miss measures via the backend,
+    /// inserts, returns the cloned metrics.
+    pub fn get_segment_metrics(&mut self, seg: &str) -> SegmentMetrics {
+        get_segment_metrics(seg, &mut self.segment_cache, self.backend, self.font_str)
+    }
+
+    /// Convenience: `getCorrectedSegmentWidth(seg, metrics, emojiCorrection)`
+    /// — pretext measurement.ts:180. When `emojiCorrection == 0` short-circuits
+    /// to `metrics.width`, matching the TS no-DOM path.
+    pub fn get_corrected_segment_width(&mut self, seg: &str, metrics: &mut SegmentMetrics) -> f32 {
+        get_corrected_segment_width(seg, metrics, self.emoji_correction)
+    }
+
+    /// Convenience: `getSegmentBreakableFitAdvances(seg, metrics, mode)` —
+    /// pretext measurement.ts:185.
+    pub fn get_segment_breakable_fit_advances(
+        &mut self,
+        seg: &str,
+        metrics: &mut SegmentMetrics,
+        mode: BreakableFitMode,
+    ) -> Option<Vec<f32>> {
+        get_segment_breakable_fit_advances(
+            seg,
+            metrics,
+            &mut self.segment_cache,
+            self.backend,
+            self.font_str,
+            self.emoji_correction,
+            mode,
+        )
+    }
+
+    /// Number of emoji graphemes in `seg` (cached on `metrics`).
+    pub fn get_emoji_count(&self, seg: &str, metrics: &mut SegmentMetrics) -> usize {
+        get_emoji_count(seg, metrics)
+    }
+
+    /// Commit the cache back into the global caches map.
+    pub fn commit(self, caches: &mut MeasurementCaches) {
+        caches.put_segment_metric_cache(self.font_str, self.segment_cache);
+    }
+}
+
+fn get_emoji_correction(_font_str: &str, _font_size: f32) -> f32 { 0.0 }
 
 #[cfg(test)]
 mod tests {
@@ -506,12 +576,19 @@ mod tests {
 
     #[test]
     fn get_font_measurement_state_returns_zero_emoji_correction_in_rust() {
-        let (size, correction) = get_font_measurement_state("500 32px foo", false);
-        assert_eq!(size, 32.0);
-        assert_eq!(correction, 0.0);
-        let (s2, c2) = get_font_measurement_state("500 32px foo", true);
-        assert_eq!(s2, 32.0);
-        assert_eq!(c2, 0.0); // no DOM in Rust -> no <span> measuring path
-        let _ = get_emoji_correction("500 32px foo", 32.0);
+        struct ByteLenBackend;
+        impl MeasureBackend for ByteLenBackend {
+            fn measure_text(&self, _t: &str, _f: &str) -> f32 { 0.0 }
+        }
+        let backend = ByteLenBackend;
+        let mut caches = MeasurementCaches::default();
+        let state = get_font_measurement_state(&mut caches, &backend, "500 32px foo", false);
+        assert_eq!(state.font_size, 32.0);
+        assert_eq!(state.emoji_correction, 0.0);
+        // Test both branches of the needsEmojiCorrection flag are byte-faithful.
+        let state2 = get_font_measurement_state(&mut caches, &backend, "500 32px foo", true);
+        assert_eq!(state2.font_size, 32.0);
+        assert_eq!(state2.emoji_correction, 0.0); // no DOM in Rust -> no <span> measuring path
+        assert_eq!(get_emoji_correction("500 32px foo", 32.0), 0.0);
     }
 }

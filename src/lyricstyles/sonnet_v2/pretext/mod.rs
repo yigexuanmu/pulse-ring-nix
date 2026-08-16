@@ -18,6 +18,7 @@
 //! See `docs/superpowers/plans/2026-08-15-sonnet-1to1-rewrite.md` Phase 2.
 
 pub mod analysis;
+pub mod bidi;
 pub mod bidi_data;
 
 /// Placeholder for the shared `Intl.Segmenter('word')` (Phase 2.6 layout.rs

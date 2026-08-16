@@ -10,7 +10,7 @@
 //   0x03 + u32 JSON 长度 + JSON (playback → pulse-playback)
 //   0x04 + u32 JSON 长度 + JSON (theme   → pulse-theme)
 
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, screen } = require('electron');
 const path = require('path');
 
 // htmlPath / width / height 从环境变量读, 不再用 argv 位置参数.
@@ -19,8 +19,12 @@ const path = require('path');
 // (页面渲染出 main.js 源码). 用 env 完全脱离 argv 解析陷阱.
 const htmlPath = process.env.PULSE_RING_HTML || '';
 const htmlIsUrl = htmlPath.startsWith('http://') || htmlPath.startsWith('https://');
-const width = parseInt(process.env.PULSE_RING_WIDTH || '1920', 10);
-const height = parseInt(process.env.PULSE_RING_HEIGHT || '1080', 10);
+// 默认尺寸只作 Fallback：实际渲染分辨率在 app.whenReady 里从 screen API
+// 自适应主屏 (display.size, 不套 workAreaSize—场景壁纸要全屏不避让 panels)。
+// Rust 端 spawn 时传的 PULSE_RING_WIDTH/HEIGHT 历史配置不再决定实际渲染像素，
+// 仅在屏幕自适应失败时作为叝底默认值。
+const fallbackWidth  = parseInt(process.env.PULSE_RING_WIDTH  || '1920', 10);
+const fallbackHeight = parseInt(process.env.PULSE_RING_HEIGHT || '1080', 10);
 if (!htmlPath) {
   console.error('[pulse-ring wallpaper] PULSE_RING_HTML env not set; refusing to start');
   app.quit();
@@ -162,6 +166,16 @@ app.commandLine.appendSwitch('ozone-platform', 'wayland');
 // 留 WebGL 即可恢复 sonnet PixiJS 渲染。
 
 app.whenReady().then(() => {
+  // 自适应主屏分辨率：场景/网页壁纸应铺满整屏，不走 cfg.web_wallpaper_size
+  // 写死的 960×540。display.size 是 logical px (CSS px)，与 BrowserWindow 接收
+  // 的尺寸单位一致；scaleFactor 单独影响 capturePage 输出的 device px 数。
+  // 多屏连接时只取主屏 (single primary display)；多屏全屏拼接不是 pulse-ring 场景。
+  let display;
+  try { display = screen.getPrimaryDisplay(); }
+  catch (_) { display = null; }
+  const width  = display ? display.size.width  : fallbackWidth;
+  const height = display ? display.size.height : fallbackHeight;
+  if (display) console.error(`[main] auto-resize to primary display: ${width}x${height}, scaleFactor=${display.scaleFactor}`);
   // transparent: 歌词层除歌词特效本身外应当全透明，让底层壁纸透出。
   // RGBA 帧透明区域 alpha=0，Rust overlay pass 用 ALPHA_BLENDING 合成时
   // alpha=0 的像素不贡献，底层壁纸原样保留。只设 transparent 即可，

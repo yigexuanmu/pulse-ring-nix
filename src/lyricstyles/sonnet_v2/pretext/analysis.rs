@@ -426,6 +426,80 @@ fn classify_segment(seg: &str, wsp: WhiteSpaceProfile) -> SegmentBreakKind {
     }
 }
 
+/// Byte-identical port of pretext `classifySegmentBreakChar(ch, profile)`.
+/// Classifies a *single* character (not a segment) into a `SegmentBreakKind`.
+pub fn classify_segment_break_char(ch: char, wsp: WhiteSpaceProfile) -> SegmentBreakKind {
+    if wsp.preserve_ordinary_spaces || wsp.preserve_hard_breaks {
+        if ch == ' ' { return SegmentBreakKind::PreservedSpace; }
+        if ch == '\t' { return SegmentBreakKind::Tab; }
+        if wsp.preserve_hard_breaks && ch == '\n' { return SegmentBreakKind::HardBreak; }
+    }
+    match ch {
+        ' ' => SegmentBreakKind::Space,
+        '\u{a0}' | '\u{202f}' | '\u{2060}' | '\u{feff}' => SegmentBreakKind::Glue,
+        '\u{200b}' => SegmentBreakKind::ZeroWidthBreak,
+        '\u{ad}' => SegmentBreakKind::SoftHyphen,
+        _ => SegmentBreakKind::Text,
+    }
+}
+
+/// `breakCharRe = /[\x20\t\n\xA0\u00AD\u200B\u202F\u2060\uFEFF]/` — true iff the
+/// char maps to a non-`Text` kind in `classifySegmentBreakChar`.
+fn is_break_char(ch: char) -> bool {
+    matches!(ch, ' ' | '\t' | '\n' | '\u{a0}' | '\u{ad}' | '\u{200b}' | '\u{202f}' | '\u{2060}' | '\u{feff}')
+}
+
+/// Byte-identical port of pretext `splitSegmentByBreakKind(segment, isWordLike, start, profile)`.
+/// Splits a segment into pieces when the break-character kind changes; preserves
+/// the original `isWordLike` for `Text` pieces and produces contiguous `start`
+/// byte offsets into the source string.
+pub fn split_segment_by_break_kind(
+    segment: &str,
+    is_word_like: bool,
+    start: usize,
+    wsp: WhiteSpaceProfile,
+) -> Vec<(String, bool, SegmentBreakKind, usize)> {
+    if !segment.chars().any(is_break_char) {
+        return vec![(segment.to_string(), is_word_like, SegmentBreakKind::Text, start)];
+    }
+
+    let mut pieces: Vec<(String, bool, SegmentBreakKind, usize)> = vec![];
+    let mut current_kind: Option<SegmentBreakKind> = None;
+    let mut current_text_parts: Vec<char> = vec![];
+    let mut current_start = start;
+    let mut current_word_like = false;
+    let mut offset = 0usize;
+
+    for ch in segment.chars() {
+        let kind = classify_segment_break_char(ch, wsp);
+        let word_like = kind == SegmentBreakKind::Text && is_word_like;
+
+        if current_kind == Some(kind) && current_word_like == word_like {
+            current_text_parts.push(ch);
+            offset += ch.len_utf8();
+            continue;
+        }
+
+        if current_kind.is_some() {
+            let text: String = current_text_parts.iter().collect();
+            pieces.push((text, current_word_like, current_kind.unwrap(), current_start));
+        }
+
+        current_kind = Some(kind);
+        current_text_parts = vec![ch];
+        current_start = start + offset;
+        current_word_like = word_like;
+        offset += ch.len_utf8();
+    }
+
+    if current_kind.is_some() {
+        let text: String = current_text_parts.iter().collect();
+        pieces.push((text, current_word_like, current_kind.unwrap(), current_start));
+    }
+
+    pieces
+}
+
 fn compile_analysis_chunks(
     segmentation: &MergedSegmentation,
     wsp: WhiteSpaceProfile,
@@ -542,5 +616,60 @@ mod tests {
         assert!(!can_continue_keep_all_text_run("abc\u{a0}", false));
         assert!(!can_continue_keep_all_text_run("abc\u{2014}", true));
         assert!(can_continue_keep_all_text_run("abc", true));
+    }
+
+    /// `split_segment_by_break_kind` — same-kind runs coalesce; kind changes
+    /// start a new piece.
+    #[test]
+    fn split_segment_by_break_kind_splits_text_and_space() {
+        let pieces = split_segment_by_break_kind(
+            "abc   def", true, 100, WhiteSpaceProfile {
+                mode: WhiteSpaceMode::Normal,
+                preserve_ordinary_spaces: false,
+                preserve_hard_breaks: false,
+            });
+        // text "abc" + space "   " + text "def" = 3 pieces.
+        assert_eq!(pieces.len(), 3);
+        assert_eq!(pieces[0].0, "abc");
+        assert_eq!(pieces[0].1, true);
+        assert_eq!(pieces[0].2, SegmentBreakKind::Text);
+        assert_eq!(pieces[0].3, 100);
+        assert_eq!(pieces[1].0, "   ");
+        assert_eq!(pieces[1].1, false);
+        assert_eq!(pieces[1].2, SegmentBreakKind::Space);
+        assert_eq!(pieces[1].3, 103);
+        assert_eq!(pieces[2].0, "def");
+        assert_eq!(pieces[2].1, true);
+        assert_eq!(pieces[2].2, SegmentBreakKind::Text);
+        assert_eq!(pieces[2].3, 106);
+    }
+
+    /// `split_segment_by_break_kind` — no break chars => single Text piece.
+    #[test]
+    fn split_segment_by_break_kind_returns_single_piece_for_plain_text() {
+        let pieces = split_segment_by_break_kind(
+            "你好world", true, 0, WhiteSpaceProfile {
+                mode: WhiteSpaceMode::Normal,
+                preserve_ordinary_spaces: false,
+                preserve_hard_breaks: false,
+            });
+        assert_eq!(pieces.len(), 1);
+        assert_eq!(pieces[0].0, "你好world");
+        assert_eq!(pieces[0].2, SegmentBreakKind::Text);
+    }
+
+    /// `classify_segment_break_char` — exact single-char mapping.
+    #[test]
+    fn classify_single_char_matches_pretext_kind() {
+        let normal = WhiteSpaceProfile {
+            mode: WhiteSpaceMode::Normal,
+            preserve_ordinary_spaces: false,
+            preserve_hard_breaks: false,
+        };
+        assert_eq!(classify_segment_break_char(' ', normal), SegmentBreakKind::Space);
+        assert_eq!(classify_segment_break_char('\u{a0}', normal), SegmentBreakKind::Glue);
+        assert_eq!(classify_segment_break_char('\u{200b}', normal), SegmentBreakKind::ZeroWidthBreak);
+        assert_eq!(classify_segment_break_char('\u{ad}', normal), SegmentBreakKind::SoftHyphen);
+        assert_eq!(classify_segment_break_char('a', normal), SegmentBreakKind::Text);
     }
 }

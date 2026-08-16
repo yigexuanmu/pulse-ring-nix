@@ -23,6 +23,7 @@
 
 pub mod camera_tracking;
 pub mod font_stack;
+pub mod freeglue;
 pub mod lyrics_util;
 pub mod motion;
 pub mod pretext;

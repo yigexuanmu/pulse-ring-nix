@@ -1019,3 +1019,36 @@ PIXI-coupled "render shell" files; the port replaces PIXI mutation with arena
 node field mutation and the automatic PIXI tick with `flatten_scene`. Phase 7
 (post-process filters → draw.rs WGSL `scene_at` chain) and Phase 8 (atlas
 FreeType coverage raster swap) come after the runtime lands.
+
+### Phase 6.2 — scene-shell layer (in progress; two smallest members landed)
+
+Pure algorithm + MgCanvas/arena-reuse builder files (no semantic logic of their
+own), independent leaves of the shell family. Both translate folia `pixi.Graphics`
+mutation chains onto `crate::lyricstyles::mg::MgCanvas` (identical builder API
+to folia's PixiJS chain).
+
+| Sub | File | Commit | Tests | Notes |
+|---|---|---|---|---|
+| 6.2a | `glyph_layout.rs` (sonnetGlyphLayout.ts 77 — glyph spacing / ker-rewind) | `ba1439a` | +5 | Reuses `SonnetTypographyPlacement` + `SnapshotPair` (Phase 4). Pure fn. |
+| 6.2b | `text_fixed_geo.rs` (sonnetTextFixedGeo.ts 190 — fixed-geometry backplate emitter) | `474d96e` | +7 | Reuses `MgCanvas` builder; TWO PIXI-only concepts become `TextFixedGeoBackplate` fields: `graphic.rotation` → `rotation: f32`, `graphic.addChild(hatch)` → `child: Option<MgCanvas>`. `SonnetTheme` extended with `primary/secondary/accent_color: [f32;4]` (matches `mg::Color`; fed straight into strokes). |
+
+HEAD `474d96e` on origin, sonnet_v2 tree **16,261 LOC / 29 files**, **250 tests** green.
+
+### Next session continuation seed (Phase 6.2 remainder)
+
+Remaining Phase 6 scene-shell files (by ascending size):
+- `sonnetStaffView.ts` (163 lines) — staff-decor backplate, same reusable
+  `MgCanvas` builder pattern; smallest next, **port immediately**.
+- `sonnetGuides.ts` (270 lines) — dashed lines / axis guides / scoreboard.
+- `sonnetFrameDecor.ts` (302 lines) — frame border decoration.
+- `sonnetSceneBuilder.ts` (346 lines) — `SceneView` construction (arena
+  `push_scene`/`push_shot` scaffolding; first file that mutates scene graph).
+- `sonnetTextViewBuilder.ts` (420 lines) — glyph/segment nodes (arena
+  `push_glyph`/`push_segment`); touches `arena.rs` view-construction contract.
+- `createSonnetPixiRuntime.ts` (745 lines) — the largest, lands last; replaces
+  PIXI per-frame mutation with arena-node field mutation + `flatten_scene`
+  real body.
+
+Port order is strictly ascending-size, smallest-leaves-first, so each commit
+is independently green (`cargo check` + tests pass after every file) without a
+forward reference into a not-yet-ported member.

@@ -27,6 +27,7 @@ pub mod random;
 pub mod semantic;
 pub mod motion;
 pub mod program;
+pub mod camera_tracking;
 pub mod transitions;
 pub mod types;
 

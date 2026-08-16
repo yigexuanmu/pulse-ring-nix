@@ -39,12 +39,14 @@ process.stdout.on('error', () => {
   process.exit(0);
 });
 
-function writeFrame(buf) {
-  // 管道忙（stdout 未排空）时直接丢弃本帧：防止队列无界增长导致内存爆炸。
+function writeFrame(buf, w, h) {
+  // 帧头写入实际尺寸 w/h（而非 argv 的 width/height），原因是 Wayland 离屏后端
+  // 下的 capturePage 返回合成尺寸而非 window 尺寸；帧头若与缓冲不匹配，Rust 端
+  // 会按错误尺寸分配 → 解析错位。管道忙时丢弃本帧防止内存爆炸。
   if (paused || outputClosed) return;
   const header = Buffer.alloc(8);
-  header.writeUInt32LE(width, 0);
-  header.writeUInt32LE(height, 4);
+  header.writeUInt32LE(w, 0);
+  header.writeUInt32LE(h, 4);
   queue.push(header);
   queue.push(buf);
   pump();
@@ -139,7 +141,10 @@ process.stdin.on('data', (chunk) => {
   }
 });
 
-app.commandLine.appendSwitch('ozone-platform', 'x11');
+// Wayland（rootless XWayland 下 X11 后端会因无 root window 触发
+// XGetWindowAttributes failed → whenReady 死锁。Wayland 后端 on this
+// compositor (niri) 经实测工作）。
+app.commandLine.appendSwitch('ozone-platform', 'wayland');
 // 必须软件渲染：本机 MESA DRI 权限问题会让 GPU 进程段错误崩溃（exit 139）。
 app.disableHardwareAcceleration();
 
@@ -176,7 +181,10 @@ app.whenReady().then(() => {
     win.webContents.capturePage()
       .then((image) => {
         const size = image.getSize();
-        if (size.width !== width || size.height !== height) return;
+        // 流式发送 capturePage 返回的实际尺寸帧（Wayland 后端下，离屏合成尺寸
+        // 不等于 window 尺寸；零尺寸仅出现在首帧未绘完时，跳过即可）。
+        // 帧头写入真实 w/h，Rust 端 upload_overlay 同尺寸走快路径、变尺寸重建纹理。
+        if (size.width === 0 || size.height === 0) return;
         const bgra = image.toBitmap(); // BGRA（Electron 位图）
         const rgba = Buffer.allocUnsafe(bgra.length);
         for (let i = 0; i < bgra.length; i += 4) {
@@ -185,7 +193,7 @@ app.whenReady().then(() => {
           rgba[i + 2] = bgra[i];
           rgba[i + 3] = bgra[i + 3];
         }
-        writeFrame(rgba);
+        writeFrame(rgba, size.width, size.height);
       })
       .catch(() => {})
       .finally(schedule);

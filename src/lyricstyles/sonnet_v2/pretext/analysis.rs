@@ -978,6 +978,66 @@ pub fn merge_no_space_word_chains(seg: MergedSegmentation) -> MergedSegmentation
     }
 }
 
+/// `splitTrailingForwardStickyCluster(text)` — pretext analysis.ts:399.
+/// Scans backwards from end, collapsing every combining-mark / kinsokuEnd /
+/// forwardStickyGlue character into a trailing `tail` substring. Returns
+/// `Some((head, tail))` when at least one leading AND at least one trailing
+/// character survives the scan; `null` otherwise.
+pub fn split_trailing_forward_sticky_cluster(text: &str) -> Option<(&str, &str)> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut split_index = chars.len();
+    while split_index > 0 {
+        let ch = chars[split_index - 1];
+        if is_combining_mark(ch) {
+            split_index -= 1;
+            continue;
+        }
+        if set_contains(KINSOKU_END, ch) || set_contains(FORWARD_STICKY_GLUE, ch) {
+            split_index -= 1;
+            continue;
+        }
+        break;
+    }
+    if split_index == 0 || split_index == chars.len() {
+        return None;
+    }
+    // Slice the original &str at char indices — recompute byte offsets.
+    let head_byte_end = chars[..split_index]
+        .iter()
+        .map(|c| c.len_utf8())
+        .sum();
+    Some((&text[..head_byte_end], &text[head_byte_end..]))
+}
+
+/// `carryTrailingForwardStickyAcrossCJKBoundary` — pretext analysis.ts:1027.
+/// For each consecutive pair of TEXT segs where both are CJK runs, attempt to
+/// `splitTrailingForwardStickyCluster` on the left run; if it splits, move the
+/// trailing sticky cluster to the front of the right run (and adjust the right
+/// run's `starts` offset by `head.len()` in UTF-16 code units — Rust tracks
+/// char counts, semantically equivalent for UAX purposes).
+pub fn carry_trailing_forward_sticky_across_cjk_boundary(mut seg: MergedSegmentation) -> MergedSegmentation {
+    let n = seg.len;
+    if n < 2 { return seg; }
+    let mut i = 0usize;
+    while i + 1 < n {
+        if seg.kinds[i] == SegmentBreakKind::Text && seg.kinds[i + 1] == SegmentBreakKind::Text
+            && is_cjk(&seg.texts[i]) && is_cjk(&seg.texts[i + 1])
+        {
+            // Need an owned head/tail because we overwrite both texts[i] and
+            // texts[i+1] in sequence — a borrow into seg.texts would conflict.
+            if let Some((head, tail)) = split_trailing_forward_sticky_cluster(&seg.texts[i]) {
+                let carried = format!("{}{}", tail, seg.texts[i + 1]);
+                let head_len = head.chars().count();
+                seg.texts[i] = head.to_string();
+                seg.texts[i + 1] = carried;
+                seg.starts[i + 1] = seg.starts[i] + head_len;
+            }
+        }
+        i += 1;
+    }
+    seg
+}
+
 /// `mergeGlueConnectedTextRuns` — pretext analysis.ts:951.
 /// Fold chains of `glue`-kind segments into adjacent `text` runs; standalone glue
 /// clusters (no following text) are kept as glue kind. Byte-identical control flow.
@@ -1272,9 +1332,9 @@ fn build_merged_segmentation(
     let seg = merge_numeric_runs(seg);
     let seg = split_hyphenated_numeric_runs(seg);
     let seg = merge_no_space_word_chains(seg);
-    // TODO Phase 2.2: remaining 2 passes —
-    //   carry_trailing_forward_sticky_across_cjk_boundary /
-    //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
+    let seg = carry_trailing_forward_sticky_across_cjk_boundary(seg);
+    // TODO Phase 2.2: remaining 1 pass —
+    //   merge_keep_all_text_segments — ported in next commit.
     seg
 }
 
@@ -2407,5 +2467,43 @@ mod tests {
         assert_eq!(merged.len, 1);
         assert_eq!(merged.texts[0], "/=");
         assert_eq!(merged.is_word_like[0], false);
+    }
+
+    /// `split_trailing_forward_sticky_cluster`: trailing kinsokuEnd sticky cluster is peeled.
+    #[test]
+    fn split_trailing_forward_sticky_cluster_peels_trailing_kinsoku_end() {
+        // "你好「": '「' (U+300C) is in kinsokuEnd → tail.
+        let s = "你好「";
+        assert_eq!(split_trailing_forward_sticky_cluster(s), Some(("你好", "「")));
+        // Plain text with no trailing sticky → None.
+        assert_eq!(split_trailing_forward_sticky_cluster("abc"), None);
+        // All sticky → None (head empty).
+        assert_eq!(split_trailing_forward_sticky_cluster("「"), None);
+    }
+
+    /// `carry_trailing_forward_sticky_across_cjk_boundary`: left CJK run's trailing
+    /// sticky cluster (:653) gets moved to head of right CJK run.
+    #[test]
+    fn carry_trailing_sticky_moves_cluster_across_cjk_boundary() {
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec!["你好「".into(), "世界".into()],
+            text_parts: vec![vec![], vec![]],
+            is_word_like: vec![false; 2],
+            kinds: vec![SegmentBreakKind::Text; 2],
+            starts: vec![0, 3],
+            single_char_run_chars: vec![None; 2],
+            single_char_run_lengths: vec![0; 2],
+            contains_cjk: vec![true; 2],
+            contains_arabic_script: vec![false; 2],
+            ends_with_closing_quote: vec![false; 2],
+            ends_with_myanmar_medial_glue: vec![false; 2],
+            has_arabic_no_space_punctuation: vec![false; 2],
+        };
+        let merged = carry_trailing_forward_sticky_across_cjk_boundary(seg);
+        assert_eq!(merged.len, 2);
+        assert_eq!(merged.texts[0], "你好");
+        assert_eq!(merged.texts[1], "「世界");
+        assert_eq!(merged.starts[1], 2); // starts[0] + head_chars count (2)
     }
 }

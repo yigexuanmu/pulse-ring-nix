@@ -21,8 +21,9 @@
 //! from Phase 0.2 onward but does not participate in the live frame loop until
 //! every Phase is green and snapshotted.
 
-pub mod types;
+pub mod lyrics_util;
 pub mod pretext;
+pub mod types;
 
 /// Placeholder entry — identical signature to the legacy
 /// `crate::lyricstyles::sonnet::build_frame`.

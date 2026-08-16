@@ -811,7 +811,10 @@ impl RingRenderer {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            // Bgra8UnormSrgb: 与 Electron capturePage 位图原生格式一致 (toBitmap() 直出 BGRA)，
+            // 省掉 main.js 的 BGRA→RGBA 软件循环 (2560×1600×4 = 16MB 转一半字节)。
+            // 同时与 surface format 候选 (Surface award Bgra8Unorm) 对齐，shader 不需 swap。
+            format: wgpu::TextureFormat::Bgra8UnormSrgb,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });

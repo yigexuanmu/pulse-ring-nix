@@ -19,12 +19,15 @@ const path = require('path');
 // (页面渲染出 main.js 源码). 用 env 完全脱离 argv 解析陷阱.
 const htmlPath = process.env.PULSE_RING_HTML || '';
 const htmlIsUrl = htmlPath.startsWith('http://') || htmlPath.startsWith('https://');
-// 默认尺寸只作 Fallback：实际渲染分辨率在 app.whenReady 里从 screen API
-// 自适应主屏 (display.size, 不套 workAreaSize—场景壁纸要全屏不避让 panels)。
-// Rust 端 spawn 时传的 PULSE_RING_WIDTH/HEIGHT 历史配置不再决定实际渲染像素，
-// 仅在屏幕自适应失败时作为叝底默认值。
-const fallbackWidth  = parseInt(process.env.PULSE_RING_WIDTH  || '1920', 10);
-const fallbackHeight = parseInt(process.env.PULSE_RING_HEIGHT || '1080', 10);
+// 窗口尺寸走 PULSE_RING_WIDTH/HEIGHT (Rust spawn 时从 cfg.web_wallpaper_size 传入)。
+// 不要自适应整屏 —— 每帧 raw RGBA 要通过 stdout pipe (~39 MiB/s) 发出去，窗口尺寸决定 fps 上限：
+//   960×540 → 2 MiB/帧 → 最多 ~20fps
+//   1920×1080 → 7.9 MiB/帧 → 最多 ~5fps
+//   2560×1600 → 16 MiB/帧 → 最多 ~2.5fps
+// Rust overlay pass 在 GPU 上把 web 帧 upscale 上去，不用达到原生屏分。
+// 之前的 "自适应主屏" 设计被证实在 stdout 管道上老不夀量, 这儿回退之。
+const fallbackWidth  = parseInt(process.env.PULSE_RING_WIDTH  || '960', 10);
+const fallbackHeight = parseInt(process.env.PULSE_RING_HEIGHT || '540', 10);
 if (!htmlPath) {
   console.error('[pulse-ring wallpaper] PULSE_RING_HTML env not set; refusing to start');
   app.quit();
@@ -166,16 +169,12 @@ app.commandLine.appendSwitch('ozone-platform', 'wayland');
 // 留 WebGL 即可恢复 sonnet PixiJS 渲染。
 
 app.whenReady().then(() => {
-  // 自适应主屏分辨率：场景/网页壁纸应铺满整屏，不走 cfg.web_wallpaper_size
-  // 写死的 960×540。display.size 是 logical px (CSS px)，与 BrowserWindow 接收
-  // 的尺寸单位一致；scaleFactor 单独影响 capturePage 输出的 device px 数。
-  // 多屏连接时只取主屏 (single primary display)；多屏全屏拼接不是 pulse-ring 场景。
-  let display;
-  try { display = screen.getPrimaryDisplay(); }
-  catch (_) { display = null; }
-  const width  = display ? display.size.width  : fallbackWidth;
-  const height = display ? display.size.height : fallbackHeight;
-  if (display) console.error(`[main] auto-resize to primary display: ${width}x${height}, scaleFactor=${display.scaleFactor}`);
+  // 窗口尺寸走 PULSE_RING_WIDTH/HEIGHT（Rust spawn 时从 cfg.web_wallpaper_size 传进来）。
+  // 不要用 screen.getPrimaryDisplay() 自适应整屏 —— 那会让每帧 raw RGBA 体积暴涨：
+  // 2560×1600×4 = 16 MiB/帧，stdout 管道实测 ~39 MiB/s → 写一帧 400ms = 2.5fps 上限。
+  // Rust overlay pass 在 GPU 上按需 upscale texture，不需要 web 帧达到原生屏分。
+  const width  = fallbackWidth;
+  const height = fallbackHeight;
   // transparent: 歌词层除歌词特效本身外应当全透明，让底层壁纸透出。
   // RGBA 帧透明区域 alpha=0，Rust overlay pass 用 ALPHA_BLENDING 合成时
   // alpha=0 的像素不贡献，底层壁纸原样保留。只设 transparent 即可，
@@ -215,19 +214,12 @@ app.whenReady().then(() => {
     win.webContents.capturePage()
       .then((image) => {
         const size = image.getSize();
-        // 流式发送 capturePage 返回的实际尺寸帧（Wayland 后端下，离屏合成尺寸
-        // 不等于 window 尺寸；零尺寸仅出现在首帧未绘完时，跳过即可）。
-        // 帧头写入真实 w/h，Rust 端 upload_overlay 同尺寸走快路径、变尺寸重建纹理。
         if (size.width === 0 || size.height === 0) return;
-        const bgra = image.toBitmap(); // BGRA（Electron 位图）
-        const rgba = Buffer.allocUnsafe(bgra.length);
-        for (let i = 0; i < bgra.length; i += 4) {
-          rgba[i] = bgra[i + 2];
-          rgba[i + 1] = bgra[i + 1];
-          rgba[i + 2] = bgra[i];
-          rgba[i + 3] = bgra[i + 3];
-        }
-        writeFrame(rgba, size.width, size.height);
+        // Electron 位图 native 是 BGRA，与 Rust wgpu overlay texture (Bgra8UnormSrgb)
+        // 一致，直接发，不做 BGRA→RGBA 软件循环（2560×1600×4 16MB 字节约一半字节
+        // 是烫手续性工作，实测 conv=19-26ms/帧）。
+        const bgra = image.toBitmap();
+        writeFrame(bgra, size.width, size.height);
       })
       .catch(() => {})
       .finally(schedule);

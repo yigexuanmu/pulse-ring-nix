@@ -1466,6 +1466,31 @@ impl RingRenderer {
             wp_pass.set_bind_group(0, wp_bg, &[]);
             wp_pass.draw(0..3, 0..1);
             drop(wp_pass);
+        } else {
+            // No image wallpaper: still clear the surface to transparent so the
+            // folia overlay and rings start from a known state. Without this,
+            // the freshly-acquired surface texture's contents are undefined
+            // (GPU/driver-dependent — some initialize to opaque white), and
+            // Pass 2's LoadOp::Load inherits that garbage as the background.
+            // This produced the symptom "画到一半 screen 显示白屏" when only a
+            // scene_wallpaper (folia-lyrics) was configured.
+            let mut clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    depth_slice: None,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            drop(clear_pass);
         }
 
         // Pass 1.5: folia overlay (lyrics visualizer). Drawn ABOVE the wallpaper and
@@ -1476,6 +1501,11 @@ impl RingRenderer {
         if has_overlay {
             self.ensure_overlay_pass();
             if let (Some(p), Some(b)) = (self.overlay_pipeline.as_ref(), self.overlay_bind_group.as_ref()) {
+                static LOG_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = LOG_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n == 0 || n == 60 {
+                    log::info!("overlay pass: drawing folia frame onto surface (frame #{n})");
+                }
                 let mut ov_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("overlay pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {

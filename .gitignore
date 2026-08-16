@@ -11,3 +11,6 @@ npm-debug.log*
 # pi agent session artifacts
 .pi/
 .config/
+
+# nix build out-link
+result

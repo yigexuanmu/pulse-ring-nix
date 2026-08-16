@@ -141,12 +141,18 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
     };
 
     let mut child = Command::new(&electron)
+        // --no-sandbox is mandatory on NixOS: the distribution ships no setuid
+        // sandbox helper, so Chromium's default sandbox prevents the renderer
+        // process from initializing the GPU/Compositor stack — the page boots
+        // but renders nothing (a fully-white surface). Same behaviour as the
+        // bundled electron helper scripts shipped by most NixOS Electron apps.
+        .arg("--no-sandbox")
         .args([helper, abs_html, width.to_string(), height.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("spawn electron failed: {e}"))?;
+        .map_err(|e| format!("spawn electron failed: {e}"))?;;;
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().ok_or("no stdout")?;

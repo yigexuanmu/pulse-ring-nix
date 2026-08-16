@@ -132,15 +132,17 @@ process.stdin.on('data', (chunk) => {
       let payload = null;
       try { payload = JSON.parse(input.buf.slice(5, 5 + len).toString('utf8')); } catch (_) {}
       input.buf = input.buf.slice(5 + len);
-      if (payload == null || !win || win.isDestroyed()) continue;
       const channel = { 1: 'pulse-config', 2: 'pulse-lyrics', 3: 'pulse-playback', 4: 'pulse-theme' }[tag];
-      if (channel) {
-        if (tag === 1) latestConfig = payload;
-        else if (tag === 2) latestLyrics = payload;
-        else if (tag === 3) latestPlayback = payload;
-        else if (tag === 4) latestTheme = payload;
-        win.webContents.send(channel, payload);
-      }
+      if (!channel) continue;
+      // 缓存必须在 !win guard 之前: stdin 可能在 app.whenReady 建 win 之前到达,
+      // 此时 packet 仍需缓存到 latestXxx, 否则 did-finish-load 重放看到 null,
+      // obs-bridge 永远收不到 config/lyrics → 页面停在 Waiting / 经典 fallback.
+      if (tag === 1) latestConfig = payload;
+      else if (tag === 2) latestLyrics = payload;
+      else if (tag === 3) latestPlayback = payload;
+      else if (tag === 4) latestTheme = payload;
+      if (!win || win.isDestroyed()) continue;   // win 未就绪: 只缓存不发送
+      win.webContents.send(channel, payload);
       continue;
     }
 

@@ -477,6 +477,80 @@ pub fn is_url_query_boundary_segment(text: &str) -> bool {
     text.contains('?') && (text.contains("://") || text.starts_with("www."))
 }
 
+/// `mergeUrlQueryRuns` — pretext analysis.ts:646.
+/// After URL-like runs are merged (pass 2/8), carve out remaining query strings
+/// that follow a URL-query-boundary segment (ts involves `?` + `://`/`www.`). A
+/// fresh Text segment is appended carrying the joined following segments (up to
+/// the next text-run boundary) and the loop cursor advances past them; the
+/// boundary segment itself is retained unmodified as the run "anchor".
+/// Byte-identical control flow to the TS original.
+pub fn merge_url_query_runs(seg: MergedSegmentation) -> MergedSegmentation {
+    let len = seg.len;
+    let in_texts = seg.texts;
+    let in_is_word_like = seg.is_word_like;
+    let in_kinds = seg.kinds;
+    let in_starts = seg.starts;
+
+    let mut texts: Vec<String> = vec![];
+    let mut is_word_like: Vec<bool> = vec![];
+    let mut kinds: Vec<SegmentBreakKind> = vec![];
+    let mut starts: Vec<usize> = vec![];
+
+    let mut i = 0usize;
+    while i < len {
+        let text = &in_texts[i];
+        texts.push(text.clone());
+        is_word_like.push(in_is_word_like[i]);
+        kinds.push(in_kinds[i]);
+        starts.push(in_starts[i]);
+
+        if !is_url_query_boundary_segment(text) {
+            i += 1;
+            continue;
+        }
+
+        let next_index = i + 1;
+        if next_index >= len || is_text_run_boundary(in_kinds[next_index]) {
+            i += 1;
+            continue;
+        }
+
+        let mut query_parts: Vec<String> = vec![];
+        let query_start = in_starts[next_index];
+        let mut j = next_index;
+        while j < len && !is_text_run_boundary(in_kinds[j]) {
+            query_parts.push(in_texts[j].clone());
+            j += 1;
+        }
+        if !query_parts.is_empty() {
+            texts.push(join_text_parts(&query_parts));
+            is_word_like.push(true);
+            kinds.push(SegmentBreakKind::Text);
+            starts.push(query_start);
+            i = j; // TS: i = j - 1 (outer for-loop adds 1 each iter)
+        } else {
+            i += 1;
+        }
+    }
+
+    let new_len = texts.len();
+    MergedSegmentation {
+        len: new_len,
+        texts,
+        text_parts: vec![],
+        is_word_like,
+        kinds,
+        starts,
+        single_char_run_chars: vec![],
+        single_char_run_lengths: vec![],
+        contains_cjk: vec![],
+        contains_arabic_script: vec![],
+        ends_with_closing_quote: vec![],
+        ends_with_myanmar_medial_glue: vec![],
+        has_arabic_no_space_punctuation: vec![],
+    }
+}
+
 /// `mergeUrlLikeRuns` — pretext analysis.ts:596.
 /// Merge a leading `www.`/`scheme:`+`//`URL-like run together with the
 /// following text segments up to the next text-run boundary (space / preserved-
@@ -844,9 +918,10 @@ fn build_merged_segmentation(
     // Phase 2.2 downstream merge passes (pretext analysis.ts order):
     let seg = merge_glue_connected_text_runs(seg);
     let seg = merge_url_like_runs(seg);
-    // TODO Phase 2.2: remaining 6 passes — merge_url_query_runs /
-    //   merge_numeric_runs / split_hyphenated_numeric_runs /
-    //   merge_no_space_word_chains / carry_trailing_forward_sticky_across_cjk_boundary /
+    let seg = merge_url_query_runs(seg);
+    // TODO Phase 2.2: remaining 5 passes — merge_numeric_runs /
+    //   split_hyphenated_numeric_runs / merge_no_space_word_chains /
+    //   carry_trailing_forward_sticky_across_cjk_boundary /
     //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
     seg
 }
@@ -1736,5 +1811,68 @@ mod tests {
         assert_eq!(merged.texts[1], "x");
         // note: "x" is text but no longer URL-promoted (its is_word_like stays false).
         assert_eq!(merged.is_word_like[1], false);
+    }
+
+    /// `merge_url_query_runs`: boundary segment keeps + query tail joined into new Text.
+    #[test]
+    fn merge_url_query_carves_following_tail_after_boundary() {
+        // After pass 2/8 (merge_url_like_runs), this tail layout emerges:
+        // ["www.foo?bar", " ", "after"] — the `?`-carrying run is already one seg.
+        // For the query pass we want to test the simpler shape TS targets:
+        // boundary seg + following text run.
+        // ["http://foo?q=1", "pathextra", " ", "x"]
+        //   ^boundary seg        ^following text   ^space   ^later
+        let seg = MergedSegmentation {
+            len: 4,
+            texts: vec!["http://foo?q=1".into(), "pathextra".into(), " ".into(), "x".into()],
+            text_parts: vec![vec![]; 4],
+            is_word_like: vec![true, false, false, false],
+            kinds: vec![SegmentBreakKind::Text, SegmentBreakKind::Text, SegmentBreakKind::Space, SegmentBreakKind::Text],
+            starts: vec![0, 12, 22, 23],
+            single_char_run_chars: vec![None; 4],
+            single_char_run_lengths: vec![0; 4],
+            contains_cjk: vec![false; 4],
+            contains_arabic_script: vec![false; 4],
+            ends_with_closing_quote: vec![false; 4],
+            ends_with_myanmar_medial_glue: vec![false; 4],
+            has_arabic_no_space_punctuation: vec![false; 4],
+        };
+        let merged = merge_url_query_runs(seg);
+        // boundary seg kept; following text run "pathextra" (non-boundary, non-text-run-boundary)
+        // appended as a new Text seg; then space boundary — loop stops; space+"x"
+        // appended unchanged.
+        assert_eq!(merged.len, 4);
+        assert_eq!(merged.texts[0], "http://foo?q=1");
+        assert_eq!(merged.texts[1], "pathextra");
+        assert_eq!(merged.is_word_like[1], true); // promoted to true
+        assert_eq!(merged.kinds[1], SegmentBreakKind::Text);
+        assert_eq!(merged.texts[2], " ");
+        assert_eq!(merged.texts[3], "x");
+    }
+
+    /// `merge_url_query_runs`: boundary seg at end of run (no following segments)
+    /// kept as-is, no new segment appended.
+    #[test]
+    fn merge_url_query_boundary_at_end_keeps_unmodified() {
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec!["http://foo?q=1".into(), " ".into()],
+            text_parts: vec![vec![]; 2],
+            is_word_like: vec![true, false],
+            kinds: vec![SegmentBreakKind::Text, SegmentBreakKind::Space],
+            starts: vec![0, 12],
+            single_char_run_chars: vec![None; 2],
+            single_char_run_lengths: vec![0; 2],
+            contains_cjk: vec![false; 2],
+            contains_arabic_script: vec![false; 2],
+            ends_with_closing_quote: vec![false; 2],
+            ends_with_myanmar_medial_glue: vec![false; 2],
+            has_arabic_no_space_punctuation: vec![false; 2],
+        };
+        let merged = merge_url_query_runs(seg);
+        // boundary followed immediately by space (text-run boundary) -> no carve-out.
+        assert_eq!(merged.len, 2);
+        assert_eq!(merged.texts[0], "http://foo?q=1");
+        assert_eq!(merged.texts[1], " ");
     }
 }

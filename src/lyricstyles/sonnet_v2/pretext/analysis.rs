@@ -421,6 +421,104 @@ pub fn join_reversed_prefix_parts(prefix_parts: &[String], tail: &str) -> String
     out
 }
 
+/// `mergeGlueConnectedTextRuns` — pretext analysis.ts:951.
+/// Fold chains of `glue`-kind segments into adjacent `text` runs; standalone glue
+/// clusters (no following text) are kept as glue kind. Byte-identical control flow.
+///
+/// Operates only on the 5 core fields — the 7 auxiliary parallel arrays (set
+/// during the driver dispatch) become stale and are reset to empty. Downstream
+/// merge passes and `analyze_text` consume only the 5 core fields.
+pub fn merge_glue_connected_text_runs(seg: MergedSegmentation) -> MergedSegmentation {
+    let len = seg.len;
+    let in_texts = seg.texts;
+    let in_is_word_like = seg.is_word_like;
+    let in_kinds = seg.kinds;
+    let in_starts = seg.starts;
+
+    let mut texts: Vec<String> = vec![];
+    let mut is_word_like: Vec<bool> = vec![];
+    let mut kinds: Vec<SegmentBreakKind> = vec![];
+    let mut starts: Vec<usize> = vec![];
+
+    let mut read = 0usize;
+    while read < len {
+        let mut text_parts: Vec<String> = vec![in_texts[read].clone()];
+        let mut word_like = in_is_word_like[read];
+        let mut kind = in_kinds[read];
+        let mut start = in_starts[read];
+
+        if kind == SegmentBreakKind::Glue {
+            // Collect a run of glue segments; if a text run follows, fold it in.
+            let mut glue_parts: Vec<String> = vec![text_parts[0].clone()];
+            let glue_start = start;
+            read += 1;
+            while read < len && in_kinds[read] == SegmentBreakKind::Glue {
+                glue_parts.push(in_texts[read].clone());
+                read += 1;
+            }
+            let glue_text = join_text_parts(&glue_parts);
+
+            if read < len && in_kinds[read] == SegmentBreakKind::Text {
+                text_parts = vec![glue_text, in_texts[read].clone()];
+                word_like = in_is_word_like[read];
+                kind = SegmentBreakKind::Text;
+                start = glue_start;
+                read += 1;
+            } else {
+                texts.push(glue_text);
+                is_word_like.push(false);
+                kinds.push(SegmentBreakKind::Glue);
+                starts.push(glue_start);
+                continue;
+            }
+        } else {
+            read += 1;
+        }
+
+        if kind == SegmentBreakKind::Text {
+            while read < len && in_kinds[read] == SegmentBreakKind::Glue {
+                let mut glue_parts: Vec<String> = vec![];
+                while read < len && in_kinds[read] == SegmentBreakKind::Glue {
+                    glue_parts.push(in_texts[read].clone());
+                    read += 1;
+                }
+                let glue_text = join_text_parts(&glue_parts);
+
+                if read < len && in_kinds[read] == SegmentBreakKind::Text {
+                    text_parts.push(glue_text);
+                    text_parts.push(in_texts[read].clone());
+                    word_like = word_like || in_is_word_like[read];
+                    read += 1;
+                    continue;
+                }
+                text_parts.push(glue_text);
+            }
+        }
+
+        texts.push(join_text_parts(&text_parts));
+        is_word_like.push(word_like);
+        kinds.push(kind);
+        starts.push(start);
+    }
+
+    let new_len = texts.len();
+    MergedSegmentation {
+        len: new_len,
+        texts,
+        text_parts: vec![],
+        is_word_like,
+        kinds,
+        starts,
+        single_char_run_chars: vec![],
+        single_char_run_lengths: vec![],
+        contains_cjk: vec![],
+        contains_arabic_script: vec![],
+        ends_with_closing_quote: vec![],
+        ends_with_myanmar_medial_glue: vec![],
+        has_arabic_no_space_punctuation: vec![],
+    }
+}
+
 fn build_merged_segmentation(
     normalized: &str,
     profile: AnalysisProfile,
@@ -591,15 +689,11 @@ fn build_merged_segmentation(
         compact += 1;
     }
     merged_len = compact;
-    // TODO Phase 2.2: pipeline downstream passes (merge_url_like_runs / merge_url_query_runs /
-    //   merge_numeric_runs / split_hyphenated_numeric_runs / merge_no_space_word_chains /
-    //   carry_trailing_forward_sticky_across_cjk_boundary) — ported in follow-up commits.
-
     m_texts.truncate(merged_len);
     m_is_word_like.truncate(merged_len);
     m_kinds.truncate(merged_len);
     m_starts.truncate(merged_len);
-    MergedSegmentation {
+    let seg = MergedSegmentation {
         len: merged_len,
         texts: m_texts,
         text_parts: m_text_parts,
@@ -613,7 +707,14 @@ fn build_merged_segmentation(
         ends_with_closing_quote: m_ends_close_quote,
         ends_with_myanmar_medial_glue: m_ends_myanmar,
         has_arabic_no_space_punctuation: m_has_arabic_no_space_punct,
-    }
+    };
+    // Phase 2.2 downstream merge passes (pretext analysis.ts order):
+    let seg = merge_glue_connected_text_runs(seg);
+    // TODO Phase 2.2: remaining 7 passes — merge_url_like_runs /
+    //   merge_url_query_runs / merge_numeric_runs / split_hyphenated_numeric_runs /
+    //   merge_no_space_word_chains / carry_trailing_forward_sticky_across_cjk_boundary /
+    //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
+    seg
 }
 
 /// Minimal `classifySegmentBreakChar` — classifies a whole word-bounded
@@ -1326,5 +1427,86 @@ mod tests {
         );
         // "hello" (text) + " " (space) + "world" (text) = 3 entries; no sticky merge.
         assert_eq!(seg.len, 3);
+    }
+
+    /// `merge_glue_connected_text_runs`: glue sandwiched between two text runs folds
+    /// both text segs + glue into one Text segment.
+    #[test]
+    fn merge_glue_fold_glue_between_two_text_runs() {
+        // piece the seg directly: Text("you") Glue("·") Text("good") → Text("you·good").
+        let seg = MergedSegmentation {
+            len: 3,
+            texts: vec!["you".into(), "·".into(), "good".into()],
+            text_parts: vec![vec![], vec![], vec![]],
+            is_word_like: vec![true, false, true],
+            kinds: vec![SegmentBreakKind::Text, SegmentBreakKind::Glue, SegmentBreakKind::Text],
+            starts: vec![0, 3, 4],
+            single_char_run_chars: vec![None, None, None],
+            single_char_run_lengths: vec![0; 3],
+            contains_cjk: vec![false, false, false],
+            contains_arabic_script: vec![false, false, false],
+            ends_with_closing_quote: vec![false, false, false],
+            ends_with_myanmar_medial_glue: vec![false, false, false],
+            has_arabic_no_space_punctuation: vec![false, false, false],
+        };
+        let merged = merge_glue_connected_text_runs(seg);
+        assert_eq!(merged.len, 1);
+        assert_eq!(merged.texts[0], "you·good");
+        assert_eq!(merged.kinds[0], SegmentBreakKind::Text);
+        assert_eq!(merged.is_word_like[0], true); // word_like stays true (true||true)
+        assert_eq!(merged.starts[0], 0);
+    }
+
+    /// `merge_glue_connected_text_runs`: trailing glue with no following text run
+    /// stays as glue kind, not folded into prior text.
+    #[test]
+    fn merge_glue_trailing_glue_keeps_as_glue_kind() {
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec!["hi".into(), "·".into()],
+            text_parts: vec![vec![], vec![]],
+            is_word_like: vec![true, false],
+            kinds: vec![SegmentBreakKind::Text, SegmentBreakKind::Glue],
+            starts: vec![0, 2],
+            single_char_run_chars: vec![None, None],
+            single_char_run_lengths: vec![0, 0],
+            contains_cjk: vec![false, false],
+            contains_arabic_script: vec![false, false],
+            ends_with_closing_quote: vec![false, false],
+            ends_with_myanmar_medial_glue: vec![false, false],
+            has_arabic_no_space_punctuation: vec![false, false],
+        };
+        let merged = merge_glue_connected_text_runs(seg);
+        // Text("hi") stays; Glue("·") stays — plus the text-glue loop appends
+        // the trailing glue via `textParts.push(glueText)`, so Text becomes "hi·".
+        assert_eq!(merged.len, 1);
+        assert_eq!(merged.texts[0], "hi·");
+        assert_eq!(merged.kinds[0], SegmentBreakKind::Text);
+    }
+
+    /// `merge_glue_connected_text_runs`: leading glue with no precedent text folds
+    /// into the following text run.
+    #[test]
+    fn merge_glue_leading_glue_folds_into_following_text() {
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec!["·".into(), "ab".into()],
+            text_parts: vec![vec![], vec![]],
+            is_word_like: vec![false, true],
+            kinds: vec![SegmentBreakKind::Glue, SegmentBreakKind::Text],
+            starts: vec![0, 1],
+            single_char_run_chars: vec![None, None],
+            single_char_run_lengths: vec![0, 0],
+            contains_cjk: vec![false, false],
+            contains_arabic_script: vec![false, false],
+            ends_with_closing_quote: vec![false, false],
+            ends_with_myanmar_medial_glue: vec![false, false],
+            has_arabic_no_space_punctuation: vec![false, false],
+        };
+        let merged = merge_glue_connected_text_runs(seg);
+        assert_eq!(merged.len, 1);
+        assert_eq!(merged.texts[0], "·ab");
+        assert_eq!(merged.kinds[0], SegmentBreakKind::Text);
+        assert_eq!(merged.starts[0], 0);
     }
 }

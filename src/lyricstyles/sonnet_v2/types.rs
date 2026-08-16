@@ -156,3 +156,147 @@ impl Line {
         self.end_time
     }
 }
+
+// ===== folia `sonnet/types.ts` — SonnetProgram family =====
+// Pure renderer-independent contracts for the deterministic Sonnet PV program.
+
+/// folia `sonnet/types.ts` — `SonnetParagraphKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetParagraphKind {
+    Breath,
+    Verse,
+    Lift,
+    Chorus,
+    Break,
+    Outro,
+}
+
+/// folia `sonnet/types.ts` — `SonnetParagraphBoundary`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetParagraphBoundary {
+    SongStart,
+    TimeGap,
+    Metadata,
+    DurationCap,
+    LineCap,
+}
+
+/// folia `sonnet/types.ts` — `SonnetShotKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetShotKind {
+    EditorialColumn,
+    TypeImpact,
+    FragmentCollage,
+    TrackingRibbon,
+    MaskReveal,
+    PosterBlocks,
+    QuietTableau,
+}
+
+/// folia `sonnet/types.ts` — `SONNET_TRANSITION_KINDS` (order matters for deterministic round-robin).
+pub const SONNET_TRANSITION_KINDS: &[SonnetTransitionKind] = &[
+    SonnetTransitionKind::FastBlur,
+    SonnetTransitionKind::MonoGlitch,
+    SonnetTransitionKind::CameraPull,
+];
+
+/// folia `sonnet/types.ts` — `SonnetTransitionKind`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetTransitionKind {
+    FastBlur,
+    MonoGlitch,
+    CameraPull,
+}
+
+/// folia `sonnet/types.ts` — `SonnetSemanticSegment`.
+#[derive(Debug, Clone)]
+pub struct SonnetSemanticSegment {
+    pub text: String,
+    pub start_offset: usize,
+    pub end_offset: usize,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub word_indices: Vec<usize>,
+    pub graphemes: Vec<GraphemeTiming>,
+    pub is_word_like: bool,
+}
+
+/// folia `sonnet/types.ts` — `SonnetAnimationCue`. `kind` is one of
+/// `'enter' | 'hold' | 'exit' | 'accent'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetAnimationCueKind {
+    Enter,
+    Hold,
+    Exit,
+    Accent,
+}
+
+/// folia `sonnet/types.ts` — `SonnetAnimationCue`.
+#[derive(Debug, Clone)]
+pub struct SonnetAnimationCue {
+    pub at: f64,
+    pub duration: f64,
+    pub kind: SonnetAnimationCueKind,
+    pub segment_start: usize,
+    pub segment_end: usize,
+}
+
+/// folia `sonnet/types.ts` — `SonnetCameraFrame`
+#[derive(Debug, Clone, Copy)]
+pub struct SonnetCameraFrame {
+    pub x: f64,
+    pub y: f64,
+    pub zoom: f64,
+    pub rotation: f64,
+}
+
+/// folia `sonnet/types.ts` — `SonnetShot`.
+#[derive(Debug, Clone)]
+pub struct SonnetShot {
+    pub id: String,
+    pub kind: SonnetShotKind,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub line_indices: Vec<usize>,
+    pub cues: Vec<SonnetAnimationCue>,
+    pub camera: SonnetCameraFrame,
+}
+
+/// folia `sonnet/types.ts` — `SonnetTransition`.
+#[derive(Debug, Clone)]
+pub struct SonnetTransition {
+    pub kind: SonnetTransitionKind,
+    pub start_time: f64,
+    pub end_time: f64,
+}
+
+/// folia `sonnet/types.ts` — `SonnetCompiledLine`.
+#[derive(Debug, Clone)]
+pub struct SonnetCompiledLine {
+    pub source_index: usize,
+    pub line: Line,
+    pub render_end_time: f64,
+    pub segments: Vec<SonnetSemanticSegment>,
+}
+
+/// folia `sonnet/types.ts` — `SonnetParagraph`.
+#[derive(Debug, Clone)]
+pub struct SonnetParagraph {
+    pub id: String,
+    pub kind: SonnetParagraphKind,
+    pub boundary: SonnetParagraphBoundary,
+    pub start_time: f64,
+    pub end_time: f64,
+    pub lines: Vec<SonnetCompiledLine>,
+    pub shots: Vec<SonnetShot>,
+    pub transition_out: Option<SonnetTransition>,
+}
+
+/// folia `sonnet/types.ts` — `SonnetProgram`.
+#[derive(Debug, Clone)]
+pub struct SonnetProgram {
+    pub version: u32,
+    pub seed: String,
+    pub paragraph_gap_threshold: f64,
+    pub paragraphs: Vec<SonnetParagraph>,
+}

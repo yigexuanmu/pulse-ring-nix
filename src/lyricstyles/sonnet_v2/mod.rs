@@ -23,6 +23,7 @@
 
 pub mod lyrics_util;
 pub mod pretext;
+pub mod random;
 pub mod types;
 
 /// Placeholder entry — identical signature to the legacy

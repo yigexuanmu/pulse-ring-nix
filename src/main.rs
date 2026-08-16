@@ -1649,6 +1649,18 @@ fn apply_pack_style(cfg: &mut config::Config, qml: Option<&str>, lua: Option<&st
 }
 
 fn resolve_wallpaper(path: &str) -> ResolvedWp {
+    // 远程 http(s) URL (如 folia OBS browser source): 直接当 web 壁纸, 跳过本地
+    // pack/路径解析 — URL 既不是 pack 名也不是本地文件. 浏览器源页面(folia)
+    // 自己从其 SSE 后端拉歌词/进度/频谱, pulse-ring 仅负责 capturePage 抓帧.
+    if web_wallpaper::is_url_path(path) {
+        return ResolvedWp {
+            file: path.to_string(),
+            kind: "web".into(),
+            params: "{}".into(),
+            qml: None,
+            lua: None,
+        };
+    }
     // 壁纸库：裸名字或相对路径先查 ~/.config/pulse-ring/wallpapers/<name>
     let resolved_path = if std::path::Path::new(path).is_absolute() || std::path::Path::new(path).exists() {
         path.to_string()

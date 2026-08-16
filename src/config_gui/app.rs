@@ -177,7 +177,12 @@ fn build_general_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lan
             let preset = crate::folia_lyrics::active_preset(&s.folia);
             let enabled = preset.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
             s.config.scene_wallpaper = if enabled {
-                Some("folia-lyrics".to_string())
+                // 保留 scene_wallpaper: 若用户在 QML 手动配了 folia OBS URL
+                // (http(s)://...), 则保留该 URL — pulse-ring 的 Electron 直接
+                // loadURL 加载 folia 浏览器源页面。否则默认本地包名 "folia-lyrics".
+                Some(s.config.scene_wallpaper.clone()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or_else(|| "folia-lyrics".to_string()))
             } else {
                 None
             };
@@ -580,7 +585,14 @@ fn build_folia_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lang:
         folia_preset_set(&mut st.folia, &active_clone, "enabled", serde_json::json!(on));
         // 同时与 QML 的 scene_wallpaper 联动：「开」即启用歌词层，
         // 「关」即卸下——一个开关端到端启停，不要求用户另下壁纸配置。
-        st.config.scene_wallpaper = if on { Some("folia-lyrics".to_string()) } else { None };
+        // 若 scene_wallpaper 已含 URL（手动配的 folia OBS 源），保留该 URL。
+        st.config.scene_wallpaper = if on {
+            Some(st.config.scene_wallpaper.clone()
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| "folia-lyrics".to_string()))
+        } else {
+            None
+        };
     });
     top_group.add(&enabled_row);
 

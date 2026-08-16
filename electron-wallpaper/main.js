@@ -18,6 +18,7 @@ const path = require('path');
 // process.argv 里搅乱位置 — 曾导致 main.js 自己被当成 htmlPath 加载
 // (页面渲染出 main.js 源码). 用 env 完全脱离 argv 解析陷阱.
 const htmlPath = process.env.PULSE_RING_HTML || '';
+const htmlIsUrl = htmlPath.startsWith('http://') || htmlPath.startsWith('https://');
 const width = parseInt(process.env.PULSE_RING_WIDTH || '1920', 10);
 const height = parseInt(process.env.PULSE_RING_HEIGHT || '1080', 10);
 if (!htmlPath) {
@@ -176,7 +177,10 @@ app.whenReady().then(() => {
     },
   });
   win.webContents.setFrameRate(30);
-  win.loadFile(htmlPath);
+  // File target 走 loadFile (本地打包的 folia React bundle);
+  // 远程 URL (folia OBS browser source) 走 loadURL — 页面自己从其 SSE 后端
+  // 拿歌词/进度/频谱, pulse-ring 只 capturePage 抓帧.
+  if (htmlIsUrl) win.loadURL(htmlPath); else win.loadFile(htmlPath);
   win.webContents.on('did-finish-load', () => {
     if (latestConfig) win.webContents.send('pulse-config', latestConfig);
     if (latestLyrics) win.webContents.send('pulse-lyrics', latestLyrics);

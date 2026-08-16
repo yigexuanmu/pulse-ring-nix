@@ -130,7 +130,11 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
     } else {
         concat!(env!("CARGO_MANIFEST_DIR"), "/electron-wallpaper/main.js").to_string()
     };
-    let abs_html = if std::path::Path::new(html_path).is_absolute() {
+    // 远程 URL (如 folia OBS browser source /obs?obs=1&token=...) 直接透传, 不做
+    // abs 路径转换 — URL 不是文件系统路径, 走 BrowserWindow.loadURL 而非 loadFile.
+    let abs_html = if is_url_path(html_path) {
+        html_path.to_string()
+    } else if std::path::Path::new(html_path).is_absolute() {
         html_path.to_string()
     } else {
         format!(
@@ -259,4 +263,13 @@ pub fn drain_web(rx: &Receiver<WebFrame>) -> Option<WebFrame> {
 /// True when a wallpaper path is an HTML file (web wallpaper).
 pub fn is_html_path(path: &str) -> bool {
     path.to_ascii_lowercase().ends_with(".html") || path.to_ascii_lowercase().ends_with(".htm")
+}
+
+/// True when a wallpaper target is a remote http(s) URL
+/// (e.g. `http://127.0.0.1:32108/obs?obs=1&token=...` — folia OBS browser source).
+/// URL targets skip local-pack resolution; the BrowserWindow calls `loadURL`
+/// instead of `loadFile`, and the remote page (folia) drives its own data via
+/// SSE from its backend, leaving pulse-ring only to capture frames.
+pub fn is_url_path(path: &str) -> bool {
+    path.starts_with("http://") || path.starts_with("https://")
 }

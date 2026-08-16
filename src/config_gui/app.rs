@@ -564,7 +564,13 @@ fn build_folia_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lang:
     let st = state.clone();
     let active_clone = active.clone();
     enabled_row.connect_active_notify(move |r| {
-        folia_preset_set(&mut st.borrow_mut().folia, &active_clone, "enabled", serde_json::json!(r.is_active()));
+        let on = r.is_active();
+        let mut st = st.borrow_mut();
+        // 同步 folia-lyrics.json 的预设开关
+        folia_preset_set(&mut st.folia, &active_clone, "enabled", serde_json::json!(on));
+        // 同时与 QML 的 scene_wallpaper 联动：「开」即启用歌词层，
+        // 「关」即卸下——一个开关端到端启停，不要求用户另下壁纸配置。
+        st.config.scene_wallpaper = if on { Some("folia-lyrics".to_string()) } else { None };
     });
     top_group.add(&enabled_row);
 

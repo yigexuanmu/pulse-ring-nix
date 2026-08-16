@@ -58,12 +58,21 @@ pub fn library_dir() -> std::path::PathBuf {
 /// Resolve a wallpaper name to the library folder if it exists there.
 /// `name` may be a bare folder name ("my-wallpaper") or a relative path.
 pub fn resolve_library_path(name: &str) -> Option<std::path::PathBuf> {
+    // 1) 用户壁纸库：~/.config/pulse-ring/wallpapers/<name>/
     let p = library_dir().join(name);
     if p.is_dir() && p.join("project.json").is_file() {
-        Some(p)
-    } else {
-        None
+        return Some(p);
     }
+    // 2) 随包安装的库（包装器注入 PULSE_RING_WALLPAPER_LIB → $out/share/pulse-ring/
+    //    assets/wallpapers），让随包发布的 pack（如 folia-lyrics）开箱即用，
+    //    用户无需手动拷贝到 ~/.config/。
+    if let Ok(lib) = std::env::var("PULSE_RING_WALLPAPER_LIB") {
+        let bp = std::path::PathBuf::from(lib).join(name);
+        if bp.is_dir() && bp.join("project.json").is_file() {
+            return Some(bp);
+        }
+    }
+    None
 }
 
 /// If `path` is a directory containing `project.json`, resolve it to a wallpaper

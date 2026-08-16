@@ -135,6 +135,10 @@
             # DevShell `cargo run` needs it on PATH the same way the installed
             # wrapper does (wrapProgram --prefix PATH).
             export PATH="${pkgs.lib.makeBinPath runtimeBins}:$PATH"
+            # Bundled wallpaper library: lets `cargo run` resolve packaged
+            # wallpaper packs (e.g. folia-lyrics) the same way the installed
+            # wrapper does, without copying packs into ~/.config/.
+            export PULSE_RING_WALLPAPER_LIB="$PWD/assets/wallpapers"
           '';
         };
 
@@ -193,7 +197,8 @@
               --prefix LD_LIBRARY_PATH : "${pkgs.lib.makeLibraryPath runtimeLibs}" \
               --prefix GST_PLUGIN_PATH : "${pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" runtimeLibs}" \
               --prefix PATH : "${pkgs.lib.makeBinPath runtimeBins}" \
-              --set PULSE_RING_ELECTRON "${pkgs.electron}/bin/electron"
+              --set PULSE_RING_ELECTRON "${pkgs.electron}/bin/electron" \
+              --set PULSE_RING_WALLPAPER_LIB "$out/share/pulse-ring/assets/wallpapers"
           '';
 
           meta = with pkgs.lib; {

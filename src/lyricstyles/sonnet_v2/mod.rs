@@ -29,6 +29,7 @@ pub mod pretext;
 pub mod program;
 pub mod random;
 pub mod semantic;
+pub mod shot_flow_layouts;
 pub mod transitions;
 pub mod typography_roles;
 pub mod types;

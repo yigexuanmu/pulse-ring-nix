@@ -170,7 +170,17 @@ fn build_general_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lan
     let prefs_clone = prefs.clone();
     save_row.connect_activated(move |_| {
         let msg = {
-            let s = st.borrow();
+            let mut s = st.borrow_mut();
+            // 同步 scene_wallpaper 跟随 folia 预设的 enabled 状态：
+            // 这样无论用户本次开 GUI 是否手动触发开关，保存时状态都一致。
+            // scene_wallpaper=Some("folia-lyrics") 才让 main.rs spawn 歌词层进程。
+            let preset = crate::folia_lyrics::active_preset(&s.folia);
+            let enabled = preset.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
+            s.config.scene_wallpaper = if enabled {
+                Some("folia-lyrics".to_string())
+            } else {
+                None
+            };
             let qml_ok = qml_io::save_config(&s.config);
             let folia_ok = crate::folia_lyrics::save(&s.folia);
             match (qml_ok, folia_ok) {

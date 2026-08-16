@@ -125,10 +125,11 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
             electron.display()
         ));
     }
-    let helper = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/electron-wallpaper/main.js"
-    );
+    let helper: String = if let Ok(p) = std::env::var("PULSE_RING_HELPER") {
+        p
+    } else {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/electron-wallpaper/main.js").to_string()
+    };
     let abs_html = if std::path::Path::new(html_path).is_absolute() {
         html_path.to_string()
     } else {
@@ -140,7 +141,7 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
     };
 
     let mut child = Command::new(&electron)
-        .args([helper, &abs_html, &width.to_string(), &height.to_string()])
+        .args([helper, abs_html, width.to_string(), height.to_string()])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

@@ -198,6 +198,7 @@
               --prefix GST_PLUGIN_PATH : "${pkgs.lib.makeSearchPathOutput "lib" "lib/gstreamer-1.0" runtimeLibs}" \
               --prefix PATH : "${pkgs.lib.makeBinPath runtimeBins}" \
               --set PULSE_RING_ELECTRON "${pkgs.electron}/bin/electron" \
+              --set PULSE_RING_HELPER "$out/share/pulse-ring/electron-wallpaper/main.js" \
               --set PULSE_RING_WALLPAPER_LIB "$out/share/pulse-ring/assets/wallpapers"
           '';
 

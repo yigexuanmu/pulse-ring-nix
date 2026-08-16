@@ -13,9 +13,15 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 
-const htmlPath = process.argv[2];
-const width = parseInt(process.argv[3] || '1920', 10);
-const height = parseInt(process.argv[4] || '1080', 10);
+const htmlPath = (() => {
+  // argv 是 [electron, main.js? , --flag?, htmlPath, width, height].
+  // Electron CLI flag (如 --no-sandbox) 不被从 argv 剖除, 会留在 process.argv 里
+  // 顶住预期位置. 跟过所有 -- 开头的 flag, 第一个非 flag 即 htmlPath.
+  const cli = process.argv.slice(2).filter(a => !a.startsWith('-'));
+  return cli[0];
+})();
+const width = parseInt((() => { const cli = process.argv.slice(2).filter(a => !a.startsWith('-')); return cli[1] || '1920'; })(), 10);
+const height = parseInt((() => { const cli = process.argv.slice(2).filter(a => !a.startsWith('-')); return cli[2] || '1080'; })(), 10);
 
 let win = null;
 let latestConfig = null;

@@ -14,3 +14,6 @@ docs/EDT_BG_DESIGN.md
 NO_LYRICS_AUDIT.md
 PERF_AUDIT.md
 lyrics/fixtures.json
+
+# nix build --print-out-paths creates these symlinks; never commit them.
+result*

@@ -146,15 +146,21 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
         // from initializing the GPU/Compositor stack (page boots but renders
         // nothing — a fully-white surface). Same behaviour as the bundled
         // electron helper scripts shipped by most NixOS Electron apps.
-        // main.js 里用 robust argv 解析 (过滤 -- 开头的 flag), 所以此 flag
-        // 守在 argv 不会污染 htmlPath 位置; Electron /dev/shm errr 避免了.
+        //
+        // htmlPath / width / height 走 env, 不走 argv 位置参数.
+        // 原因: Electron CLI flag (如 --no-sandbox) 不被从 argv 剖除, 会留在
+        // process.argv 里搅乱位置 — 曾导致 main.js 自己被当成 htmlPath, 页面
+        // 渲染出 main.js 源码. 用 env 完全脱离 argv 解析陷阱.
         .arg("--no-sandbox")
-        .args([helper, abs_html, width.to_string(), height.to_string()])
+        .arg(&helper)                        // main script: Electron 执行 helper
+        .env("PULSE_RING_HTML", &abs_html)    // htmlPath via env
+        .env("PULSE_RING_WIDTH", width.to_string())
+        .env("PULSE_RING_HEIGHT", height.to_string())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
         .spawn()
-        .map_err(|e| format!("spawn electron failed: {e}"))?;;;
+        .map_err(|e| format!("spawn electron failed: {e}"))?;
 
     let stdin = child.stdin.take();
     let stdout = child.stdout.take().ok_or("no stdout")?;

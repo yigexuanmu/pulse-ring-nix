@@ -13,15 +13,17 @@
 const { app, BrowserWindow } = require('electron');
 const path = require('path');
 
-const htmlPath = (() => {
-  // argv 是 [electron, main.js? , --flag?, htmlPath, width, height].
-  // Electron CLI flag (如 --no-sandbox) 不被从 argv 剖除, 会留在 process.argv 里
-  // 顶住预期位置. 跟过所有 -- 开头的 flag, 第一个非 flag 即 htmlPath.
-  const cli = process.argv.slice(2).filter(a => !a.startsWith('-'));
-  return cli[0];
-})();
-const width = parseInt((() => { const cli = process.argv.slice(2).filter(a => !a.startsWith('-')); return cli[1] || '1920'; })(), 10);
-const height = parseInt((() => { const cli = process.argv.slice(2).filter(a => !a.startsWith('-')); return cli[2] || '1080'; })(), 10);
+// htmlPath / width / height 从环境变量读, 不再用 argv 位置参数.
+// 原因: Electron CLI flag (如 --no-sandbox) 不被从 argv 剖除, 会留在
+// process.argv 里搅乱位置 — 曾导致 main.js 自己被当成 htmlPath 加载
+// (页面渲染出 main.js 源码). 用 env 完全脱离 argv 解析陷阱.
+const htmlPath = process.env.PULSE_RING_HTML || '';
+const width = parseInt(process.env.PULSE_RING_WIDTH || '1920', 10);
+const height = parseInt(process.env.PULSE_RING_HEIGHT || '1080', 10);
+if (!htmlPath) {
+  console.error('[pulse-ring wallpaper] PULSE_RING_HTML env not set; refusing to start');
+  app.quit();
+}
 
 let win = null;
 let latestConfig = null;
@@ -155,12 +157,17 @@ app.commandLine.appendSwitch('ozone-platform', 'wayland');
 app.disableHardwareAcceleration();
 
 app.whenReady().then(() => {
+  // backgroundColor: 默认不设时 Electron 用白色背景；folia 页面顶层 div 是
+  // transparent，React 在离屏模式下若不加黑底会被白色吞掉页面内容不可见。
+  // 黑底让 folia 内容浮起来；后续 overlay 用 alpha 合成，黑色 alpha=1 区域会
+  // 覆盖壁纸（符合「歌词层在壁纸上方」的层级）。
   win = new BrowserWindow({
     width,
     height,
     show: false,
     frame: false,
     transparent: false,
+    backgroundColor: '#000000',
     webPreferences: {
       offscreen: true,
       backgroundThrottling: false,

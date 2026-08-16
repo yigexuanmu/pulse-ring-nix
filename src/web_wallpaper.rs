@@ -156,6 +156,15 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
         // process.argv 里搅乱位置 — 曾导致 main.js 自己被当成 htmlPath, 页面
         // 渲染出 main.js 源码. 用 env 完全脱离 argv 解析陷阱.
         .arg("--no-sandbox")
+        // 强制软件渲染 GL：离屏 Electron + Linux 桌面默认走 native GPU EGL 时，
+        // Wayland 离屏窗口下 Chromium 的 GPU 进程经常起不来（canvas drawing buffer 0×0），
+        // 导致 folia sonnet（Pixi WebGL 运行时）init 失败，只剩 VisualizerSubtitleOverlay
+        // 字幕浮动——看起来像 "不是 sonnet"。强制 egl-angle + swiftshader（软件 WebGL2）
+        // 跨环境一致可渲染，capturePage 抓帧又不依赖硬件 VSync，性能足够。
+        .arg("--use-gl=egl")
+        .arg("--use-angle=swiftshader")
+        .arg("--enable-unsafe-swiftshader")
+        .arg("--ignore-gpu-blocklist")
         .arg(&helper)                        // main script: Electron 执行 helper
         .env("PULSE_RING_HTML", &abs_html)    // htmlPath via env
         .env("PULSE_RING_WIDTH", width.to_string())

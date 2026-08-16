@@ -86,8 +86,35 @@ const obsBus: ObsBus = {
   },
 };
 
-// Exposed for diagnostics; nothing in this file reads it.
-(window as unknown as { __obsBus?: unknown }).__obsBus = obsBus;
+// Exposed for diagnostics: any page-level executeJavaScript can read this to inspect
+// what the bridge actually saw from window.pulseRing and what it dispatched to ObsBrowserSourceApp.
+(window as unknown as {
+  __obsBus?: unknown;
+  __obsBridgeDebug?: () => unknown;
+}).__obsBus = obsBus;
+(window as unknown as { __obsBridgeDebug?: () => unknown }).__obsBridgeDebug = () => ({
+  initialConfigDispatched,
+  cachedConfig,
+  cachedLyricsLines: cachedLyrics?.lines?.length ?? 0,
+  cachedPlayback: cachedPlayback && {
+    title: cachedPlayback.title,
+    positionSec: cachedPlayback.positionSec,
+    durationSec: cachedPlayback.durationSec,
+    playing: cachedPlayback.playing,
+    coverUrl: cachedPlayback.coverUrl,
+  },
+  cachedTheme: cachedTheme && { name: cachedTheme.name, primaryColor: cachedTheme.primaryColor },
+  lastDispatched: {
+    config: obsBus.lastByType.config && JSON.parse(obsBus.lastByType.config.data as string).visualizerMode,
+    clockSentAtMs: obsBus.lastByType.clock && JSON.parse(obsBus.lastByType.clock.data as string).sentAtMs,
+    audioSentAtMs: obsBus.lastByType.audio && JSON.parse(obsBus.lastByType.audio.data as string).sentAtMs,
+  },
+  obsBusListenerCounts: {
+    config: obsBus.listenersByType.config.size,
+    clock: obsBus.listenersByType.clock.size,
+    audio: obsBus.listenersByType.audio.size,
+  },
+});
 
 // ---------- MockEventSource: drop-in replacement for window.EventSource ----------
 

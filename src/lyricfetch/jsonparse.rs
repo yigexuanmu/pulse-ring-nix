@@ -162,6 +162,11 @@ pub(crate) fn parse_json_lines(value: &serde_json::Value) -> Vec<LyricLine> {
                             ],
                         );
                         let mut chars: Vec<i64> = Vec::new();
+                        // Phase 1.2 — additionally capture word-level timing (objects with
+                        // text + start/end) as LyricWord so sonnet v2 grapheme_timeline
+                        // has the parser-derived words Vec (folia `Line.words`). `chars`
+                        // fallback is preserved unchanged so existing callers see no drift.
+                        let mut lyric_words: Vec<crate::lyrics::LyricWord> = Vec::new();
                         for chkey in &["chars", "charTimes", "syllables", "wordsTiming"] {
                             if let Some(arr) = o.get(*chkey).filter(|v| v.is_array()) {
                                 for c in arr.as_array().unwrap() {
@@ -176,6 +181,30 @@ pub(crate) fn parse_json_lines(value: &serde_json::Value) -> Vec<LyricLine> {
                                         _ => 0,
                                     };
                                     chars.push(t);
+                                    // Phase 1.2 — wrap a word-shaped object as a LyricWord.
+                                    if let serde_json::Value::Object(_) = c {
+                                        let wtext = first_value_str(
+                                            c,
+                                            &[&["word"], &["text"], &["content"]],
+                                        );
+                                        if !wtext.is_empty() {
+                                            let ws = first_value_num(
+                                                c,
+                                                &[&["startTime"], &["start"], &["startTimeMs"], &["time"]],
+                                            );
+                                            let we_raw = first_value_num(
+                                                c,
+                                                &[&["endTime"], &["end"], &["endTimeMs"]],
+                                            );
+                                            let we = if we_raw > ws { we_raw } else { ws };
+                                            lyric_words.push(crate::lyrics::LyricWord {
+                                                text: wtext,
+                                                start_ms: ws,
+                                                end_ms: we,
+                                                syllables: Vec::new(),
+                                            });
+                                        }
+                                    }
                                 }
                                 break;
                             }
@@ -192,7 +221,7 @@ pub(crate) fn parse_json_lines(value: &serde_json::Value) -> Vec<LyricLine> {
                             translation,
                             romanization,
                             chars,
-                            words: Vec::new(),
+                            words: lyric_words,
                             song_part: String::new(),
                             block_index: 0,
                             chorus_flag: false,
@@ -225,4 +254,65 @@ pub(crate) fn parse_payload(text: &str) -> Vec<LyricLine> {
         }
     }
     super::lrc::parse_plain(trimmed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_json_lines;
+
+    /// Phase 1.2 — objects with a `wordsTiming` field yield a `words` Vec carrying
+    /// one LyricWord per timed object, alongside the per-char `chars` fallback so
+    /// existing `chars` consumers see no behavioural drift.
+    #[test]
+    fn words_timing_populates_words_vec() {
+        let json = r#"{
+            "lines": [
+                {
+                    "startTime": 1000,
+                    "endTime": 5000,
+                    "text": "Hello World",
+                    "wordsTiming": [
+                        {"word": "Hello", "startTime": 1000, "endTime": 3000},
+                        {"word": "World", "startTime": 3000, "endTime": 5000}
+                    ]
+                }
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let out = parse_json_lines(&v);
+        assert_eq!(out.len(), 1);
+        let line = &out[0];
+        assert_eq!(line.start_ms, 1000);
+        assert_eq!(line.duration_ms, 4000);
+        assert_eq!(line.text, "Hello World");
+        // Phase 1.2: words Vec captured.
+        assert_eq!(line.words.len(), 2);
+        assert_eq!(line.words[0].text, "Hello");
+        assert_eq!(line.words[0].start_ms, 1000);
+        assert_eq!(line.words[0].end_ms, 3000);
+        assert_eq!(line.words[1].text, "World");
+        assert_eq!(line.words[1].start_ms, 3000);
+        assert_eq!(line.words[1].end_ms, 5000);
+    }
+
+    /// Phase 1.2 — a bare `chars` numeric array (legacy convention) still populates
+    /// `chars` like before, but leaves `words` empty (no per-word text to extract).
+    #[test]
+    fn numeric_chars_leaves_words_empty() {
+        let json = r#"{
+            "lines": [
+                {
+                    "startTime": 2000,
+                    "endTime": 3000,
+                    "text": "abc",
+                    "chars": [2000, 2200, 2400]
+                }
+            ]
+        }"#;
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        let out = parse_json_lines(&v);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].chars, vec![2000, 2200, 2400]);
+        assert!(out[0].words.is_empty());
+    }
 }

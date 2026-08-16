@@ -132,6 +132,8 @@ fn parse_lines(source_lines: &[Value], total: i64) -> Vec<LyricLine> {
         let mut text_parts: Vec<String> = Vec::new();
         let mut roman_parts: Vec<String> = Vec::new();
         let mut chars: Vec<i64> = Vec::new();
+        // Phase 1.2 — collect per-word timing as lyricfetch::LyricWord (folia `Word` contract).
+        let mut lyric_words: Vec<crate::lyrics::LyricWord> = Vec::new();
         // word_timings[0] start/end (captured for the duration_inferred heuristic).
         let mut first_word_span: Option<(i64, i64)> = None;
         if let Some(words) = words {
@@ -173,6 +175,14 @@ fn parse_lines(source_lines: &[Value], total: i64) -> Vec<LyricLine> {
                 for index in 0..count {
                     chars.push(word_start + index * dur / tlen);
                 }
+                // Phase 1.2 — wrap the parsed word object as a LyricWord (syllables empty;
+                // SPlayer word objects do not expose a syllable sub-array).
+                lyric_words.push(crate::lyrics::LyricWord {
+                    text: text.clone(),
+                    start_ms: word_start,
+                    end_ms: word_end,
+                    syllables: Vec::new(),
+                });
             }
         }
 
@@ -236,7 +246,7 @@ fn parse_lines(source_lines: &[Value], total: i64) -> Vec<LyricLine> {
             translation,
             romanization,
             chars: line_chars,
-            words: Vec::new(),
+            words: lyric_words,
             song_part: String::new(),
             block_index: 0,
             chorus_flag: false,
@@ -355,6 +365,15 @@ mod tests {
             line.chars,
             vec![1000, 1200, 1400, 1600, 1800, 2000, 2200, 2400, 2600, 2800]
         );
+        // Phase 1.2 — words Vec populated from yrcData word objects (folia `Word`).
+        assert_eq!(line.words.len(), 2);
+        assert_eq!(line.words[0].text, "Hello");
+        assert_eq!(line.words[0].start_ms, 1000);
+        assert_eq!(line.words[0].end_ms, 2000);
+        assert!(line.words[0].syllables.is_empty());
+        assert_eq!(line.words[1].text, "World");
+        assert_eq!(line.words[1].start_ms, 2000);
+        assert_eq!(line.words[1].end_ms, 3000);
     }
 
     /// Parity case B: `lrcData` fallback when `yrcData` is empty/missing.

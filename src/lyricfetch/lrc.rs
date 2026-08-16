@@ -78,6 +78,10 @@ pub(crate) fn parse_plain(text: &str) -> Vec<LyricLine> {
             translation: String::new(),
             romanization: String::new(),
             chars: Vec::new(),
+            words: Vec::new(),
+            song_part: String::new(),
+            block_index: 0,
+            chorus_flag: false,
         });
     }
     out
@@ -136,6 +140,10 @@ fn krc_branch(krc: &Captures, offset: i64, out: &mut Vec<LyricLine>) {
                 translation: String::new(),
                 romanization: String::new(),
                 chars,
+                words: Vec::new(),
+                song_part: String::new(),
+                block_index: 0,
+                chorus_flag: false,
             });
             return;
         }
@@ -149,6 +157,10 @@ fn krc_branch(krc: &Captures, offset: i64, out: &mut Vec<LyricLine>) {
             translation: String::new(),
             romanization: String::new(),
             chars: Vec::new(),
+            words: Vec::new(),
+            song_part: String::new(),
+            block_index: 0,
+            chorus_flag: false,
         });
     }
 }
@@ -188,6 +200,10 @@ fn time_tag_branch(raw: &str, offset: i64, out: &mut Vec<LyricLine>) {
             translation: String::new(),
             romanization: String::new(),
             chars,
+            words: Vec::new(),
+            song_part: String::new(),
+            block_index: 0,
+            chorus_flag: false,
         });
     }
 }

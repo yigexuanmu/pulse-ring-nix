@@ -74,6 +74,10 @@ pub(crate) fn fetch_musixmatch(req: &TrackRequest) -> Result<LyricData, String> 
                     translation: String::new(),
                     romanization: String::new(),
                     chars: Vec::new(),
+                    words: Vec::new(),
+                    song_part: String::new(),
+                    block_index: 0,
+                    chorus_flag: false,
                 });
             }
             if !lines.is_empty() && !tlines.is_empty() {

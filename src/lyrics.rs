@@ -12,6 +12,38 @@ use std::sync::mpsc;
 #[path = "lyricfetch/mod.rs"]
 mod lyricfetch;
 
+/// One syllable in a parser-derived word (folia `Syllable`).
+#[derive(Debug, Clone)]
+pub struct LyricSyllable {
+    pub text: String,
+    /// Syllable start time in ms (parser-derived; never negative).
+    pub start_ms: i64,
+    /// Syllable end time in ms.
+    pub end_ms: i64,
+}
+
+impl LyricSyllable {
+    pub fn start_sec(&self) -> f32 { self.start_ms as f32 / 1000.0 }
+    pub fn end_sec(&self) -> f32 { self.end_ms as f32 / 1000.0 }
+}
+
+/// One word in a parser-derived timed lyric line (folia `Word`).
+#[derive(Debug, Clone)]
+pub struct LyricWord {
+    pub text: String,
+    /// Word start time in ms.
+    pub start_ms: i64,
+    /// Word end time in ms (>= start_ms).
+    pub end_ms: i64,
+    /// Optional sub-word syllable timing (empty when the source only provides word-level).
+    pub syllables: Vec<LyricSyllable>,
+}
+
+impl LyricWord {
+    pub fn start_sec(&self) -> f32 { self.start_ms as f32 / 1000.0 }
+    pub fn end_sec(&self) -> f32 { self.end_ms as f32 / 1000.0 }
+}
+
 /// One lyric line in the unified model (times in ms).
 #[derive(Debug, Clone)]
 pub struct LyricLine {
@@ -27,6 +59,24 @@ pub struct LyricLine {
     pub romanization: String,
     /// Per-character timestamps in ms (used for sub-word reveal; may be empty).
     pub chars: Vec<i64>,
+    /// Per-word timing (parser-derived; may be empty when the source has no word-level
+    /// timing — sonnet v2 falls back to uniform split in `grapheme_timing.rs`).
+    pub words: Vec<LyricWord>,
+    /// Song section tag ("verse"/"chorus"/"bridge"/…). Empty when the source has no metadata.
+    pub song_part: String,
+    /// Block index (metadata boundary detection). 0 when the source has no block info.
+    pub block_index: i64,
+    /// Chorus flag (parsed from source or detected by the adapter). `false` when unknown.
+    pub chorus_flag: bool,
+}
+
+impl LyricLine {
+    /// Line start in seconds (ms / 1000).
+    pub fn start_sec(&self) -> f32 { self.start_ms as f32 / 1000.0 }
+    /// Line end in seconds: `(start + duration) / 1000`.
+    pub fn end_sec(&self) -> f32 { (self.start_ms + self.duration_ms) as f32 / 1000.0 }
+    /// Line end in ms: `start_ms + duration_ms`.
+    pub fn end_ms(&self) -> i64 { self.start_ms + self.duration_ms }
 }
 
 /// Parsed lyric set for one track.
@@ -120,5 +170,46 @@ mod tests {
         let a = TrackRequest { title: "Song".into(), artist: "Artist".into(), album: "A".into(), duration_ms: 1, source: "lrclib".into(), ttml_url: String::new() };
         let b = TrackRequest { title: "Song".into(), artist: "Artist".into(), album: "B".into(), duration_ms: 2, source: "netease".into(), ttml_url: "x".into() };
         assert_eq!(a.key(), b.key());
+    }
+
+    // Phase 1.1 — folia `Line` contract coverage: words / syllables / songPart /
+    // blockIndex / isChorus, plus end_sec()/start_sec()/end_ms() helpers used by
+    // sonnet v2 paragraph splitting (Phase 3.8 program.rs).
+    #[test]
+    fn lyric_line_expanded_contract_end_sec_and_helpers() {
+        let word = LyricWord {
+            text: "hello".into(),
+            start_ms: 1000,
+            end_ms: 3000,
+            syllables: vec![LyricSyllable {
+                text: "hel".into(),
+                start_ms: 1000,
+                end_ms: 2000,
+            }],
+        };
+        let line = LyricLine {
+            start_ms: 1000,
+            duration_ms: 2000,
+            text: "hello".into(),
+            translation: "你好".into(),
+            romanization: String::new(),
+            chars: vec![],
+            words: vec![word.clone()],
+            song_part: "verse".into(),
+            block_index: 0,
+            chorus_flag: false,
+        };
+        assert_eq!(line.start_sec(), 1.0_f32, "start_sec = ms/1000");
+        assert_eq!(line.end_sec(), 3.0_f32, "end_sec = (start+duration)/1000");
+        assert_eq!(line.end_ms(), 3000, "end_ms = start_ms + duration_ms");
+        assert_eq!(line.words.len(), 1);
+        assert_eq!(line.words[0].text, "hello");
+        assert_eq!(line.words[0].syllables.len(), 1);
+        assert_eq!(line.words[0].syllables[0].text, "hel");
+        assert_eq!(line.song_part, "verse");
+        assert!(!line.chorus_flag);
+        // No-op: word.end_sec via helper (Phase 3.2 uses this).
+        assert_eq!(word.start_sec(), 1.0_f32);
+        assert_eq!(word.end_sec(), 3.0_f32);
     }
 }

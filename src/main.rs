@@ -725,6 +725,10 @@ fn virtual_staff(t: f32) -> lyrics::LyricData {
             translation: String::new(),
             romanization: String::new(),
             chars: vec![],
+            words: vec![],
+            song_part: String::new(),
+            block_index: 0,
+            chorus_flag: false,
         });
     }
     lyrics::LyricData { source: "virtual-staff".to_string(), lines }

@@ -236,6 +236,10 @@ fn parse_lines(source_lines: &[Value], total: i64) -> Vec<LyricLine> {
             translation,
             romanization,
             chars: line_chars,
+            words: Vec::new(),
+            song_part: String::new(),
+            block_index: 0,
+            chorus_flag: false,
         };
         if !item.text.is_empty()
             || !item.translation.is_empty()

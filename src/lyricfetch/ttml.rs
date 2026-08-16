@@ -95,6 +95,10 @@ pub(crate) fn parse_ttml(text: &str) -> Vec<LyricLine> {
                 translation: String::new(),
                 romanization: String::new(),
                 chars,
+                words: Vec::new(),
+                song_part: String::new(),
+                block_index: 0,
+                chorus_flag: false,
             },
             kind,
         ));

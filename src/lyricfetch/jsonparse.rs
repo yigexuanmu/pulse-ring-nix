@@ -110,6 +110,10 @@ pub(crate) fn parse_json_lines(value: &serde_json::Value) -> Vec<LyricLine> {
                         translation: String::new(),
                         romanization: String::new(),
                         chars: Vec::new(),
+                        words: Vec::new(),
+                        song_part: String::new(),
+                        block_index: 0,
+                        chorus_flag: false,
                     }),
                     serde_json::Value::Object(o) => {
                         let start = first_value_num(
@@ -188,6 +192,10 @@ pub(crate) fn parse_json_lines(value: &serde_json::Value) -> Vec<LyricLine> {
                             translation,
                             romanization,
                             chars,
+                            words: Vec::new(),
+                            song_part: String::new(),
+                            block_index: 0,
+                            chorus_flag: false,
                         });
                     }
                     _ => {}

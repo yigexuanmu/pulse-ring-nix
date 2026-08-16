@@ -49,6 +49,10 @@ pub fn render(text: &str, style: &str, time: f32, path: &str) -> Result<(), Stri
         translation: translation.to_string(),
         romanization: String::new(),
         chars: vec![],
+        words: vec![],
+        song_part: String::new(),
+        block_index: 0,
+        chorus_flag: false,
     };
     let lines = if text == "-" {
         // Neutral placeholder (no real-song lyrics) so preview still works without a text arg.

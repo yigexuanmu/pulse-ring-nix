@@ -34,6 +34,7 @@ pub mod random;
 pub mod semantic;
 pub mod poster_blocks_layout;
 pub mod shot_flow_layouts;
+pub mod text_fixed_geo;
 pub mod transitions;
 pub mod typography_layout;
 pub mod typography_roles;

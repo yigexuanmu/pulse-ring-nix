@@ -340,10 +340,19 @@ pub enum SonnetAnimationIntensity {
     Chaotic,
 }
 
-/// folia `src/types.ts` — `Theme` (motion-only subset).
+/// folia `src/types.ts` — `Theme` (sonnet-relevant subset).
+///
+/// `primary_color` / `secondary_color` / `accent_color` mirror folia's
+/// `primaryColor` / `secondaryColor` / `accentColor` but as RGBA linear floats
+/// `[r, g, b, a]` in `0..=1` (matching `crate::lyricstyles::mg::Color`), since
+/// the v2 scene graph samples these directly into atlas strokes rather than
+/// carrying hex strings through the runtime.
 #[derive(Debug, Clone, Copy)]
 pub struct SonnetTheme {
     pub animation_intensity: SonnetAnimationIntensity,
+    pub primary_color: [f32; 4],
+    pub secondary_color: [f32; 4],
+    pub accent_color: [f32; 4],
 }
 
 // ===== folia `sonnetTypographyRoles.ts` — layout layer forward type =====

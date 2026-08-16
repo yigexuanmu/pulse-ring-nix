@@ -21,14 +21,16 @@
 //! from Phase 0.2 onward but does not participate in the live frame loop until
 //! every Phase is green and snapshotted.
 
+pub mod camera_tracking;
+pub mod font_stack;
 pub mod lyrics_util;
+pub mod motion;
 pub mod pretext;
+pub mod program;
 pub mod random;
 pub mod semantic;
-pub mod motion;
-pub mod program;
-pub mod camera_tracking;
 pub mod transitions;
+pub mod typography_roles;
 pub mod types;
 
 /// Placeholder entry — identical signature to the legacy

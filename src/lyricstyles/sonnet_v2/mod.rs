@@ -21,6 +21,7 @@
 //! from Phase 0.2 onward but does not participate in the live frame loop until
 //! every Phase is green and snapshotted.
 
+pub mod arena;
 pub mod camera_tracking;
 pub mod font_stack;
 pub mod freeglue;

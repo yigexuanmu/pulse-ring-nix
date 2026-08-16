@@ -421,6 +421,139 @@ pub fn join_reversed_prefix_parts(prefix_parts: &[String], tail: &str) -> String
     out
 }
 
+/// `isTextRunBoundary` — pretext analysis.ts:570. Returns true for any segment
+/// kind that marks a hard run break (whitespace, preserved space,
+/// zero-width-break, hard-break). Used by `merge_url_like_runs`/
+/// `merge_url_query_runs` to know where to stop absorbing text segments.
+pub fn is_text_run_boundary(kind: SegmentBreakKind) -> bool {
+    matches!(
+        kind,
+        SegmentBreakKind::Space
+            | SegmentBreakKind::PreservedSpace
+            | SegmentBreakKind::ZeroWidthBreak
+            | SegmentBreakKind::HardBreak
+    )
+}
+
+/// `urlSchemeSegmentRe` — pretext analysis.ts:574. Matches a single text segment
+/// whose entire body is a leading URL scheme: `^[A-Za-z][A-Za-z0-9+.-]*:$`.
+/// We represent the regex as a small inline matcher (avoids pulling `regex`
+/// crate into pretext hot path; the pattern is simple enough to spell out).
+pub fn is_url_scheme_segment(text: &str) -> bool {
+    let mut bytes = text.as_bytes().iter();
+    let Some(&first) = bytes.next() else { return false };
+    if !first.is_ascii_alphabetic() { return false; }
+    let mut seen_colon = false;
+    for b in bytes {
+        if b.is_ascii_alphanumeric() || *b == b'+' || *b == b'.' || *b == b'-' { continue; }
+        if *b == b':' && !seen_colon { seen_colon = true; continue; }
+        return false;
+    }
+    seen_colon
+}
+
+/// `isUrlLikeRunStart` — pretext analysis.ts:581. A text segment begins a URL-like
+/// run if it_starts `www.` OR it's a `scheme:` followed by a `//` text segment.
+/// Reads ORIGINAL (unmutated) segmentation state, so callers should pass the input
+/// snapshot, not the in-progress working arrays.
+pub fn is_url_like_run_start(
+    texts: &[String],
+    kinds: &[SegmentBreakKind],
+    len: usize,
+    index: usize,
+) -> bool {
+    let text = &texts[index];
+    if text.starts_with("www.") { return true; }
+    is_url_scheme_segment(text)
+        && index + 1 < len
+        && kinds[index + 1] == SegmentBreakKind::Text
+        && texts[index + 1] == "//"
+}
+
+/// `isUrlQueryBoundarySegment` — pretext analysis.ts:589. Detects a boundary
+/// after which `mergeUrlQueryRuns` should stop absorbing; used later by
+/// `mergeUrlQueryRuns`. Ported now for proximity with the URL helpers.
+pub fn is_url_query_boundary_segment(text: &str) -> bool {
+    text.contains('?') && (text.contains("://") || text.starts_with("www."))
+}
+
+/// `mergeUrlLikeRuns` — pretext analysis.ts:596.
+/// Merge a leading `www.`/`scheme:`+`//`URL-like run together with the
+/// following text segments up to the next text-run boundary (space / preserved-
+/// space / zero-width-break / hard-break), or until encountering a segment text
+/// containing `?` (query marker). Every absorbed segment after the start has its
+/// `is_word_like` set to true and `kind` promoted to `text`; text is cleared and
+/// later compacted out. Byte-identical control flow to the TS original.
+pub fn merge_url_like_runs(seg: MergedSegmentation) -> MergedSegmentation {
+    let len = seg.len;
+    // TS reads `segmentation.texts[i]` (the unmutated ORIGINAL param) inside
+    // `isUrlLikeRunStart`, even though the working `texts`/`kinds` arrays below
+    // get mutated. We keep an ORIGINAL snapshot for those reads.
+    let orig_texts = seg.texts.clone();
+    let orig_kinds = seg.kinds.clone();
+    let mut texts = seg.texts;
+    let mut is_word_like = seg.is_word_like;
+    let mut kinds = seg.kinds;
+    let starts = seg.starts;
+
+    let mut i = 0;
+    while i < len {
+        if orig_kinds[i] != SegmentBreakKind::Text
+            || !is_url_like_run_start(&orig_texts, &orig_kinds, len, i)
+        {
+            i += 1;
+            continue;
+        }
+
+        let mut merged_parts: Vec<String> = vec![texts[i].clone()];
+        let mut j = i + 1;
+        while j < len && !is_text_run_boundary(kinds[j]) {
+            merged_parts.push(texts[j].clone());
+            is_word_like[i] = true;
+            let ends_query_prefix = texts[j].contains('?');
+            kinds[j] = SegmentBreakKind::Text;
+            texts[j] = String::new();
+            j += 1;
+            if ends_query_prefix { break; }
+        }
+        texts[i] = join_text_parts(&merged_parts);
+        i += 1;
+    }
+
+    // Compact empties (inlined `compactLen` scalar — byte-identical to TS).
+    let mut compact_len = 0usize;
+    for read in 0..texts.len() {
+        if texts[read].is_empty() { continue; }
+        if compact_len != read {
+            texts[compact_len] = texts[read].clone();
+            is_word_like[compact_len] = is_word_like[read];
+            kinds[compact_len] = kinds[read];
+        }
+        compact_len += 1;
+    }
+    texts.truncate(compact_len);
+    is_word_like.truncate(compact_len);
+    kinds.truncate(compact_len);
+    let mut starts_out = starts;
+    starts_out.truncate(compact_len);
+
+    MergedSegmentation {
+        len: compact_len,
+        texts,
+        text_parts: vec![],
+        is_word_like,
+        kinds,
+        starts: starts_out,
+        single_char_run_chars: vec![],
+        single_char_run_lengths: vec![],
+        contains_cjk: vec![],
+        contains_arabic_script: vec![],
+        ends_with_closing_quote: vec![],
+        ends_with_myanmar_medial_glue: vec![],
+        has_arabic_no_space_punctuation: vec![],
+    }
+}
+
 /// `mergeGlueConnectedTextRuns` — pretext analysis.ts:951.
 /// Fold chains of `glue`-kind segments into adjacent `text` runs; standalone glue
 /// clusters (no following text) are kept as glue kind. Byte-identical control flow.
@@ -710,8 +843,9 @@ fn build_merged_segmentation(
     };
     // Phase 2.2 downstream merge passes (pretext analysis.ts order):
     let seg = merge_glue_connected_text_runs(seg);
-    // TODO Phase 2.2: remaining 7 passes — merge_url_like_runs /
-    //   merge_url_query_runs / merge_numeric_runs / split_hyphenated_numeric_runs /
+    let seg = merge_url_like_runs(seg);
+    // TODO Phase 2.2: remaining 6 passes — merge_url_query_runs /
+    //   merge_numeric_runs / split_hyphenated_numeric_runs /
     //   merge_no_space_word_chains / carry_trailing_forward_sticky_across_cjk_boundary /
     //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
     seg
@@ -1508,5 +1642,99 @@ mod tests {
         assert_eq!(merged.texts[0], "·ab");
         assert_eq!(merged.kinds[0], SegmentBreakKind::Text);
         assert_eq!(merged.starts[0], 0);
+    }
+
+    /// `is_url_scheme_segment` matches /^[A-Za-z][A-Za-z0-9+.-]*:$/.
+    #[test]
+    fn url_scheme_segment_regex() {
+        assert!(is_url_scheme_segment("http:"));
+        assert!(is_url_scheme_segment("https:"));
+        assert!(is_url_scheme_segment("a:"));
+        assert!(is_url_scheme_segment("a1+-.:"));
+        assert!(!is_url_scheme_segment("http"));
+        assert!(!is_url_scheme_segment("://"));
+        assert!(!is_url_scheme_segment("1http:")); // starts with digit
+        assert!(!is_url_scheme_segment("http::")); // double colon
+        assert!(!is_url_scheme_segment("http /")); // space
+    }
+
+    /// `merge_url_like_runs`: `https:` + `//` + `host` boundary-absorbed into one Text.
+    #[test]
+    fn merge_url_like_schemes_slashes_fold() {
+        // 3 segments: ["https:", "//", "host"] all text kind.
+        let seg = MergedSegmentation {
+            len: 3,
+            texts: vec!["https:".into(), "//".into(), "host".into()],
+            text_parts: vec![vec![], vec![], vec![]],
+            is_word_like: vec![false, false, false],
+            kinds: vec![SegmentBreakKind::Text; 3],
+            starts: vec![0, 6, 8],
+            single_char_run_chars: vec![None, None, None],
+            single_char_run_lengths: vec![0; 3],
+            contains_cjk: vec![false; 3],
+            contains_arabic_script: vec![false; 3],
+            ends_with_closing_quote: vec![false; 3],
+            ends_with_myanmar_medial_glue: vec![false; 3],
+            has_arabic_no_space_punctuation: vec![false; 3],
+        };
+        let merged = merge_url_like_runs(seg);
+        assert_eq!(merged.len, 1);
+        assert_eq!(merged.texts[0], "https://host");
+        assert_eq!(merged.kinds[0], SegmentBreakKind::Text);
+        assert_eq!(merged.is_word_like[0], true); // promoted to true
+        assert_eq!(merged.starts[0], 0);
+    }
+
+    /// `merge_url_like_runs`: `www.` start absorbs up to space boundary.
+    #[test]
+    fn merge_url_like_www_runs_to_space() {
+        // ["www.", "foo", "bar"] text + [" "] space + ["after"] text.
+        let seg = MergedSegmentation {
+            len: 5,
+            texts: vec!["www.".into(), "foo".into(), "bar".into(), " ".into(), "after".into()],
+            text_parts: vec![vec![]; 5],
+            is_word_like: vec![false; 5],
+            kinds: vec![SegmentBreakKind::Text, SegmentBreakKind::Text, SegmentBreakKind::Text, SegmentBreakKind::Space, SegmentBreakKind::Text],
+            starts: vec![0, 4, 7, 10, 11],
+            single_char_run_chars: vec![None; 5],
+            single_char_run_lengths: vec![0; 5],
+            contains_cjk: vec![false; 5],
+            contains_arabic_script: vec![false; 5],
+            ends_with_closing_quote: vec![false; 5],
+            ends_with_myanmar_medial_glue: vec![false; 5],
+            has_arabic_no_space_punctuation: vec![false; 5],
+        };
+        let merged = merge_url_like_runs(seg);
+        assert_eq!(merged.len, 3); // ["www.foobar", " ", "after"]
+        assert_eq!(merged.texts[0], "www.foobar");
+        assert_eq!(merged.kinds[1], SegmentBreakKind::Space);
+        assert_eq!(merged.texts[2], "after");
+    }
+
+    /// `merge_url_like_runs`: query marker `?` in absorbed segment stops the run.
+    #[test]
+    fn merge_url_like_query_marker_stops_run() {
+        // ["http:", "//", "h", "?", "x"] all text — `?` ends query prefix → break after.
+        let seg = MergedSegmentation {
+            len: 5,
+            texts: vec!["http:".into(), "//".into(), "h".into(), "?".into(), "x".into()],
+            text_parts: vec![vec![]; 5],
+            is_word_like: vec![false; 5],
+            kinds: vec![SegmentBreakKind::Text; 5],
+            starts: vec![0, 5, 7, 8, 9],
+            single_char_run_chars: vec![None; 5],
+            single_char_run_lengths: vec![0; 5],
+            contains_cjk: vec![false; 5],
+            contains_arabic_script: vec![false; 5],
+            ends_with_closing_quote: vec![false; 5],
+            ends_with_myanmar_medial_glue: vec![false; 5],
+            has_arabic_no_space_punctuation: vec![false; 5],
+        };
+        let merged = merge_url_like_runs(seg);
+        assert_eq!(merged.len, 2); // ["http://h?", "x"]
+        assert_eq!(merged.texts[0], "http://h?");
+        assert_eq!(merged.texts[1], "x");
+        // note: "x" is text but no longer URL-promoted (its is_word_like stays false).
+        assert_eq!(merged.is_word_like[1], false);
     }
 }

@@ -20,6 +20,7 @@
 pub mod analysis;
 pub mod bidi;
 pub mod bidi_data;
+pub mod line_break;
 pub mod line_text;
 pub mod measurement;
 

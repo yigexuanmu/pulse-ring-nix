@@ -22,6 +22,7 @@
 //! every Phase is green and snapshotted.
 
 pub mod types;
+pub mod pretext;
 
 /// Placeholder entry — identical signature to the legacy
 /// `crate::lyricstyles::sonnet::build_frame`.

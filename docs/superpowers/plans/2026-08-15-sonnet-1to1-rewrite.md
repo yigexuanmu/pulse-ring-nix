@@ -992,3 +992,30 @@ After Phase 4: Phase 5 (Mg family — sonnetMg*.ts, heavy) → Phase 6 (scene
 builder) → Phase 7 (runtime shell createSonnetPixiRuntime → arena) → Phase 8
 (atlas/glyph raster FreeType/Harfbuzz integration) → Phase 9 (tuning wiring
 +GUI integration + verification).
+
+### Phase 6.1 — arena.rs landed ✅ (2026-08-16)
+
+- `src/lyricstyles/sonnet_v2/arena.rs` — 530 lines, X-architecture core.
+- Byte-identical 1:1 port of folia `GlyphView`/`SegmentView`/`ShotView`/`SceneView`
+  view-graph contracts. PIXI `Container`/`Text`/`Filter` handles → `SlotId` (u32)
+  indices into `Vec` flat-owned nodes; `updateAnimation` closures → precomputed
+  `GlyphAnimationState` carrier; `ghosts: GlyphGhostView[]` → `Vec<GhostEnvelope>`.
+- `SceneArena`: push/free slot reuse mirroring folia `sceneCache.delete`; flat
+  glyph/segment/shot/scene vec layout + per-index borrow + borrow_mut helpers.
+- `flatten_scene` stub returns empty `Vec<CharQuad>` (Phase 6.2 implements the
+  per-glyph emit walk mirroring folia `renderFrame`).
+- 5 arena tests green (SlotId null sentinel, push/free slot reuse, segment/shot/
+  scene indexing round-trip, flatten stub empty). HEAD `8ad3990` on origin,
+  sonnet_v2 tree 15,617 LOC, **238 tests** green.
+
+### Next session continuation seed (revised)
+
+**Phase 6.2 — scene builders + runtime shell**. The folia files remaining for
+Phase 6: `sonnetSceneBuilder.ts` (SceneView construction = arena `push_scene`/
+`push_shot` scaffolding), `sonnetTextViewBuilder.ts` (glyph/segment nodes =
+arena `push_glyph`/`push_segment`), then `createSonnetPixiRuntime.ts` (the
+745-line per-frame mutate pass → `flatten_scene` real body). These are the
+PIXI-coupled "render shell" files; the port replaces PIXI mutation with arena
+node field mutation and the automatic PIXI tick with `flatten_scene`. Phase 7
+(post-process filters → draw.rs WGSL `scene_at` chain) and Phase 8 (atlas
+FreeType coverage raster swap) come after the runtime lands.

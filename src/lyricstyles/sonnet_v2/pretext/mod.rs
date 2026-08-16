@@ -17,4 +17,10 @@
 //!
 //! See `docs/superpowers/plans/2026-08-15-sonnet-1to1-rewrite.md` Phase 2.
 
+pub mod analysis;
 pub mod bidi_data;
+
+/// Placeholder for the shared `Intl.Segmenter('word')` (Phase 2.6 layout.rs
+/// takes ownership of it via analysis.rs). Removed once `analysis.rs` builds
+/// its own segmenter struct.
+pub struct SharedWordSegmenter;

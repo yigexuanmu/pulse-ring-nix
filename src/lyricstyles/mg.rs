@@ -79,6 +79,19 @@ pub struct MgCanvas {
 const GOLDEN: f32 = 0.6180339887498949;
 
 impl MgCanvas {
+    /// Number of completed stroke primitives recorded. Test-only mirror of
+    /// PIXI `Graphics.geometry.graphicsData.length` — used by v2 scene shell
+    /// ports as a coarse parity witness (not a byte-exact renderer frontier).
+    pub fn strokes_count(&self) -> usize {
+        self.strokes.len()
+    }
+
+    /// Number of completed fill primitives recorded. Test-only mirror of
+    /// PIXI `Graphics.geometry.graphicsData.length` (fill sub-array).
+    pub fn fills_count(&self) -> usize {
+        self.fills.len()
+    }
+
     pub fn new() -> Self {
         Self::default()
     }
@@ -147,6 +160,28 @@ impl MgCanvas {
             .line_to(x + w, y + h)
             .line_to(x, y + h)
             .line_to(x, y);
+        self
+    }
+
+    /// `drawEllipse(x, y, rx, ry)` — mirrors PixiJS `Graphics.drawEllipse`, which
+    /// internally converts the ellipse into four cubic-bezier curves using the
+    /// standard ellipse-to-bezier approximation (kappa ≈ 0.5522847498307796).
+    /// `cx`,`cy` is the centre; `rx`,`ry` are the half-width and half-height.
+    pub fn ellipse(&mut self, cx: f32, cy: f32, rx: f32, ry: f32) -> &mut Self {
+        let kappa = 0.5522847498307796_f32;
+        let ox = rx * kappa; // horizontal offset of control points
+        let oy = ry * kappa; // vertical offset of control points
+        let right_x = cx + rx;
+        let left_x = cx - rx;
+        let top_y = cy - ry;
+        let bottom_y = cy + ry;
+        // Start at the rightmost point and trace the ellipse counter-clockwise
+        // via four cubic-bezier quarter-arcs (identical to PixiJS).
+        self.move_to(right_x, cy);
+        self.cubic_to(right_x, cy - oy, cx + ox, top_y, cx, top_y);
+        self.cubic_to(cx - ox, top_y, left_x, cy - oy, left_x, cy);
+        self.cubic_to(left_x, cy + oy, cx - ox, bottom_y, cx, bottom_y);
+        self.cubic_to(cx + ox, bottom_y, right_x, cy + oy, right_x, cy);
         self
     }
 

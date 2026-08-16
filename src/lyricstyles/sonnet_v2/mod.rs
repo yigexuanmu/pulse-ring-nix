@@ -32,6 +32,8 @@ pub mod pretext;
 pub mod program;
 pub mod random;
 pub mod semantic;
+pub mod staff_notation;
+pub mod staff_view;
 pub mod poster_blocks_layout;
 pub mod shot_flow_layouts;
 pub mod text_fixed_geo;

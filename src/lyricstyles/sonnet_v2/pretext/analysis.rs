@@ -295,7 +295,7 @@ pub fn analyze_text(
     }
     let merged = build_merged_segmentation(&normalized, profile, wsp);
     let segmentation = if word_break == WordBreakMode::KeepAll {
-        merge_keep_all_text_segments(&normalized, &merged, profile.break_keep_all_after_punctuation)
+        merge_keep_all_text_segments(&normalized, merged, profile.break_keep_all_after_punctuation)
     } else {
         merged
     };
@@ -1333,8 +1333,6 @@ fn build_merged_segmentation(
     let seg = split_hyphenated_numeric_runs(seg);
     let seg = merge_no_space_word_chains(seg);
     let seg = carry_trailing_forward_sticky_across_cjk_boundary(seg);
-    // TODO Phase 2.2: remaining 1 pass —
-    //   merge_keep_all_text_segments — ported in next commit.
     seg
 }
 
@@ -1739,29 +1737,163 @@ fn compile_analysis_chunks(
     chunks
 }
 
-/// Phase 2.2 placeholder: returns the segmentation unchanged until the
-/// full kinsoku / sticky-glue keep-all merge is transcribed.
-fn merge_keep_all_text_segments(
-    _normalized: &str,
+/// `mergeKeepAllTextSegments` — pretext analysis.ts:1388.
+/// Conditional post-pipeline pass invoked from `analyzeText` when
+/// WordBreakMode == KeepAll. Forms runs of consecutive TEXT segs by walking
+/// the merged array, starting a fresh group at the first TEXT seg and ending
+/// it at the first TEXT seg whose predecessor fails `canContinueKeepAllTextRun`
+/// (or at the next non-TEXT seg). Groups containing CJK are merged into a
+/// single text slice of the original normalized string; non-CJK groups are
+/// preserved individual-text-faithful (each original seg emitted unchanged).
+/// Returns a fresh `MergedSegmentation` whose aux vectors are deduced.
+
+fn ka_push_original(
+    texts: &mut Vec<String>,
+    is_word_like: &mut Vec<bool>,
+    kinds: &mut Vec<SegmentBreakKind>,
+    starts: &mut Vec<usize>,
     segmentation: &MergedSegmentation,
-    _break_after_punctuation: bool,
+    index: usize,
+) {
+    texts.push(segmentation.texts[index].clone());
+    is_word_like.push(segmentation.is_word_like[index]);
+    kinds.push(SegmentBreakKind::Text);
+    starts.push(segmentation.starts[index]);
+}
+
+/// Same as `ka_push_original` but slices the original normalized string from
+/// `starts[start]` to `starts[end]` (or end of string) in UTF-8 bytes. pretext
+/// uses UTF-16 code-unit indices to slice; since our `starts` array stores
+/// UTF-16 indices identical to pretext (port invariant from
+/// `build_merged_segmentation`), we must convert UTF-16 code-unit index → UTF-8
+/// byte offset via `.slice()`-equivalent char-range computation.
+fn ka_push_merged(
+    texts: &mut Vec<String>,
+    is_word_like: &mut Vec<bool>,
+    kinds: &mut Vec<SegmentBreakKind>,
+    starts: &mut Vec<usize>,
+    normalized: &str,
+    segmentation: &MergedSegmentation,
+    start: usize,
+    end: usize,
+) {
+    let n = segmentation.len;
+    let mut word_like = false;
+    for i in start..end {
+        word_like = word_like || segmentation.is_word_like[i];
+    }
+    let source_start = segmentation.starts[start];
+    let source_end = if end < n { segmentation.starts[end] } else { normalized.len() };
+    // `starts` are UTF-8 byte offsets into `normalized` (established in
+    // `build_merged_segmentation` via `word_segment.as_ptr() - norm_ptr`).
+    // TS uses UTF-16 code-unit indices with `.slice()`, but for BMP-only input
+    // those indices are identical to the Rust byte index only for ASCII (BMP
+    // wide chars are multi-byte UTF-8). The port contract is byte-offset-based
+    // consistently across every merge pass, so a byte slice is correct here.
+    texts.push(normalized[source_start..source_end].to_string());
+    is_word_like.push(word_like);
+    kinds.push(SegmentBreakKind::Text);
+    starts.push(source_start);
+}
+
+fn ka_flush_group(
+    texts: &mut Vec<String>,
+    is_word_like: &mut Vec<bool>,
+    kinds: &mut Vec<SegmentBreakKind>,
+    starts: &mut Vec<usize>,
+    group_start: &mut i64,
+    group_contains_cjk: &mut bool,
+    end: usize,
+    normalized: &str,
+    segmentation: &MergedSegmentation,
+) {
+    let gstart = *group_start;
+    if gstart < 0 { return; }
+    let gstart_idx = gstart as usize;
+    if *group_contains_cjk {
+        if gstart_idx + 1 == end {
+            ka_push_original(texts, is_word_like, kinds, starts, segmentation, gstart_idx);
+        } else {
+            ka_push_merged(texts, is_word_like, kinds, starts, normalized, segmentation, gstart_idx, end);
+        }
+    } else {
+        for i in gstart_idx..end {
+            ka_push_original(texts, is_word_like, kinds, starts, segmentation, i);
+        }
+    }
+    *group_start = -1;
+    *group_contains_cjk = false;
+}
+
+fn merge_keep_all_text_segments(
+    normalized: &str,
+    segmentation: MergedSegmentation,
+    break_after_punctuation: bool,
 ) -> MergedSegmentation {
+    let n = segmentation.len;
+    if n <= 1 {
+        return segmentation;
+    }
+
+    let mut texts: Vec<String> = vec![];
+    let mut is_word_like: Vec<bool> = vec![];
+    let mut kinds: Vec<SegmentBreakKind> = vec![];
+    let mut starts: Vec<usize> = vec![];
+
+    let mut group_start: i64 = -1; // TS sentinel: -1 = no group
+    let mut group_contains_cjk = false;
+
+    for i in 0..n {
+        let kind = segmentation.kinds[i];
+
+        if kind == SegmentBreakKind::Text {
+            if i > 0
+                && group_start >= 0
+                && !can_continue_keep_all_text_run(&segmentation.texts[i - 1], break_after_punctuation)
+            {
+                ka_flush_group(
+                    &mut texts, &mut is_word_like, &mut kinds, &mut starts,
+                    &mut group_start, &mut group_contains_cjk,
+                    i, normalized, &segmentation,
+                );
+            }
+            if group_start < 0 { group_start = i as i64; }
+            group_contains_cjk = group_contains_cjk || is_cjk(&segmentation.texts[i]);
+            continue;
+        }
+
+        ka_flush_group(
+            &mut texts, &mut is_word_like, &mut kinds, &mut starts,
+            &mut group_start, &mut group_contains_cjk,
+            i, normalized, &segmentation,
+        );
+        texts.push(segmentation.texts[i].clone());
+        is_word_like.push(segmentation.is_word_like[i]);
+        kinds.push(kind);
+        starts.push(segmentation.starts[i]);
+    }
+
+    ka_flush_group(
+        &mut texts, &mut is_word_like, &mut kinds, &mut starts,
+        &mut group_start, &mut group_contains_cjk,
+        n, normalized, &segmentation,
+    );
+
+    let len = texts.len();
     MergedSegmentation {
-        len: segmentation.len,
-        texts: segmentation.texts.clone(),
-        is_word_like: segmentation.is_word_like.clone(),
-        kinds: segmentation.kinds.clone(),
-        starts: segmentation.starts.clone(),
-        // Phase 2.2 stub: KeepAll currently returns a passthrough; downstream passes
-        // of build_merged_segmentation are identity stubs until follow-up commits.
-        text_parts: segmentation.text_parts.clone(),
-        single_char_run_chars: segmentation.single_char_run_chars.clone(),
-        single_char_run_lengths: segmentation.single_char_run_lengths.clone(),
-        contains_cjk: segmentation.contains_cjk.clone(),
-        contains_arabic_script: segmentation.contains_arabic_script.clone(),
-        ends_with_closing_quote: segmentation.ends_with_closing_quote.clone(),
-        ends_with_myanmar_medial_glue: segmentation.ends_with_myanmar_medial_glue.clone(),
-        has_arabic_no_space_punctuation: segmentation.has_arabic_no_space_punctuation.clone(),
+        len,
+        texts,
+        text_parts: vec![vec![]; len],
+        is_word_like,
+        kinds,
+        starts,
+        single_char_run_chars: vec![None; len],
+        single_char_run_lengths: vec![0; len],
+        contains_cjk: vec![false; len],
+        contains_arabic_script: vec![false; len],
+        ends_with_closing_quote: vec![false; len],
+        ends_with_myanmar_medial_glue: vec![false; len],
+        has_arabic_no_space_punctuation: vec![false; len],
     }
 }
 
@@ -2505,5 +2637,43 @@ mod tests {
         assert_eq!(merged.texts[0], "你好");
         assert_eq!(merged.texts[1], "「世界");
         assert_eq!(merged.starts[1], 2); // starts[0] + head_chars count (2)
+    }
+
+    /// `merge_keep_all_text_segments`: groups CJK text runs. Two adjacent CJK
+    /// text segments with no glue/keepglue boundary in between merge into one.
+    /// Routing via `analyze_text` with WordBreakMode::KeepAll kicks this path.
+    #[test]
+    fn merge_keep_all_merges_two_cjk_text_runs_to_one() {
+        // "你好 世界": split_word_bounds → ["你好", " ", "世界"]. Space is its
+        // own non-TEXT seg (space kind) → flushes group; each CJK run stays single.
+        // To test merge, we need two adjacent TEXT segs with CJK and no space
+        // between them: "你好world" → driver yields ["你","好","world"] (driver
+        // merge glue Connected runs already coalesces the CJK glue pair). Use a
+        // manual segmentation fixture instead, bypassing the driver.
+        // The driver-side glue pass already collapses '':',\u300c'-like tribbles,
+        // so we directly feed the unit a 3-seg arrangement: two text CJK runs +
+        // specific break_profile that allows them to continue.
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec!["你好".into(), "世界".into()],
+            text_parts: vec![vec![], vec![]],
+            is_word_like: vec![false; 2],
+            kinds: vec![SegmentBreakKind::Text; 2],
+            starts: vec![0, 6], // UTF-8 byte offsets: 你好 is 6 bytes
+            single_char_run_chars: vec![None; 2],
+            single_char_run_lengths: vec![0; 2],
+            contains_cjk: vec![true; 2],
+            contains_arabic_script: vec![false; 2],
+            ends_with_closing_quote: vec![false; 2],
+            ends_with_myanmar_medial_glue: vec![false; 2],
+            has_arabic_no_space_punctuation: vec![false; 2],
+        };
+        // normalized = "你好世界" (12 UTF-8 bytes); break_after_punctuation=false
+        // so can_continue returns true (its first call ends_with_keep_all_glue is
+        // also false). One group spanning both segs; merged slice = whole text.
+        let out = merge_keep_all_text_segments("你好世界", seg, false);
+        assert_eq!(out.len, 1);
+        assert_eq!(out.texts[0], "你好世界");
+        assert_eq!(out.kinds[0], SegmentBreakKind::Text);
     }
 }

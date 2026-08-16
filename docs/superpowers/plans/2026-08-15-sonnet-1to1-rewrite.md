@@ -769,3 +769,47 @@ PLAN 显示三个 待补缺漏（已在自检发现并补进 Phase 9 末尾）�
 **3. 类型一致性** — Phase 1 `LyricWord::syllables` 在 Phase 3.2 grapheme_timing 实现被 `word.syllables` 消费；Phase 3 的 `SceneArena` 在 Phase 6 重构本文定义，Phase 9.1 使用。`SonnetTransitionFrame` 用 Phase 3.7 定义名，Phase 8.2 填充触发一致（如改 named fork 立即自检再改正）。
 
 完成。下一步交执行：**主会话亲自**按 Phase 0→9 顺序逐任务实现（不 fan-out，access tier 限时限 confirmed），每任务 TDD + cargo check + commit，最后 GUI 自检。
+
+---
+
+## 进度日志
+
+### 2026-08-16 主体会话 Phase 0-2.2 部分完成（HEAD = 5d3ac13）
+
+**11 个新 commit 已 push origin `feat/sonnet-1to1-rewrite`**（1577 行 Rust，51 个单元测试绿）：
+
+| 阶段 | commit | 内容 |
+|---|---|---|
+| Phase 0.1 | `f360a9d` | flake.nix freetype+harfbuzz 接 buildInputs+devShell |
+| Phase 0.2 | `81aae0e` | Cargo.toml 加 freetype-sys/harfbuzz_rs/unicode-segmentation/unicode-bidi/unicode-general-category + sonnet_v2 骨架（mod.rs + types.rs） |
+| Phase 1.1 | `7f44200` | LyricLine 扩 words/song_part/block_index/chorus_flag + 11 个构造点批改 + 单测 |
+| Phase 1.2 | `66446df` | lyricfetch splayer.yrcData + jsonparse.wordsTiming 填 words Vec |
+| Phase 2.1 | `4d9f143` | pretext bidi_data byte-identical 256 Latin-1 表 + 714 ranges + 抽样测 |
+| Phase 2.2 | `9510bce` | analysis 框架（normalize_normal / normalize_pre_wrap / split_word_bounds UAX#29 + classify_segment + compile_analysis_chunks」（stub） |
+| Phase 2.2 | `f4590c1` | analysis sticky-glue + kinsoku 集（kinsokuStart/End、leftStickyPunctuation、forwardStickyGlue、closingQuoteChars、keepAllGlue/DashBreak、arabicNoSpaceTrailing、myanmarMedialGlue、numericJoiner、noSpaceWordBreakAfter）+ ends_with_closing_quote/previousCodePointStart/getLastCodePoint/endsWithLineStartProhibitedText/canContinueKeepAllTextRun |
+| Phase 2.2 | `c3b43e0` | classify_segment_break_char 单字符 + split_segment_by_break_kind 整段同 kind 切分 |
+| wire | `5d3ac13` | mod.rs 漏 add `pub mod pretext;` 修复 |
+
+### 仍待（剩余 ~13,000 行 TS → ~6,500 行 Rust）
+
+下一 commit 续接：先把 Cargo 加 `unicode-general-category` crate（combiningMarkRe `\p{M}` 需要 Mn/Mc/Me 判定）+ 译 `build_merged_segmentation` driver 主体（per-piece sticky-merge dispatch + materialize + escaped-quote pass + forward-sticky carry pass + compact ~260 行）+ 前置 helper `is_line_break_numeric_affix` / `is_left_sticky_punctuation_segment` / `is_cjk_line_start_prohibited_segment` / `is_forward_sticky_cluster_segment` / `is_escaped_quote_cluster_segment` / `get_repeatable_single_char_run_char` / `materialize_deferred_single_char_run` / `has_arabic_no_space_punctuation` / `ends_with_myanmar_medial_glue` / `split_leading_space_and_marks`。driver 末尾按 TS 顺序串 8 个下游 merge_pass pipeline，每个独立 commit + cargo test 绿。
+
+### cargo env 绕开（worktree nix develop flake self-ref 缓存异常）
+
+`/tmp/sonnet-rewrite` 内 `nix develop` 因 flake.lock self-ref 缓存锁死老的非法 git sha `d26d71a4` 不可用。绕开方法：从主 repo `/home/mioha/pulse-ring-nix-connet` 起 `nix develop` 进程，把它的 devShell env + freetype/harfbuzz store 路径透传给 worktree cargo：
+
+```bash
+FT=$(nix build --print-out-paths nixpkgs#freetype)
+HB=$(nix build --print-out-paths nixpkgs#harfbuzz)
+cd /home/mioha/pulse-ring-nix-connet
+nix develop -c bash -c '
+  export PKG_CONFIG_PATH="'"$FT"'/lib/pkgconfig:'"$HB"'/lib/pkgconfig:$PKG_CONFIG_PATH"
+  export LD_LIBRARY_PATH="'"$FT"'/lib:'"$HB"'/lib:$LD_LIBRARY_PATH"
+  cd /tmp/sonnet-rewrite
+  cargo test --bin pulse-ring
+'
+```
+
+### Task 追踪
+- Task #33 `[Rewrite-V2] folia sonnet 编译器级 1:1 移植（9 Phase 全量推倒重做）` — 父任务 in_progress
+- Task #32 `[Verify-V1] 核实子 agent：双分支构建+预览+GUI 全绿自测` — blocked by #33 完成 GUI 接线

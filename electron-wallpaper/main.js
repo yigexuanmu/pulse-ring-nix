@@ -1,7 +1,7 @@
 // pulse-ring 网页壁纸渲染器（Electron 离屏）
 //
 // 用法：electron main.js <html路径> <宽度> <高度>
-// 通过 capturePage 定时抓帧，把页面帧按 stdout 输出：
+// 通过 Chromium offscreen paint 事件生帧，把页面帧按 stdout 输出：
 //   [4 字节 LE 宽][4 字节 LE 高][宽*高*4 字节 RGBA]
 // 从 stdin 读取带类型的消息：
 //   0x00 + 128 x f32 + energy f32
@@ -10,7 +10,7 @@
 //   0x03 + u32 JSON 长度 + JSON (playback → pulse-playback)
 //   0x04 + u32 JSON 长度 + JSON (theme   → pulse-theme)
 
-const { app, BrowserWindow, screen } = require('electron');
+const { app, BrowserWindow } = require('electron');
 const path = require('path');
 
 // htmlPath / width / height 从环境变量读, 不再用 argv 位置参数.
@@ -191,10 +191,9 @@ app.whenReady().then(() => {
       preload: path.join(__dirname, 'preload.js'),
     },
   });
-  win.webContents.setFrameRate(30);
   // File target 走 loadFile (本地打包的 folia React bundle);
   // 远程 URL (folia OBS browser source) 走 loadURL — 页面自己从其 SSE 后端
-  // 拿歌词/进度/频谱, pulse-ring 只 capturePage 抓帧.
+  // 拿歌词/进度/频谱, pulse-ring 只 capturePage 抓帧. （paint 事件在下面装上。）
   if (htmlIsUrl) win.loadURL(htmlPath); else win.loadFile(htmlPath);
   win.webContents.on('did-finish-load', () => {
     if (latestConfig) win.webContents.send('pulse-config', latestConfig);
@@ -203,28 +202,20 @@ app.whenReady().then(() => {
     if (latestTheme) win.webContents.send('pulse-theme', latestTheme);
   });
 
-  // 隐藏窗口的离屏 paint 事件只触发前 1-2 帧就停止（Electron 已知行为），
-  // 改用 capturePage 定时抓帧：稳定 ~30fps。
-  const captureTimer = () => {
-    // 定时器链必须永远延续：paused（stdout 忙）时只跳过本帧，绝不断链，
-    // 否则管道一忙就永久停帧（表现为"跑一会儿卡住"）。
-    if (!win || win.isDestroyed()) return;
-    const schedule = () => setTimeout(captureTimer, 33); // ~30fps
-    if (paused) { schedule(); return; }
-    win.webContents.capturePage()
-      .then((image) => {
-        const size = image.getSize();
-        if (size.width === 0 || size.height === 0) return;
-        // Electron 位图 native 是 BGRA，与 Rust wgpu overlay texture (Bgra8UnormSrgb)
-        // 一致，直接发，不做 BGRA→RGBA 软件循环（2560×1600×4 16MB 字节约一半字节
-        // 是烫手续性工作，实测 conv=19-26ms/帧）。
-        const bgra = image.toBitmap();
-        writeFrame(bgra, size.width, size.height);
-      })
-      .catch(() => {})
-      .finally(schedule);
-  };
-  setTimeout(captureTimer, 300); // 等页面加载后开始
+  // 用 Electron 官方 offscreen paint 事件抓帧（不再 capturePage 轮询）。
+  // Chromium 合成完一帧就主动推 paint 事件 — 事件驱动、无 Promise/readback 开销、
+  // 无 setTimeout 轮询延迟。实测纯 folia 原版走 paint 事件 57fps，而 capturePage
+  // 轮询因每帧 GPU readback + Promise 串行 + stdout 管道回流被压在 15fps。
+  // setFrameRate(60) 让 Chromium 以 60fps 上限推帧；管道忙(paused)时早返回丢弃本帧，
+  // 下一帧 Chromium 自然再推过来，绝不串行阻塞。
+  win.webContents.on('paint', (event, dirty, image) => {
+    if (paused || outputClosed || !win || win.isDestroyed()) return;
+    const size = image.getSize();
+    if (size.width === 0 || size.height === 0) return;
+    const bgra = image.toBitmap();
+    writeFrame(bgra, size.width, size.height);
+  });
+  win.webContents.setFrameRate(60);
 
   win.webContents.on('did-fail-load', (_e, code, desc) => {
     console.error(`web wallpaper load failed (${code}): ${desc}`);

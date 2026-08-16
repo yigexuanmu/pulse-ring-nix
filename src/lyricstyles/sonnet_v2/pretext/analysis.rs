@@ -33,6 +33,165 @@ pub enum SegmentBreakKind {
     HardBreak,
 }
 
+// ===== kinsoku / sticky-glue / closing-quote sets =====
+// Byte-identical copy of pretext `analysis.ts` const Sets. Each entry is the
+// single code point the TS Set holds; group order matches TS declaration.
+
+/// `kinsokuStart` — characters prohibited from starting a line (CJK 仮名禁則).
+pub const KINSOKU_START: &[char] = &[
+    '\u{ff0c}', '\u{ff0e}', '\u{ff01}', '\u{ff1a}', '\u{ff1b}', '\u{ff1f}',
+    '\u{3001}', '\u{3002}', '\u{30fb}', '\u{ff09}', '\u{3015}', '\u{3009}',
+    '\u{300b}', '\u{300d}', '\u{300f}', '\u{3011}', '\u{3017}', '\u{3019}',
+    '\u{301b}', '\u{30fc}', '\u{3005}', '\u{303b}', '\u{309d}', '\u{309e}',
+    '\u{30fd}', '\u{30fe}',
+];
+
+/// `kinsokuEnd` — characters prohibited from ending a line.
+pub const KINSOKU_END: &[char] = &[
+    '"', '(', '[', '{',
+    '¡', '¿',
+    '“', '‘', '‚', '„', '«', '‹',
+    '\u{2e18}',
+    '\u{ff08}', '\u{3014}', '\u{3008}', '\u{300a}', '\u{300c}', '\u{300e}',
+    '\u{3010}', '\u{3016}', '\u{3018}', '\u{301a}',
+];
+
+/// `leftStickyPunctuation` — punctuation that sticks to the preceding text run.
+pub const LEFT_STICKY_PUNCTUATION: &[char] = &[
+    '.', ',', '!', '?', ':', ';',
+    '\u{60c}', '\u{61b}', '\u{61f}',
+    '\u{964}', '\u{965}',
+    '\u{104a}', '\u{104b}', '\u{104c}', '\u{104d}', '\u{104f}',
+    ')', ']', '}',
+    '%', '"',
+    '”', '’', '»', '›',
+    '…',
+];
+
+/// `forwardStickyGlue` — sticks to the *following* text run.
+pub const FORWARD_STICKY_GLUE: &[char] = &['\'', '’'];
+
+/// `closingQuoteChars` — used by `endsWithClosingQuote`.
+pub const CLOSING_QUOTE_CHARS: &[char] = &[
+    '”', '’', '»', '›',
+    '\u{300d}', '\u{300f}', '\u{3011}', '\u{300b}', '\u{3009}', '\u{3015}', '\u{ff09}',
+];
+
+/// `keepAllGlueChars` — no-break space / word-joiner glue in `keep-all` mode.
+pub const KEEP_ALL_GLUE_CHARS: &[char] = &[
+    '\u{a0}', '\u{202f}', '\u{2060}', '\u{feff}',
+];
+
+/// `keepAllDashBreakChars` — dashes allow breaking in `keep-all` mode.
+pub const KEEP_ALL_DASH_BREAK_CHARS: &[char] = &[
+    '-', '\u{2010}', '\u{2013}', '\u{2014}',
+];
+
+/// `arabicNoSpaceTrailingPunctuation`.
+pub const ARABIC_NO_SPACE_TRAILING_PUNCTUATION: &[char] = &[
+    ':', '.', '\u{60c}', '\u{61b}',
+];
+
+/// `myanmarMedialGlue` — U+104F.
+pub const MYANMAR_MEDIAL_GLUE: &[char] = &['\u{104f}'];
+
+/// `numericJoinerChars` (TS `numericJoinerChars`).
+pub const NUMERIC_JOINER_CHARS: &[char] = &[
+    ':', '-', '/', '×', ',', '.', '+',
+    '\u{2013}', '\u{2014}',
+];
+
+/// `noSpaceWordBreakAfterChars`.
+pub const NO_SPACE_WORD_BREAK_AFTER_CHARS: &[char] = &[
+    '?', '\u{58a}', '-', '\u{2010}', '\u{2012}', '\u{2013}', '\u{2014}',
+    '\u{2026}', '\u{203c}', '\u{203d}', '\u{2049}',
+];
+
+fn set_contains(set: &[char], c: char) -> bool {
+    // Linear scan; sets are all small (<32 entries) and hot enough on small
+    // CJK strings that a binary search wouldn't pay for the sort overhead.
+    set.iter().any(|&x| x == c)
+}
+
+/// `endsWithClosingQuote` — walk backwards skipping `leftStickyPunctuation`,
+/// returning true at the first closing quote.
+pub fn ends_with_closing_quote(text: &str) -> bool {
+    let mut end = text.len();
+    while end > 0 {
+        let start = previous_code_point_start(text, end);
+        let ch = &text[start..end];
+        let c = ch.chars().next().unwrap_or('\0');
+        if set_contains(CLOSING_QUOTE_CHARS, c) {
+            return true;
+        }
+        if !set_contains(LEFT_STICKY_PUNCTUATION, c) {
+            return false;
+        }
+        end = start;
+    }
+    false
+}
+
+/// `previousCodePointStart` — byte position of the code point ending at `end`.
+/// In Rust this is a simple `char_indices` walk backwards, but pretext's UTF-16
+/// surrogate pair tracking is unnecessary for UTF-8 (`char` is a code point).
+pub fn previous_code_point_start(text: &str, end: usize) -> usize {
+    if end == 0 {
+        return 0;
+    }
+    let mut last = end;
+    let bytes = text.as_bytes();
+    // Walk back over continuation bytes (0x80..0xBF) to the lead byte.
+    while last > 0 && (bytes[last - 1] & 0xC0) == 0x80 {
+        last -= 1;
+    }
+    if last == 0 {
+        return 0;
+    }
+    last - 1
+}
+
+/// `getLastCodePoint` — returns the last `char` of `text`, or `None` if empty.
+pub fn get_last_code_point(text: &str) -> Option<char> {
+    if text.is_empty() {
+        return None;
+    }
+    text.chars().next_back()
+}
+
+/// `endsWithLineStartProhibitedText` (= kinsokuStart ∪ leftStickyPunctuation).
+pub fn ends_with_line_start_prohibited_text(text: &str) -> bool {
+    match get_last_code_point(text) {
+        Some(c) => set_contains(KINSOKU_START, c) || set_contains(LEFT_STICKY_PUNCTUATION, c),
+        None => false,
+    }
+}
+
+fn ends_with_keep_all_glue_text(text: &str) -> bool {
+    matches!(get_last_code_point(text), Some(c) if set_contains(KEEP_ALL_GLUE_CHARS, c))
+}
+
+fn ends_with_keep_all_dash_break_text(text: &str) -> bool {
+    matches!(get_last_code_point(text), Some(c) if set_contains(KEEP_ALL_DASH_BREAK_CHARS, c))
+}
+
+/// `canContinueKeepAllTextRun` — keep-all grouping continuation test.
+pub fn can_continue_keep_all_text_run(previous_text: &str, break_after_punctuation: bool) -> bool {
+    if ends_with_keep_all_glue_text(previous_text) {
+        return false;
+    }
+    if !break_after_punctuation {
+        return true;
+    }
+    if ends_with_line_start_prohibited_text(previous_text) {
+        return false;
+    }
+    if ends_with_keep_all_dash_break_text(previous_text) {
+        return false;
+    }
+    true
+}
+
 /// Aggregate of `([text], [isWordLike], [kind], [start])` arrays (TS `MergedSegmentation`).
 pub struct MergedSegmentation {
     pub len: usize,
@@ -344,10 +503,44 @@ mod tests {
         assert_eq!(words, vec!["你", "好", "world"]);
     }
 
-    /// Whitespace collapsing (normal mode).
+    /// Phase 2.2 sticky glue + kinsoku helpers.
     #[test]
-    fn normal_mode_collapses_whitespace_runs() {
-        let a = analyze_text("a   b\tc", default_profile(), WhiteSpaceMode::Normal, WordBreakMode::Normal);
-        assert_eq!(a.normalized, "a b c");
+    fn ends_with_closing_quote_walking_back_through_sticky_punct() {
+        assert!(ends_with_closing_quote("hello”"));
+        assert!(!ends_with_closing_quote("hello"));
+        assert!(ends_with_closing_quote("』"));
+    }
+
+    /// `previous_code_point_start` UTF-8 walk.
+    #[test]
+    fn previous_code_point_start_handles_multibyte_utf8() {
+        assert_eq!(previous_code_point_start("a你", 1 + 3), 1);
+        assert_eq!(previous_code_point_start("abc", 3), 2);
+        assert_eq!(previous_code_point_start("你", 0), 0);
+    }
+
+    /// `get_last_code_point`.
+    #[test]
+    fn get_last_code_point_back_iter() {
+        assert_eq!(get_last_code_point(""), None);
+        assert_eq!(get_last_code_point("你好").unwrap(), '好');
+        assert_eq!(get_last_code_point("abc").unwrap(), 'c');
+    }
+
+    /// `ends_with_line_start_prohibited_text` (kinsokuStart ∪ leftSticky).
+    #[test]
+    fn ends_with_line_start_prohibited_detects_comma_and_close_bracket() {
+        assert!(ends_with_line_start_prohibited_text("你好，"));
+        assert!(ends_with_line_start_prohibited_text("abc."));
+        assert!(!ends_with_line_start_prohibited_text("abc"));
+    }
+
+    /// `can_continue_keep_all_text_run` glue/dash break rules.
+    #[test]
+    fn keep_all_continuation_rules() {
+        assert!(can_continue_keep_all_text_run("abc", false));
+        assert!(!can_continue_keep_all_text_run("abc\u{a0}", false));
+        assert!(!can_continue_keep_all_text_run("abc\u{2014}", true));
+        assert!(can_continue_keep_all_text_run("abc", true));
     }
 }

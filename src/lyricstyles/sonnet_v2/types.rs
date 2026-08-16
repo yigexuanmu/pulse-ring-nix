@@ -128,10 +128,15 @@ pub struct LineTransitionTiming {
     pub line_pass_hold: f64,
 }
 
-/// folia `types.ts` — `Line`. Minimal subset consumed by `grapheme_timing` /
-/// `render_hints`. Full field set (translation / id / agentId / romanisation /
-/// alternateTexts / backgroundVocals / chorusEffect) lands in Phase 3.9 alongside
-/// `SonnetProgram`.
+/// folia `types.ts` — `Line`.
+///
+/// Carries the contract fields consumed by `sonnetProgram` + `sonnetSemantic`:
+/// `startTime`/`endTime` (seconds), `fullText`, `words`, `blockIndex?`,
+/// `songPart?`, `isChorus?`, and cached `renderHints?`. The optional renderer-only
+/// extras (translation / id / agentId / romanisation / alternateTexts /
+/// backgroundVocals / chorusEffect) are not consumed by the pure-algorithm layer
+/// and so are omitted. Times are seconds, matching the folia `number` contract
+/// 1:1.
 #[derive(Debug, Clone)]
 pub struct Line {
     pub words: Vec<Word>,
@@ -139,13 +144,20 @@ pub struct Line {
     pub start_time: f64,
     /// Seconds (>= start_time).
     pub end_time: f64,
-    /// The string shown to the user; may include whitespace / punctuation not
+    /// The string shown to user; may include whitespace / punctuation not
     /// present in `words[]`.
     pub full_text: String,
     /// Cached render hints. The pure-algorithm port calls `build_line_render_hints`
     /// lazily when this is `None`; the migrate/ensure family populates it for later
     /// visualizers that read `line.renderHints` directly.
     pub render_hints: Option<LineRenderHints>,
+    /// folia `blockIndex?: number` — structural block grouping for metadata
+    /// paragraph boundaries.
+    pub block_index: Option<usize>,
+    /// folia `songPart?: string` — section tag ('verse'/'chorus'/'bridge'/…).
+    pub song_part: Option<String>,
+    /// folia `isChorus?: boolean` — explicit chorus flag (may be unset).
+    pub is_chorus: bool,
 }
 
 impl Line {
@@ -192,6 +204,18 @@ pub enum SonnetShotKind {
     PosterBlocks,
     QuietTableau,
 }
+
+/// folia `sonnet/types.ts` — `SONNET_SHOT_KINDS` (order matters for
+/// deterministic distribution across shots).
+pub const SONNET_SHOT_KINDS: &[SonnetShotKind] = &[
+    SonnetShotKind::EditorialColumn,
+    SonnetShotKind::TypeImpact,
+    SonnetShotKind::FragmentCollage,
+    SonnetShotKind::TrackingRibbon,
+    SonnetShotKind::MaskReveal,
+    SonnetShotKind::PosterBlocks,
+    SonnetShotKind::QuietTableau,
+];
 
 /// folia `sonnet/types.ts` — `SONNET_TRANSITION_KINDS` (order matters for deterministic round-robin).
 pub const SONNET_TRANSITION_KINDS: &[SonnetTransitionKind] = &[

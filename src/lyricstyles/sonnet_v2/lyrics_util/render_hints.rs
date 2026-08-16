@@ -160,6 +160,9 @@ pub fn build_line_render_hints_for_window(
         end_time: *end_time,
         full_text: String::new(),
         render_hints: None,
+        block_index: None,
+        song_part: None,
+        is_chorus: false,
     });
     let line = &line_ref;
 
@@ -292,6 +295,9 @@ mod tests {
             end_time: end,
             full_text: "".to_string(),
             render_hints: None,
+            block_index: None,
+            song_part: None,
+            is_chorus: false,
         }
     }
 

@@ -231,6 +231,9 @@ mod tests {
             end_time: end,
             full_text: text.to_string(),
             render_hints: None,
+            block_index: None,
+            song_part: None,
+            is_chorus: false,
         }
     }
 

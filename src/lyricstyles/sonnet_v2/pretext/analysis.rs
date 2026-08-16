@@ -720,6 +720,90 @@ pub fn merge_numeric_runs(seg: MergedSegmentation) -> MergedSegmentation {
     }
 }
 
+/// `splitHyphenatedNumericRuns` — pretext analysis.ts:898.
+/// UNFOLDS numeric runs that contain ASCII hyphen `-` when EVERY part recovering
+/// from a `'-'` split is a nonempty decimal-digit numeric segment. Each split-off
+/// piece carries a trailing `-` EXCEPT the last (preserving the original text exactly
+/// when concatenated). Byte-identical control flow + UTF-16 code-unit length
+/// semantics (Rust uses `chars().count()` so multi-byte joiners like en/em dash
+/// DON'T introduce drift).
+pub fn split_hyphenated_numeric_runs(seg: MergedSegmentation) -> MergedSegmentation {
+    let len = seg.len;
+    let in_texts = seg.texts;
+    let in_is_word_like = seg.is_word_like;
+    let in_kinds = seg.kinds;
+    let in_starts = seg.starts;
+
+    let mut texts: Vec<String> = vec![];
+    let mut is_word_like: Vec<bool> = vec![];
+    let mut kinds: Vec<SegmentBreakKind> = vec![];
+    let mut starts: Vec<usize> = vec![];
+
+    let mut i = 0usize;
+    while i < len {
+        let text = &in_texts[i];
+        if in_kinds[i] == SegmentBreakKind::Text && text.contains('-') {
+            let parts: Vec<&str> = text.split('-').collect();
+            let mut should_split = parts.len() > 1;
+            if should_split {
+                for part in &parts {
+                    if part.is_empty()
+                        || !segment_contains_decimal_digit(part)
+                        || !is_numeric_run_segment(part)
+                    {
+                        should_split = false;
+                        break;
+                    }
+                }
+            }
+
+            if should_split {
+                let mut offset: usize = 0;
+                for (j, part) in parts.iter().enumerate() {
+                    let split_text = if j < parts.len() - 1 {
+                        format!("{}-", part)
+                    } else {
+                        part.to_string()
+                    };
+                    texts.push(split_text.clone());
+                    is_word_like.push(true);
+                    kinds.push(SegmentBreakKind::Text);
+                    starts.push(in_starts[i] + offset);
+                    // TS: offset += splitText.length — string length in UTF-16
+                    // code units. Rust uses `chars().count()` so multi-byte
+                    // joiners (en/em dash) count once, byte-identical to TS.
+                    offset += split_text.chars().count();
+                }
+                i += 1;
+                continue;
+            }
+        }
+
+        texts.push(text.clone());
+        is_word_like.push(in_is_word_like[i]);
+        kinds.push(in_kinds[i]);
+        starts.push(in_starts[i]);
+        i += 1;
+    }
+
+    let new_len = texts.len();
+    MergedSegmentation {
+        len: new_len,
+        texts,
+        text_parts: vec![],
+        is_word_like,
+        kinds,
+        starts,
+        single_char_run_chars: vec![],
+        single_char_run_lengths: vec![],
+        contains_cjk: vec![],
+        contains_arabic_script: vec![],
+        ends_with_closing_quote: vec![],
+        ends_with_myanmar_medial_glue: vec![],
+        has_arabic_no_space_punctuation: vec![],
+    }
+}
+
 /// `mergeGlueConnectedTextRuns` — pretext analysis.ts:951.
 /// Fold chains of `glue`-kind segments into adjacent `text` runs; standalone glue
 /// clusters (no following text) are kept as glue kind. Byte-identical control flow.
@@ -1012,8 +1096,9 @@ fn build_merged_segmentation(
     let seg = merge_url_like_runs(seg);
     let seg = merge_url_query_runs(seg);
     let seg = merge_numeric_runs(seg);
-    // TODO Phase 2.2: remaining 4 passes — split_hyphenated_numeric_runs /
-    //   merge_no_space_word_chains / carry_trailing_forward_sticky_across_cjk_boundary /
+    let seg = split_hyphenated_numeric_runs(seg);
+    // TODO Phase 2.2: remaining 3 passes — merge_no_space_word_chains /
+    //   carry_trailing_forward_sticky_across_cjk_boundary /
     //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
     seg
 }
@@ -2036,5 +2121,66 @@ mod tests {
         let merged = merge_numeric_runs(seg);
         assert_eq!(merged.len, 2); // both standalone, not merged
         assert_eq!(merged.is_word_like[0], false);
+    }
+
+    /// `split_hyphenated_numeric_runs`: "2024-01-01" splits into three Text segs,
+    /// first two carrying trailing `-`, with start offsets accumulating by UTF-16
+    /// code-unit length of each split part.
+    #[test]
+    fn split_hyphenated_numeric_unfolds_date() {
+        // Single text run "2024-01-01" (already merged by pass 4) → 3 splits.
+        let seg = MergedSegmentation {
+            len: 1,
+            texts: vec!["2024-01-01".into()],
+            text_parts: vec![vec![]],
+            is_word_like: vec![true],
+            kinds: vec![SegmentBreakKind::Text],
+            starts: vec![100],
+            single_char_run_chars: vec![None],
+            single_char_run_lengths: vec![0],
+            contains_cjk: vec![false],
+            contains_arabic_script: vec![false],
+            ends_with_closing_quote: vec![false],
+            ends_with_myanmar_medial_glue: vec![false],
+            has_arabic_no_space_punctuation: vec![false],
+        };
+        let merged = split_hyphenated_numeric_runs(seg);
+        assert_eq!(merged.len, 3);
+        assert_eq!(merged.texts[0], "2024-");
+        assert_eq!(merged.texts[1], "01-");
+        assert_eq!(merged.texts[2], "01");
+        assert_eq!(merged.starts[0], 100);
+        assert_eq!(merged.starts[1], 105); // + "2024-".length=5 (UTF-16 units)
+        assert_eq!(merged.starts[2], 108); // + "01-".length=3
+        assert_eq!(merged.is_word_like[0], true);
+    }
+
+    /// `split_hyphenated_numeric_runs`: "-12" or "12-" contains '-' but the last
+    /// part is empty OR not numeric — `shouldSplit` stays false → kept as one seg.
+    #[test]
+    fn split_hyphenated_numeric_keeps_empty_or_non_digit_runs() {
+        // "-12": parts = ["","12"], "" is empty → shouldSplit=false (unchanged).
+        // "12--34": parts = ["12","","34"], middle empty → shouldSplit=false.
+        // "abc-xyz": parts = ["abc","xyz"], `abc` is not numeric_run_segment → false.
+        for case in ["-12", "12--34", "abc-xyz"] {
+            let seg = MergedSegmentation {
+                len: 1,
+                texts: vec![case.into()],
+                text_parts: vec![vec![]],
+                is_word_like: vec![true],
+                kinds: vec![SegmentBreakKind::Text],
+                starts: vec![0],
+                single_char_run_chars: vec![None],
+                single_char_run_lengths: vec![0],
+                contains_cjk: vec![false],
+                contains_arabic_script: vec![false],
+                ends_with_closing_quote: vec![false],
+                ends_with_myanmar_medial_glue: vec![false],
+                has_arabic_no_space_punctuation: vec![false],
+            };
+            let merged = split_hyphenated_numeric_runs(seg);
+            assert_eq!(merged.len, 1, "case \"{}\" should NOT be split", case);
+            assert_eq!(merged.texts[0], case);
+        }
     }
 }

@@ -500,6 +500,266 @@ pub fn split_segment_by_break_kind(
     pieces
 }
 
+// ===== Unicode character classes (TS `combiningMarkRe`/`arabicScriptRe`/`decimalDigitRe`) =====
+// `combiningMarkRe = /\p{M}/u` → Mn | Mc | Me (Mark categories).
+use unicode_general_category::{get_general_category, GeneralCategory as Gc};
+
+/// `/\p{M}/u` — true for Mark categories (Mn/Mc/Me). Byte-identical to pretext `combiningMarkRe.test(ch)`.
+pub fn is_combining_mark(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        Gc::NonspacingMark | Gc::SpacingMark | Gc::EnclosingMark
+    )
+}
+
+/// `/\p{Nd}/u` — true for the Decimal Number (Nd) category.
+pub fn is_decimal_digit_char(ch: char) -> bool {
+    get_general_category(ch) == Gc::DecimalNumber
+}
+
+/// `arabicScriptRe = /\p{Script=Arabic}/u` — hard Unicode script ranges for Arabic
+/// (main, supplement, extended A/B/C, presentation forms A/B, SIYAK). Byte-identical.
+pub const ARABIC_SCRIPT_RANGES: &[(u32, u32)] = &[
+    (0x0600, 0x0604), (0x0606, 0x06DC), (0x06DE, 0x06FF),
+    (0x0750, 0x077F),
+    (0x0870, 0x0888), (0x088A, 0x088E), (0x0890, 0x0891), (0x0898, 0x089F),
+    (0x08A0, 0x08FF),
+    (0xFB1D, 0xFB4F),
+    (0xFB50, 0xFDFF),
+    (0xFE70, 0xFEFF),
+    (0x10E60, 0x10E7F),
+    (0x1EE00, 0x1EEFF),
+];
+
+/// `arabicScriptRe.test(text)` — true iff *any* code point falls in an Arabic script range.
+pub fn contains_arabic_script(text: &str) -> bool {
+    text.chars().any(|c| {
+        let u = c as u32;
+        ARABIC_SCRIPT_RANGES.iter().any(|&(s, e)| u >= s && u <= e)
+    })
+}
+
+/// `lineBreakNumericAffixRanges` — UAX #14 PR/PO class code points (flat start/end pairs).
+pub const LINE_BREAK_NUMERIC_AFFIX_RANGES: &[u32] = &[
+    0x0024, 0x0025, 0x002B, 0x002B, 0x005C, 0x005C, 0x00A2, 0x00A5, 0x00B0, 0x00B1,
+    0x058F, 0x058F, 0x0609, 0x060B, 0x066A, 0x066A, 0x07FE, 0x07FF, 0x09F2, 0x09F3,
+    0x09F9, 0x09FB, 0x0AF1, 0x0AF1, 0x0BF9, 0x0BF9, 0x0D79, 0x0D79, 0x0E3F, 0x0E3F,
+    0x17DB, 0x17DB, 0x2030, 0x2037, 0x2057, 0x2057, 0x20A0, 0x20CF, 0x2103, 0x2103,
+    0x2109, 0x2109, 0x2116, 0x2116, 0x2212, 0x2213, 0xA838, 0xA838, 0xFDFC, 0xFDFC,
+    0xFE69, 0xFE6A, 0xFF04, 0xFF05, 0xFFE0, 0xFFE1, 0xFFE5, 0xFFE6,
+    0x11FDD, 0x11FE0, 0x1E2FF, 0x1E2FF, 0x1ECAC, 0x1ECAC, 0x1ECB0, 0x1ECB0,
+];
+
+/// `isCodePointInRanges(codePoint, ranges)` — flat start/end pair scan.
+pub fn is_code_point_in_ranges(code_point: u32, ranges: &[u32]) -> bool {
+    let mut i = 0;
+    while i + 1 < ranges.len() {
+        if code_point >= ranges[i] && code_point <= ranges[i + 1] {
+            return true;
+        }
+        i += 2;
+    }
+    false
+}
+
+/// `isLineBreakNumericAffix(ch)` — true iff `ch.codePointAt(0)` falls in `lineBreakNumericAffixRanges`.
+pub fn is_line_break_numeric_affix(ch: char) -> bool {
+    is_code_point_in_ranges(ch as u32, LINE_BREAK_NUMERIC_AFFIX_RANGES)
+}
+
+/// `endsWithLineBreakNumericAffix(text)` — last significant code point is a numeric affix.
+pub fn ends_with_line_break_numeric_affix(text: &str) -> bool {
+    get_last_significant_code_point(text).map_or(false, is_line_break_numeric_affix)
+}
+
+/// `startsWithDecimalDigit(text)` — first significant code point is a `/\p{Nd}/u`.
+pub fn starts_with_decimal_digit(text: &str) -> bool {
+    get_first_significant_code_point(text).map_or(false, is_decimal_digit_char)
+}
+
+// ===== CJK classification =====
+/// `isCJKCodePoint(codePoint)` — misleading name; pretext groups CJK + kana + hangul + CJK punct + full-width block.
+pub fn is_cjk_code_point(code_point: u32) -> bool {
+    (code_point >= 0x4E00 && code_point <= 0x9FFF)
+        || (code_point >= 0x3400 && code_point <= 0x4DBF)
+        || (code_point >= 0x20000 && code_point <= 0x2A6DF)
+        || (code_point >= 0x2A700 && code_point <= 0x2B73F)
+        || (code_point >= 0x2B740 && code_point <= 0x2B81F)
+        || (code_point >= 0x2B820 && code_point <= 0x2CEAF)
+        || (code_point >= 0x2CEB0 && code_point <= 0x2EBEF)
+        || (code_point >= 0x2EBF0 && code_point <= 0x2EE5D)
+        || (code_point >= 0x2F800 && code_point <= 0x2FA1F)
+        || (code_point >= 0x30000 && code_point <= 0x3134F)
+        || (code_point >= 0x31350 && code_point <= 0x323AF)
+        || (code_point >= 0x323B0 && code_point <= 0x33479)
+        || (code_point >= 0xF900 && code_point <= 0xFAFF)
+        || (code_point >= 0x3000 && code_point <= 0x303F)
+        || (code_point >= 0x3040 && code_point <= 0x309F)
+        || (code_point >= 0x30A0 && code_point <= 0x30FF)
+        || (code_point >= 0x3130 && code_point <= 0x318F)
+        || (code_point >= 0xAC00 && code_point <= 0xD7AF)
+        || (code_point >= 0xFF00 && code_point <= 0xFFEF)
+}
+
+/// `isCJK(s)` — true iff any code point in `s` is CJK (per pretext's loose grouping).
+pub fn is_cjk(s: &str) -> bool {
+    s.chars().any(|c| is_cjk_code_point(c as u32))
+}
+
+/// `getFirstSignificantCodePoint(text)` — first non-mark code point, else `None`.
+pub fn get_first_significant_code_point(text: &str) -> Option<char> {
+    text.chars().find(|&c| !is_combining_mark(c))
+}
+
+/// `getLastSignificantCodePoint(text)` — last non-mark code point (walk back over combining marks).
+pub fn get_last_significant_code_point(text: &str) -> Option<char> {
+    if text.is_empty() {
+        return None;
+    }
+    let mut end = text.len();
+    while end > 0 {
+        let start = previous_code_point_start(text, end);
+        let ch = text[start..end].chars().next().unwrap();
+        if !is_combining_mark(ch) {
+            return Some(ch);
+        }
+        end = start;
+    }
+    None
+}
+
+// ===== segment classifiers (full-text segment membership) =====
+/// `isLeftStickyPunctuationSegment(segment)` — every char is left-sticky / numeric-affix,
+/// and combining marks are allowed only *after* the first sticky char is seen.
+pub fn is_left_sticky_punctuation_segment(segment: &str) -> bool {
+    if is_escaped_quote_cluster_segment(segment) {
+        return true;
+    }
+    let mut saw_punctuation = false;
+    for ch in segment.chars() {
+        if set_contains(LEFT_STICKY_PUNCTUATION, ch) || is_line_break_numeric_affix(ch) {
+            saw_punctuation = true;
+            continue;
+        }
+        if saw_punctuation && is_combining_mark(ch) {
+            continue;
+        }
+        return false;
+    }
+    saw_punctuation
+}
+
+/// `isCJKLineStartProhibitedSegment(segment)` — every char is in `kinsokuStart ∪ leftStickyPunctuation`, non-empty.
+pub fn is_cjk_line_start_prohibited_segment(segment: &str) -> bool {
+    if segment.is_empty() {
+        return false;
+    }
+    segment.chars().all(|c| set_contains(KINSOKU_START, c) || set_contains(LEFT_STICKY_PUNCTUATION, c))
+}
+
+/// `isForwardStickyClusterSegment(segment)` — every char is in `kinsokuEnd ∪ forwardStickyGlue`/mark/numeric-affix.
+pub fn is_forward_sticky_cluster_segment(segment: &str) -> bool {
+    if is_escaped_quote_cluster_segment(segment) {
+        return true;
+    }
+    if segment.is_empty() {
+        return false;
+    }
+    segment.chars().all(|c| {
+        set_contains(KINSOKU_END, c)
+            || set_contains(FORWARD_STICKY_GLUE, c)
+            || is_combining_mark(c)
+            || is_line_break_numeric_affix(c)
+    })
+}
+
+/// `isEscapedQuoteClusterSegment(segment)` — allows `\\` + combining marks freely; at least one
+/// closing-quote/sticky char.
+pub fn is_escaped_quote_cluster_segment(segment: &str) -> bool {
+    let mut saw_quote = false;
+    for ch in segment.chars() {
+        if ch == '\\' || is_combining_mark(ch) {
+            continue;
+        }
+        if set_contains(KINSOKU_END, ch)
+            || set_contains(LEFT_STICKY_PUNCTUATION, ch)
+            || set_contains(FORWARD_STICKY_GLUE, ch)
+        {
+            saw_quote = true;
+            continue;
+        }
+        return false;
+    }
+    saw_quote
+}
+
+/// `getRepeatableSingleCharRunChar(text, isWordLike, kind)` — returns the single repeatable
+/// punctuation char, or `None`. Excludes `"-"` and `\u{2014}` (em-dash) explicitly.
+pub fn get_repeatable_single_char_run_char(
+    text: &str,
+    is_word_like: bool,
+    kind: SegmentBreakKind,
+) -> Option<char> {
+    if kind == SegmentBreakKind::Text
+        && !is_word_like
+        && text.chars().count() == 1
+        && text != "-"
+        && text != "\u{2014}"
+    {
+        text.chars().next()
+    } else {
+        None
+    }
+}
+
+/// `materializeDeferredSingleCharRun(texts, chars, lengths, index)` — eagerly repeats the deferred single-char run.
+pub fn materialize_deferred_single_char_run(
+    texts: &mut [String],
+    chars: &mut [Option<char>],
+    lengths: &mut [usize],
+    index: usize,
+) -> String {
+    match chars[index] {
+        None => texts[index].clone(),
+        Some(ch) => {
+            let length = lengths[index];
+            if texts[index].chars().count() == length {
+                return texts[index].clone();
+            }
+            let materialized = ch.to_string().repeat(length);
+            texts[index] = materialized.clone();
+            materialized
+        }
+    }
+}
+
+/// `hasArabicNoSpacePunctuation(containsArabic, lastCodePoint)` — true iff the segment contains
+/// Arabic and ends with an Arabic no-space punctuation char.
+pub fn has_arabic_no_space_punctuation(contains_arabic: bool, last_code_point: Option<char>) -> bool {
+    contains_arabic
+        && last_code_point.map_or(false, |c| set_contains(ARABIC_NO_SPACE_TRAILING_PUNCTUATION, c))
+}
+
+/// `endsWithMyanmarMedialGlue(segment)` — last char is U+104F (Myanmar medial `\u{104f}`).
+pub fn ends_with_myanmar_medial_glue(segment: &str) -> bool {
+    get_last_code_point(segment).map_or(false, |c| set_contains(MYANMAR_MEDIAL_GLUE, c))
+}
+
+/// `splitLeadingSpaceAndMarks(segment)` — if segment starts with ASCII space followed by one-or-more
+/// `\p{M}` marks, return `Some((" ", marks))`; else `None`.
+pub fn split_leading_space_and_marks(segment: &str) -> Option<(String, String)> {
+    let mut chars = segment.chars();
+    let first = chars.next()?;
+    if first != ' ' {
+        return None;
+    }
+    let rest: String = chars.collect();
+    if !rest.is_empty() && rest.chars().all(is_combining_mark) {
+        return Some((String::from(" "), rest));
+    }
+    None
+}
+
 fn compile_analysis_chunks(
     segmentation: &MergedSegmentation,
     wsp: WhiteSpaceProfile,
@@ -671,5 +931,140 @@ mod tests {
         assert_eq!(classify_segment_break_char('\u{200b}', normal), SegmentBreakKind::ZeroWidthBreak);
         assert_eq!(classify_segment_break_char('\u{ad}', normal), SegmentBreakKind::SoftHyphen);
         assert_eq!(classify_segment_break_char('a', normal), SegmentBreakKind::Text);
+    }
+
+    /// `is_combining_mark` — Mn/Mc/Me .
+    #[test]
+    fn combining_mark_detects_marks_and_ignores_ordinary_chars() {
+        assert!(is_combining_mark('\u{300}')); // U+0300 combining grave (Mn)
+        assert!(is_combining_mark('\u{338}')); // U+0338 combining long stroke overlay
+        assert!(!is_combining_mark('a'));
+        assert!(!is_combining_mark(' '));
+    }
+
+    /// `contains_arabic_script` — main block + presentation forms.
+    #[test]
+    fn contains_arabic_script_detects_arabic_and_ignores_latin() {
+        assert!(contains_arabic_script("\u{627}")); // Arabic Alef
+        assert!(contains_arabic_script("abc\u{645}")); // mix
+        assert!(!contains_arabic_script("abc"));
+        assert!(!contains_arabic_script("你好"));
+    }
+
+    /// `is_line_break_numeric_affix` — UAX #14 PR/PO classes.
+    #[test]
+    fn numeric_affix_detects_currency_and_plus_minus() {
+        assert!(is_line_break_numeric_affix('+'));
+        assert!(!is_line_break_numeric_affix('-')); // hyphen is UAX#14 BA, not PR/PO
+        assert!(is_line_break_numeric_affix('%'));
+        assert!(is_line_break_numeric_affix('$'));
+        assert!(!is_line_break_numeric_affix('a'));
+    }
+
+    /// `is_cjk` — CJK detection .
+    #[test]
+    fn is_cjk_detects_chinese_and_kana_and_fullwidth() {
+        assert!(is_cjk("你好"));
+        assert!(is_cjk("カ"));
+        assert!(is_cjk("Ａ")); // U+FF21 fullwidth A
+        assert!(!is_cjk("hello"));
+        assert!(is_cjk("a中")); // mixed
+    }
+
+    /// `get_first_significant_code_point` — skips leading combining marks.
+    #[test]
+    fn get_first_significant_code_point_skips_leading_marks() {
+        assert_eq!(get_first_significant_code_point("a"), Some('a'));
+        assert_eq!(get_first_significant_code_point("\u{300}a"), Some('a'));
+        assert_eq!(get_first_significant_code_point(""), None);
+    }
+
+    /// `get_last_significant_code_point` — skips trailing combining marks.
+    #[test]
+    fn get_last_significant_code_point_skips_trailing_marks() {
+        assert_eq!(get_last_significant_code_point("a\u{300}"), Some('a'));
+        assert_eq!(get_last_significant_code_point("a"), Some('a'));
+        assert_eq!(get_last_significant_code_point(""), None);
+    }
+
+    /// `is_left_sticky_punctuation_segment` — punctuation + post-punct marks.
+    #[test]
+    fn left_sticky_punctuation_segment_pure_punct_and_punct_plus_marks() {
+        assert!(is_left_sticky_punctuation_segment("."));
+        assert!(is_left_sticky_punctuation_segment(".\u{300}")); // . + combining mark
+        assert!(!is_left_sticky_punctuation_segment("a"));
+        assert!(!is_left_sticky_punctuation_segment("a.")); // non-sticky first char
+    }
+
+    /// `is_cjk_line_start_prohibited_segment` — kinsoku + sticky punct only.
+    #[test]
+    fn cjk_line_start_prohibited_segment_all_sticky() {
+        assert!(is_cjk_line_start_prohibited_segment("，")); // U+FF0C
+        assert!(is_cjk_line_start_prohibited_segment("."));
+        assert!(!is_cjk_line_start_prohibited_segment("a"));
+        assert!(!is_cjk_line_start_prohibited_segment(""));
+    }
+
+    /// `is_forward_sticky_cluster_segment` — closing quote + forward glue + marks.
+    #[test]
+    fn forward_sticky_cluster_closing_quotes_and_glue() {
+        assert!(is_forward_sticky_cluster_segment("”"));
+        assert!(is_forward_sticky_cluster_segment("”\u{300}")); // quote + mark
+        assert!(!is_forward_sticky_cluster_segment("abc"));
+    }
+
+    /// `is_escaped_quote_cluster_segment` — backslash escape + sticky chars.
+    #[test]
+    fn escaped_quote_cluster() {
+        assert!(is_escaped_quote_cluster_segment("\\\"")); // \ + "
+        assert!(is_escaped_quote_cluster_segment("\"")); // just "
+        assert!(!is_escaped_quote_cluster_segment("abc"));
+    }
+
+    /// `get_repeatable_single_char_run_char` — single non-word text chars except `-`/em-dash.
+    #[test]
+    fn repeatable_single_char_run_char() {
+        assert_eq!(get_repeatable_single_char_run_char(".", false, SegmentBreakKind::Text), Some('.'));
+        assert_eq!(get_repeatable_single_char_run_char("..", false, SegmentBreakKind::Text), None); // len 2
+        assert_eq!(get_repeatable_single_char_run_char("-", false, SegmentBreakKind::Text), None); // dash excluded
+        assert_eq!(get_repeatable_single_char_run_char("\u{2014}", false, SegmentBreakKind::Text), None); // em-dash
+        assert_eq!(get_repeatable_single_char_run_char("a", true, SegmentBreakKind::Text), None); // word-like
+        assert_eq!(get_repeatable_single_char_run_char("a", false, SegmentBreakKind::Space), None); // not text
+    }
+
+    /// `materialize_deferred_single_char_run` — repeats opt char to match deferred length.
+    #[test]
+    fn materialize_deferred_repeats_opt_char() {
+        let mut texts = vec![String::from(".")];
+        let mut chars = vec![Some('.')];
+        let mut lengths = vec![3]; // deferred run length = 3
+        let materialized = materialize_deferred_single_char_run(&mut texts, &mut chars, &mut lengths, 0);
+        assert_eq!(materialized, "...");
+        assert_eq!(texts[0], "...");
+    }
+
+    /// `has_arabic_no_space_punctuation` — arabic content + trailing arabic punct.
+    #[test]
+    fn arabic_no_space_punct() {
+        assert!(has_arabic_no_space_punctuation(true, Some(':')));
+        assert!(has_arabic_no_space_punctuation(true, Some('\u{60c}'))); // Arabic comma
+        assert!(!has_arabic_no_space_punctuation(false, Some(':')));
+        assert!(!has_arabic_no_space_punctuation(true, Some('a')));
+    }
+
+    /// `ends_with_myanmar_medial_glue` — U+104F.
+    #[test]
+    fn myanmar_medial_glue() {
+        assert!(ends_with_myanmar_medial_glue("\u{104f}a\u{104f}"));
+        assert!(!ends_with_myanmar_medial_glue("a"));
+    }
+
+    /// `split_leading_space_and_marks` — leading space + all-mark tail.
+    #[test]
+    fn split_leading_space_and_marks_extracts() {
+        assert_eq!(split_leading_space_and_marks(" \u{300}"), Some((String::from(" "), String::from("\u{300}"))));
+        assert_eq!(split_leading_space_and_marks(" a"), None); // tail not all marks
+        assert_eq!(split_leading_space_and_marks("a\u{300}"), None); // no leading space
+        assert_eq!(split_leading_space_and_marks("ab"), None);
     }
 }

@@ -48,6 +48,7 @@ freetype = "0.7"
 harfbuzz_rs = "2.0"
 unicode-segmentation = "1.11"
 unicode-bidi = "0.3"
+unicode-general-category = "0.6"
 
 [dev-dependencies]
 naga = "30.0.0"

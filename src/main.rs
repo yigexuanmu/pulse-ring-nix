@@ -25,6 +25,7 @@ mod audio;
 mod config;
 mod draw;
 mod folia_bridge;
+mod folia_lyrics;
 mod lua;
 mod lyrics;
 mod plugin;
@@ -412,7 +413,9 @@ fn main() {
             log::info!("scene wallpaper: starting {}", rwp.file);
             match web_wallpaper::start_web_wallpaper(&rwp.file, w, h) {
                 Ok(mut p) => {
-                    p.send_config(&rwp.params);
+                    // Merge folia-lyrics.json (user GUI preset: mode + tuning) into the
+                    // pack's params before sending, so the page receives both from one source.
+                    p.send_config(&folia_lyrics::merge_config_payload(&rwp.params));
                     scene_first_frame = true;
                     scene_player = Some(p);
                 }
@@ -432,7 +435,7 @@ fn main() {
                 log::info!("web wallpaper: starting {}", rwp.file);
                 match web_wallpaper::start_web_wallpaper(&rwp.file, w, h) {
                     Ok(mut p) => {
-                        p.send_config(&rwp.params);
+                        p.send_config(&folia_lyrics::merge_config_payload(&rwp.params));
                         web_first_frame = true;
                         web_player = Some(p);
                     }
@@ -2456,7 +2459,7 @@ impl App {
                     let (w, h) = self.cfg.web_wallpaper_size;
                     match web_wallpaper::start_web_wallpaper(&rwp.file, w, h) {
                         Ok(mut p) => {
-                            p.send_config(&rwp.params);
+                            p.send_config(&folia_lyrics::merge_config_payload(&rwp.params));
                             self.web_player = Some(p);
                             self.web_first_frame = true;
                         }

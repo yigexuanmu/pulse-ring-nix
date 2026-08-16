@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import { useMotionValue } from 'framer-motion';
 import VisualizerRenderer from './components/visualizer/VisualizerRenderer';
+import type { VisualizerTuningBundle } from './components/visualizer/tuningRegistry';
 import { buildVisualizerTheme } from './components/app/presentation/buildVisualizerTheme';
 import { findLatestActiveLineIndex } from './utils/appPlaybackHelpers';
 import type { Line, Theme } from './types';
@@ -60,6 +61,7 @@ const TRANSPARENT_BG: VisualizerBackgroundConfig = { mode: null, transparent: tr
 const PulseRingObsApp: React.FC = () => {
   const { state, theme, getCurrentTimeSec } = usePulseRingSource();
   const [mode, setMode] = useState<VisualizerMode>(resolveInitialMode);
+  const [tunings, setTunings] = useState<VisualizerTuningBundle | undefined>(undefined);
 
   // React to a config (project.json params) carrying visualizerMode, unless the
   // URL pinned a mode via ?mode=. config lags behind mount (it's replayed on
@@ -72,6 +74,12 @@ const PulseRingObsApp: React.FC = () => {
     const applyConfig = (cfg: PulseRingConfig | null) => {
       const m = cfg && typeof cfg.visualizerMode === 'string' ? cfg.visualizerMode : null;
       if (m) setMode(m as VisualizerMode);
+      // Per-mode tuning bundle from the user's folia-lyrics.json (merged with folia
+      // defaults on the Rust side). Passed straight to VisualizerRenderer.
+      const t = cfg && cfg.foliaTuning && typeof cfg.foliaTuning === 'object'
+        ? cfg.foliaTuning as VisualizerTuningBundle
+        : undefined;
+      setTunings(t);
     };
     applyConfig(api.getConfig?.() ?? null);
     return api.onConfig?.(applyConfig);
@@ -177,6 +185,7 @@ const PulseRingObsApp: React.FC = () => {
         seed={state.track?.seed || 'pulse-ring-folia'}
         paused={paused}
         visualizerOpacity={1}
+        visualizerTunings={tunings}
         background={TRANSPARENT_BG}
         isPlayerChromeHidden={true}
         hideTranslationSubtitle={false}

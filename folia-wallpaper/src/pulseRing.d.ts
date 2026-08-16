@@ -43,6 +43,10 @@ export interface PulseRingConfig {
   // The visualizer mode to render (e.g. 'sonnet', 'monet', 'classic'). Driven by
   // project.json `params.visualizerMode` when the folia-lyrics pack is resolved.
   visualizerMode?: string;
+  // Per-mode tuning overrides (VisualizerTuningBundle) injected by pulse-ring from
+  // the user's ~/.config/pulse-ring/folia-lyrics.json. Each present mode's tuning
+  // is shallow-merged over folia's DEFAULT_*_TUNING by applyVisualizerTuning.
+  foliaTuning?: Record<string, unknown>;
   // Any other manifest params are passed through untouched.
   [key: string]: unknown;
 }

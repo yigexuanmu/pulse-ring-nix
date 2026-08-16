@@ -5,6 +5,8 @@
 
 #[path = "../config.rs"]
 mod config;
+#[path = "../folia_lyrics.rs"]
+mod folia_lyrics;
 
 #[path = "../config_gui/mod.rs"]
 mod config_gui;

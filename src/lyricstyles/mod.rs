@@ -9,4 +9,7 @@ pub mod mg_geo;
 pub mod mg_scene;
 pub mod mg_themed;
 pub mod sonnet;
+// Sonnet v2: compiler-grade 1:1 folia port — not wired into the live frame loop
+// until Phase 9.3 of docs/superpowers/plans/2026-08-15-sonnet-1to1-rewrite.md.
+pub mod sonnet_v2;
 pub mod staff_score;

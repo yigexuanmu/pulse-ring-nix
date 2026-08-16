@@ -39,6 +39,15 @@ base64 = "0.22"
 quick-xml = "0.41"
 regex = "1"
 miniz_oxide = "0.8"
+# Sonnet v2 compiler-grade 1:1 folia port (Phase 0.2):
+#   freetype.rs        → FreeType `FT_Render_Glyph` coverage raster (replaces fontdue SDF — G1).
+#   harfbuzz_rs        → harfbuzz shaping for combining marks / CJK clusters in pretext measurement.
+#   unicode-segmentation → UAX #29 word + grapheme cluster segmentation (replaces `Intl.Segmenter`).
+#   unicode-bidi       → UAX #9 bidi algorithm (replaces pretext's generated bidi-data tables).
+freetype = "0.7"
+harfbuzz_rs = "2.0"
+unicode-segmentation = "1.11"
+unicode-bidi = "0.3"
 
 [dev-dependencies]
 naga = "30.0.0"

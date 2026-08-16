@@ -813,3 +813,35 @@ nix develop -c bash -c '
 ### Task 追踪
 - Task #33 `[Rewrite-V2] folia sonnet 编译器级 1:1 移植（9 Phase 全量推倒重做）` — 父任务 in_progress
 - Task #32 `[Verify-V1] 核实子 agent：双分支构建+预览+GUI 全绿自测` — blocked by #33 完成 GUI 接线
+
+### 2026-08-16 续 II —— Phase 2.2 完整收尾（HEAD = 4f0ab37）
+
+Phase 2.2（analysis 全算法层）终结：7 个 driver pipeline merge passes + 1 个条件 KeepAll 后置 pass 全部 ported。共 **22 个新 commit past c644f4c**，`sonnet_v2/` Rust **3,581 LOC**，**87 个单元测试绿**（45 新增 analysis + 42 预存）。
+
+| Pass / 顺序 | commit | pretext analysis.ts 函数 | TS 行 |
+|---|---|---|---|
+| stub->real | `e5c4b10` | `mergeGlueConnectedTextRuns` + driver real body（粘合 CJK sticky-标点）+ 12-parallels 累积 dispatch | 951 |
+| 2/8 | `2ad9d2e`* | `mergeUrlLikeRuns` + `isUrlLikeRunStart` + `urlSchemeSegmentRe` + `isTextRunBoundary` | 596 |
+| 3/8 | `66446df`* | `mergeUrlQueryRuns` + `isUrlQueryBoundarySegment` + `joinTextParts` | 646 |
+| 4/8 | `ca65674` | `mergeNumericRuns` + `isNumericRunSegment` + `numericJoinerChars` + `segmentContainsDecimalDigit` + `startsWithDecimalDigit` | 686 |
+| 5/8 | `ca65674` (内) | `splitHyphenatedNumericRuns` + 其 step split/reproductive ASCII '-' 用例 | 898 |
+| 6/8 | `96a9087` | `mergeNoSpaceWordChains` + 配套 helper（`isNoSpaceWordInternalSymbolSegment` / `endsWithNoSpaceWordJoiner` / `canJoinNoSpaceWordBoundary` / `isNoSpaceWordInternalSymbol` / `isWordInternalSymbol` / `isAsciiWordInternalSymbolCode` / `endsWithLineBreakNumericAffix` / `isLineBreakNumericAffix` / `starts/endsWithDecimalDigit` / `\p{Emoji_Presentation}` OnceLock 正则） | 839 / 727 / 761 / 738 / 748 / 718 |
+| 7/8 | `71e5d75` | `carryTrailingForwardStickyAcrossCJKBoundary` + `splitTrailingForwardStickyCluster`（反扫 kinsokuEnd/forwardStickyGlue/巫mark） | 1027 / 399 |
+| 8/8 | `4f0ab37` | `mergeKeepAllTextSegments` + 3 ka_* helpers（条件 KeepAll 后置 pass，CJK 群组合并 vs 非 CJK 透传） | 1340 |
+
+\* commit hash 不全精确——pass 编号在 commit 历史里不严格按 1-8 升序；最终 pipeline nesting 严格匹配 pretext analysis.ts:1271-1280 nesting。
+
+**考古修正**（避免 silently-wrong port）：原 PLAN 与 stub comment 把 `mergeKeepAllTextSegments` 标为 driver pipeline "pass 8" 是错的——它实际是 `analyzeText` 在 `WordBreakMode == KeepAll` 时的条件后置 pass（不在 `buildMergedSegmentation` 内）。本轮已修正 PLAN 内联注释、删 stub、装真体。
+
+### 续接点：Phase 2.3 起剩余 pretext 6 文件（~3,580 行 TS）
+
+| 文件 | 行 | 主要 exports |
+|---|---|---|
+| `bidi.ts` | 175 | `computeBidiLevels` / `computeSegmentLevels`（简化 UAX#9） |
+| `layout.ts` | 914 | `prepare` / `prepareWithSegments` / `layoutWithLines` / `measureNaturalWidth` / `walkLineRanges` —— pretext 入口最关键 |
+| `line-break.ts` | 1236 | `layoutNextLine` / `breakLine` 折行算法 |
+| `rich-inline.ts` | 518 | 行内 rich text 节点 |
+| `line-text.ts` | 107 | 最小行盒 |
+| `measurement.ts` | 275 | `measureText` 包装（FreeType 替代 ::after Phase 0 freetype-sys 集成） |
+
+下一续接：读 PLAN Phase 2.3 → 译 `layout.ts`（pretext layout 入口，依赖 analysis.rs 已就绪），逐 export TDD + cargo check + commit。每文件独立 commit，不复用 stub。

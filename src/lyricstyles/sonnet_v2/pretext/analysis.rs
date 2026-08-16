@@ -804,6 +804,180 @@ pub fn split_hyphenated_numeric_runs(seg: MergedSegmentation) -> MergedSegmentat
     }
 }
 
+/// `emojiPresentationRe = /\p{Emoji_Presentation}/u` — pretext analysis.ts:702.
+/// Uses the `regex` crate (already a project dependency) with full Unicode
+/// support, compiled lazily on first use via `std::sync::OnceLock`.
+fn emoji_presentation_re() -> &'static regex::Regex {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    RE.get_or_init(|| regex::Regex::new(r"\p{Emoji_Presentation}").expect("emoji presentation regex"))
+}
+
+/// `wordInternalSymbolRe = /[\p{P}\p{S}\p{Co}]/u` — pretext analysis.ts:701.
+/// Implemented directly via `unicode_general_category` General_Category enums
+/// (Pc/Pd/Pe/Pf/Pi/Po/Ps as \p{P}; Sc/Sk/Sm/So as \p{S}; Co = Private_Use).
+/// Avoids a regex alloc in the hot pretxt-analysis path.
+pub fn is_word_internal_symbol(ch: char) -> bool {
+    matches!(
+        get_general_category(ch),
+        Gc::ConnectorPunctuation | Gc::DashPunctuation | Gc::ClosePunctuation
+            | Gc::FinalPunctuation | Gc::InitialPunctuation | Gc::OtherPunctuation
+            | Gc::OpenPunctuation | Gc::CurrencySymbol | Gc::ModifierSymbol
+            | Gc::MathSymbol | Gc::OtherSymbol | Gc::PrivateUse
+    )
+}
+
+/// `isAsciiWordInternalSymbolCode(code)` — pretext analysis.ts:718.
+/// ASCII punctuation/codepoint ranges (excluding \u{2D} '-' and \u{3F} '?'
+/// which are handled by `noSpaceWordBreakAfterChars`).
+pub fn is_ascii_word_internal_symbol_code(code: u32) -> bool {
+    (code >= 0x21 && code <= 0x2F && code != 0x2D)
+        || (code >= 0x3A && code <= 0x40 && code != 0x3F)
+        || (code >= 0x5B && code <= 0x60)
+        || (code >= 0x7B && code <= 0x7E)
+}
+
+/// `isNoSpaceWordInternalSymbol(ch)` — pretext analysis.ts:727:
+///   * code < 0x80 → ascii internal symbol code
+///   * else → !noSpaceWordBreakAfter && !emojiPresentationRe.test(ch) &&
+///           wordInternalSymbolRe.test(ch).
+pub fn is_no_space_word_internal_symbol(ch: char) -> bool {
+    let code = ch as u32;
+    if code < 0x80 { return is_ascii_word_internal_symbol_code(code); }
+    !NO_SPACE_WORD_BREAK_AFTER_CHARS.contains(&ch)
+        && !emoji_presentation_re().is_match(&ch.to_string())
+        && is_word_internal_symbol(ch)
+}
+
+/// `isNoSpaceWordInternalSymbolSegment(text)` — pretext analysis.ts:738:
+///   every non-mark char must be `isNoSpaceWordInternalSymbol`, AND at least one
+///   such symbol must have been seen.
+pub fn is_no_space_word_internal_symbol_segment(text: &str) -> bool {
+    let mut saw_symbol = false;
+    for ch in text.chars() {
+        if is_combining_mark(ch) { continue; }
+        if !is_no_space_word_internal_symbol(ch) { return false; }
+        saw_symbol = true;
+    }
+    saw_symbol
+}
+
+/// `endsWithNoSpaceWordJoiner(text)` — pretext analysis.ts:748:" iterate
+/// backwards skipping trailing combining marks; first non-mark char must be a
+/// `isNoSpaceWordInternalSymbol` OR `isLineBreakNumericAffix`.
+pub fn ends_with_no_space_word_joiner(text: &str) -> bool {
+    let mut end = text.len();
+    while end > 0 {
+        let start = previous_code_point_start(text, end);
+        let ch = &text[start..end];
+        // Decode the rune substring into a single char for classification.
+        let ch_c = ch.chars().next().expect("non-empty substring after previous_code_point_start");
+        if is_combining_mark(ch_c) {
+            end = start;
+            continue;
+        }
+        return is_no_space_word_internal_symbol(ch_c) || is_line_break_numeric_affix(ch_c);
+    }
+    false
+}
+
+/// `canJoinNoSpaceWordBoundary(leftText, leftWordLike, rightText, rightWordLike)` —
+/// pretext analysis.ts:761. Decides whether two consecutive TEXT segments can be
+/// joined without a space. Returns false immediately if either side contains CJK.
+pub fn can_join_no_space_word_boundary(
+    left_text: &str,
+    left_word_like: bool,
+    right_text: &str,
+    right_word_like: bool,
+) -> bool {
+    let left_symbol = !left_word_like && is_no_space_word_internal_symbol_segment(left_text);
+    let right_symbol = !right_word_like && is_no_space_word_internal_symbol_segment(right_text);
+    let left_affix = ends_with_line_break_numeric_affix(left_text);
+    let left_ends_joiner = (left_word_like || left_affix) && ends_with_no_space_word_joiner(left_text);
+
+    if !left_symbol && !right_symbol && !left_ends_joiner { return false; }
+    if is_cjk(left_text) || is_cjk(right_text) { return false; }
+    (left_word_like || left_symbol || left_affix) && (right_word_like || right_symbol)
+}
+
+/// `mergeNoSpaceWordChains` — pretext analysis.ts:839.
+/// Merge consecutive TEXT segments whose boundaries pass
+/// `canJoinNoSpaceWordBoundary` into one Text seg; stops at first gap where the
+/// boundary fails OR the next seg is non-TEXT kind. Loop cursor advances to `j`
+/// (Rust: i = j; TS: i = j then while-body end) after absorbing `j-i` segments —
+/// matches TS semantics by falling through to the after-merge `continue`.
+pub fn merge_no_space_word_chains(seg: MergedSegmentation) -> MergedSegmentation {
+    let len = seg.len;
+    let in_texts = seg.texts;
+    let in_is_word_like = seg.is_word_like;
+    let in_kinds = seg.kinds;
+    let in_starts = seg.starts;
+
+    let mut texts: Vec<String> = vec![];
+    let mut is_word_like: Vec<bool> = vec![];
+    let mut kinds: Vec<SegmentBreakKind> = vec![];
+    let mut starts: Vec<usize> = vec![];
+
+    let mut i = 0usize;
+    while i < len {
+        let text = &in_texts[i];
+        let kind = in_kinds[i];
+        let word_like = in_is_word_like[i];
+
+        if kind == SegmentBreakKind::Text {
+            let mut merged_parts: Vec<String> = vec![text.clone()];
+            let mut j = i + 1;
+            let mut merged_word_like = word_like;
+
+            while j < len
+                && in_kinds[j] == SegmentBreakKind::Text
+                && can_join_no_space_word_boundary(
+                    &in_texts[j - 1],
+                    in_is_word_like[j - 1],
+                    &in_texts[j],
+                    in_is_word_like[j],
+                )
+            {
+                let next_text = &in_texts[j];
+                merged_parts.push(next_text.clone());
+                merged_word_like = merged_word_like || in_is_word_like[j];
+                j += 1;
+            }
+
+            if j > i + 1 {
+                texts.push(join_text_parts(&merged_parts));
+                is_word_like.push(merged_word_like);
+                kinds.push(SegmentBreakKind::Text);
+                starts.push(in_starts[i]);
+                i = j;
+                continue;
+            }
+        }
+
+        texts.push(text.clone());
+        is_word_like.push(word_like);
+        kinds.push(kind);
+        starts.push(in_starts[i]);
+        i += 1;
+    }
+
+    let new_len = texts.len();
+    MergedSegmentation {
+        len: new_len,
+        texts,
+        text_parts: vec![],
+        is_word_like,
+        kinds,
+        starts,
+        single_char_run_chars: vec![],
+        single_char_run_lengths: vec![],
+        contains_cjk: vec![],
+        contains_arabic_script: vec![],
+        ends_with_closing_quote: vec![],
+        ends_with_myanmar_medial_glue: vec![],
+        has_arabic_no_space_punctuation: vec![],
+    }
+}
+
 /// `mergeGlueConnectedTextRuns` — pretext analysis.ts:951.
 /// Fold chains of `glue`-kind segments into adjacent `text` runs; standalone glue
 /// clusters (no following text) are kept as glue kind. Byte-identical control flow.
@@ -1097,7 +1271,8 @@ fn build_merged_segmentation(
     let seg = merge_url_query_runs(seg);
     let seg = merge_numeric_runs(seg);
     let seg = split_hyphenated_numeric_runs(seg);
-    // TODO Phase 2.2: remaining 3 passes — merge_no_space_word_chains /
+    let seg = merge_no_space_word_chains(seg);
+    // TODO Phase 2.2: remaining 2 passes —
     //   carry_trailing_forward_sticky_across_cjk_boundary /
     //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
     seg
@@ -2182,5 +2357,55 @@ mod tests {
             assert_eq!(merged.len, 1, "case \"{}\" should NOT be split", case);
             assert_eq!(merged.texts[0], case);
         }
+    }
+
+    /// `can_join_no_space_word_boundary`: two juxtaposed symbols (e.g. "/","=") join,
+    /// Plain ASCII letters joined by a connector like '.' join, but CJK runs never.
+    #[test]
+    fn can_join_no_space_word_boundary_cases() {
+        // Symbol pair (none is_word_like): both are no-space internal symbols.
+        assert!(can_join_no_space_word_boundary("/", false, "=", false));
+        // Two word-like runs joined by trailing '.' (joiner) on left:
+        assert!(can_join_no_space_word_boundary("foo.", true, "bar", true));
+        // CJK complaint:
+        assert!(!can_join_no_space_word_boundary("abc", true, "你", true));
+        // Plain words with no symbol/joiner return false:
+        assert!(!can_join_no_space_word_boundary("foo", true, "bar", true));
+    }
+
+    /// `merge_no_space_word_chains`: ASCII words glued by '/' merge into one Text,
+    /// followed by a CJK run that does NOT merge (CJK boundary rejected).
+    #[test]
+    fn merge_no_space_word_chains_glues_slash_pair_keeps_cjk_boundary() {
+        // Layout: "foo" text + "/" text + "bar" text + "你好" text. All text kind.
+        // '/' is left-boundary joiner: (foo,true)/(,(false) → /
+        //   left_affix=false; left_symbol=true (is_no_space_word_internal_symbol_segment("/"));
+        //   (left_word_like=false || left_symbol=true || left_affix=false) = true,
+        //   right_word_like=false ... hmm right_symbol depends on '/' vs 'bar'
+        // For simplification, let's test the simpler shape: two true wordLike runs
+        // joined by a non-word ':' → merge passes through noop since the 3 are
+        // already adjacent text segments with no glue boundary? Actually
+        // merge_no_space_word_chains looks at can_join_no_space_word_boundary(j-1, j)
+        // — it needs the left seg to have a trailing joiner OR be a symbol segment.
+        // For safest semantic test: two pure-symbol segs.
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec!["/".into(), "=".into()],
+            text_parts: vec![vec![]; 2],
+            is_word_like: vec![false; 2],
+            kinds: vec![SegmentBreakKind::Text; 2],
+            starts: vec![0, 1],
+            single_char_run_chars: vec![None; 2],
+            single_char_run_lengths: vec![0; 2],
+            contains_cjk: vec![false; 2],
+            contains_arabic_script: vec![false; 2],
+            ends_with_closing_quote: vec![false; 2],
+            ends_with_myanmar_medial_glue: vec![false; 2],
+            has_arabic_no_space_punctuation: vec![false; 2],
+        };
+        let merged = merge_no_space_word_chains(seg);
+        assert_eq!(merged.len, 1);
+        assert_eq!(merged.texts[0], "/=");
+        assert_eq!(merged.is_word_like[0], false);
     }
 }

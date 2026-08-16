@@ -965,3 +965,30 @@ All 7 pretext files ported byte-faithful: `analysis → bidi + bidi_data → lin
 Phase 3 ordering: `types → random → motion → program → semantic` (each independent, no inter-file deps). Target: byte-identical port exposing the inputs Phase 4 (Mg family — `sonnetSceneBuilder` / `sonnetTextViewBuilder` / `sonnetCameraTracking`) consumes. Phase 4 is where the **X-architecture arena indexing** must replace the folia PIXI scene-tree mutation: each `GlyphView` / `ShotView` / `SegmentView` / `SceneView` becomes an arena `Id` + flat mutate-then-flatten pass that emits the existing `CharQuad` draw stream.
 
 Phase 4+ touch points (defer): the FreeType/Harfbuzz-based `GlyphAtlas` extension (Phase 5), `run.rs` QML menu wiring (Phase 9.5), `main.rs::active_lyric_index` and `lyricview.rs::build_frame` integration so the v2 path lights up behind a config flag.
+
+### Phase 3 — pure-algorithm layer ✅ FULLY COMPLETE (HEAD `e584b1c`, 194 tests green)
+
+All 7 pure-algorithm files (no PIXI, no numerical state machine) faithfully ported:
+
+| Sub | File | Commit | Tests |
+|---|---|---|---|
+| 3.1 | `lyrics_util/grapheme_timing.rs` + `render_hints.rs` (graphemeTiming.ts 154 + renderHints.ts 243) | `d55c3df` | +8 |
+| 3.1 | `random.rs` (sonnetRandom.ts 21 — FNV-1a hash + Math.imul mix) | `a09bfee` | +4 |
+| 3.3 | `motion.rs` (sonnetMotion.ts 282 — cubic-bezier/easing/shot-path/camera-breath/shake) | `172c686` | +17 |
+| 3.4 | `semantic.rs` (sonnetSemantic.ts 100 — word-segment boundary profiling) | `3b6ab6b` | +5 |
+| 3.5 | `program.rs` (sonnetProgram.ts 265 — compile_sonnet_program paragraph/shot build) | `cb4606b` | +10 |
+| 3.6 | `transitions.rs` (sonnetTransitions.ts 152 — scene enter/exit effect frames) | `aac9d04` | +14 |
+| 3.7 | `camera_tracking.rs` (sonnetCameraTracking.ts 45 — glyph filter + segment focus interp) | `e584b1c` | +7 |
+| 3.9 | `types.rs` (Sonnet* program-family contracts accumulated across commits) | `a09bfee`+ | (in family test counts) |
+
+### Next session continuation seed
+
+**Phase 4 — typography layer** (folia `sonnetTypographyRoles.ts` 114 + `sonnetTypographyLayout.ts` 404 = 518 lines).
+Pure role scoring + layout helpers, no PIXI. Both depend on the already-ported
+pretext `analysis` (SegmentBreakKind / kinsoku sets) and `pretext::layout`
+(prepare_pipeline). Port order: roles.rs → typography_layout.rs.
+
+After Phase 4: Phase 5 (Mg family — sonnetMg*.ts, heavy) → Phase 6 (scene
+builder) → Phase 7 (runtime shell createSonnetPixiRuntime → arena) → Phase 8
+(atlas/glyph raster FreeType/Harfbuzz integration) → Phase 9 (tuning wiring
++GUI integration + verification).

@@ -21,6 +21,9 @@ pub struct GuiState {
     pub config: crate::config::Config,
     pub lang: Lang,
     pub tr: Tr,
+    /// folia 歌词可视化配置（~/.config/pulse-ring/folia-lyrics.json，独立于 QML）。
+    /// 结构：{ activePreset, presets: { <name>: { enabled, visualizerMode, foliaTuning } } }
+    pub folia: serde_json::Value,
 }
 
 pub type State = Rc<RefCell<GuiState>>;
@@ -57,6 +60,7 @@ fn save_lang_pref(lang: Lang) {
 pub fn build_main_window(app: &adw::Application) {
     let state: State = Rc::new(RefCell::new(GuiState {
         config: qml_io::load_config(),
+        folia: crate::folia_lyrics::load(),
         lang: load_lang_pref(),
         tr: Tr::new(),
     }));
@@ -91,6 +95,7 @@ fn present_window(app: &adw::Application, state: State) {
     build_audio_page(&prefs, state.clone(), &tr, lang);
     build_language_page(&prefs, state.clone(), &tr, lang);
     build_stub_pages(&prefs, &tr, lang);
+    build_folia_page(&prefs, state.clone(), &tr, lang);
 
     prefs.present();
 }
@@ -166,9 +171,12 @@ fn build_general_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lan
     save_row.connect_activated(move |_| {
         let msg = {
             let s = st.borrow();
-            match qml_io::save_config(&s.config) {
-                Ok(_) => s.tr.get(s.lang, "common.savedHint").to_string(),
-                Err(e) => format!("{}: {}", s.tr.get(s.lang, "common.save"), e),
+            let qml_ok = qml_io::save_config(&s.config);
+            let folia_ok = crate::folia_lyrics::save(&s.folia);
+            match (qml_ok, folia_ok) {
+                (Ok(_), Ok(_)) => s.tr.get(s.lang, "common.savedHint").to_string(),
+                (Err(e), _) => format!("{}: {}", s.tr.get(s.lang, "common.save"), e),
+                (_, Err(e)) => format!("folia-lyrics.json: {}", e),
             }
         };
         toast(&prefs_clone, &msg);
@@ -449,11 +457,11 @@ fn build_language_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, la
 }
 
 fn build_stub_pages(prefs: &adw::PreferencesWindow, tr: &Tr, lang: Lang) {
-    let stubs: [(&str, &str, &str); 4] = [
+    // 粒子 / 壁纸 / 挂件 三个上游 QML 概念暂保留占位（面向后续填上）。
+    let stubs: [(&str, &str, &str); 3] = [
         (tr.get(lang, "tab.particles"), "preferences-desktop-effects-symbolic", "（v2 填充）"),
         (tr.get(lang, "tab.wallpaper"), "preferences-desktop-wallpaper-symbolic", "（v2 填充）"),
         (tr.get(lang, "tab.widgets"), "view-grid-symbolic", "（v2 填充）"),
-        (tr.get(lang, "tab.lyric"), "applications-multimedia-symbolic", "（v2 填充：folia 11 模式 Tuning）"),
     ];
     for &(title, icon, hint) in stubs.iter() {
         let page = adw::PreferencesPage::new();
@@ -467,3 +475,255 @@ fn build_stub_pages(prefs: &adw::PreferencesWindow, tr: &Tr, lang: Lang) {
         prefs.add(&page);
     }
 }
+
+// ============== Folia 歌词可视化页（总开关 + 模式 + 歌模式动态参数） ==============
+
+/// 调出 activePreset 字符串名（缺失时回退当前第一个预设 / DEFAULT_PRESET）。
+fn folia_active_name(v: &serde_json::Value) -> String {
+    if let Some(name) = v.get("activePreset").and_then(|x| x.as_str()) {
+        return name.to_string();
+    }
+    if let Some(presets) = v.get("presets").and_then(|p| p.as_object()) {
+        if let Some((k, _)) = presets.iter().next() {
+            return k.clone();
+        }
+    }
+    crate::folia_lyrics::DEFAULT_PRESET.to_string()
+}
+
+/// 读 `presets.<active>.<path>`（路径点分，如 "enabled" / "visualizerMode"）。
+fn folia_preset_get<'a>(v: &'a serde_json::Value, active: &str, path: &str) -> Option<&'a serde_json::Value> {
+    let preset = v.get("presets")?.get(active)?;
+    super::folia_meta::get(preset, path)
+}
+
+/// 写 `presets.<active>.<path>`（路径点分）。沿途创建对象节点。
+fn folia_preset_set(v: &mut serde_json::Value, active: &str, path: &str, new: serde_json::Value) {
+    if v.get("presets").is_none() {
+        *v = serde_json::json!({ "presets": {} });
+    }
+    let presets = v.get_mut("presets").unwrap().as_object_mut().unwrap();
+    if !presets.contains_key(active) {
+        presets.insert(active.to_string(), serde_json::json!({}));
+    }
+    let preset = presets.get_mut(active).unwrap();
+    super::folia_meta::set(preset, path, new);
+}
+
+/// 读 `presets.<active>.foliaTuning.<mode>.<path>`（mode 为模式字段下的根段）。
+fn folia_tuning_get<'a>(v: &'a serde_json::Value, active: &str, mode: &str, field_path: &str) -> Option<&'a serde_json::Value> {
+    let pre = v.get("presets")?.get(active)?;
+    let mode_obj = pre.get("foliaTuning")?.get(mode)?;
+    super::folia_meta::get(mode_obj, field_path)
+}
+
+/// 写 `presets.<active>.foliaTuning.<mode>.<path>`。
+fn folia_tuning_set(v: &mut serde_json::Value, active: &str, mode: &str, field_path: &str, new: serde_json::Value) {
+    // presets.<active>.foliaTuning = {} if missing
+    if !v.is_object() { *v = serde_json::json!({}); }
+    let presets = v.get_mut("presets").unwrap().as_object_mut().unwrap();
+    if !presets.contains_key(active) {
+        presets.insert(active.to_string(), serde_json::json!({}));
+    }
+    let pre = presets.get_mut(active).unwrap();
+    if pre.get("foliaTuning").is_none() { pre["foliaTuning"] = serde_json::json!({}); }
+    let tuning = pre.get_mut("foliaTuning").unwrap();
+    if tuning.get(mode).is_none() { tuning[mode] = serde_json::json!({}); }
+    let mode_obj = tuning.get_mut(mode).unwrap();
+    super::folia_meta::set(mode_obj, field_path, new);
+}
+
+fn build_folia_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lang: Lang) {
+    let active;
+    let enabled_now;
+    let mode_now;
+    {
+        let s = state.borrow();
+        active = folia_active_name(&s.folia);
+        enabled_now = folia_preset_get(&s.folia, &active, "enabled")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        mode_now = folia_preset_get(&s.folia, &active, "visualizerMode")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+            .unwrap_or_else(|| "classic".to_string());
+    }
+    let lang_en = lang == Lang::En;
+
+    let page = adw::PreferencesPage::new();
+    page.set_title(tr.get(lang, "tab.lyric"));
+    page.set_icon_name(Some("applications-multimedia-symbolic"));
+
+    // —— 顶部组：总开关 + 模式选择 ——
+    let top_group = adw::PreferencesGroup::new();
+    top_group.set_title(tr.get(lang, "folia.section.general"));
+
+    // 总开关：SwitchRow 绑定 presets.<active>.enabled
+    let enabled_row = adw::SwitchRow::builder().title(tr.get(lang, "folia.enabled")).build();
+    enabled_row.set_active(enabled_now);
+    let st = state.clone();
+    let active_clone = active.clone();
+    enabled_row.connect_active_notify(move |r| {
+        folia_preset_set(&mut st.borrow_mut().folia, &active_clone, "enabled", serde_json::json!(r.is_active()));
+    });
+    top_group.add(&enabled_row);
+
+    // 模式下拉：ComboRow，11 个模式 (cadenza 标注无面板)
+    let mode_row = adw::ComboRow::builder().title(tr.get(lang, "folia.mode")).build();
+    // 模式名列表（含 cadenza 但在说明里提示）
+    let mode_keys: [&str; 11] = [
+        "classic", "cadenza", "partita", "fume", "claddagh",
+        "cappella", "tilt", "pendolo", "monet", "diorama", "sonnet",
+    ];
+    let mode_labels: Vec<String> = mode_keys.iter().map(|m| {
+        let key = format!("folia.mode.{}", m);
+        tr.get(lang, &key).to_string()
+    }).collect();
+    let labels_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
+    let mode_model = gtk4::StringList::new(&labels_refs);
+    mode_row.set_model(Some(&mode_model));
+    let mode_idx = mode_keys.iter().position(|k| *k == mode_now).unwrap_or(0) as u32;
+    mode_row.set_selected(mode_idx);
+    top_group.add(&mode_row);
+
+    let st_for_mode = state.clone();
+    let active_clone2 = active.clone();
+    let mode_keys_clone: Rc<Vec<String>> = Rc::new(mode_keys.iter().map(|s| s.to_string()).collect());
+    // 各模式字段组都构建好，连接 mode_row::notify-selected 切换可见性。
+    let mode_row_clone = mode_row.clone();
+
+    // —— 为每个模式构建一个 PreferencesGroup（含该模式字段）；不展示在当前模式的隐去 ——
+    // 用 Rc<Vec<PreferencesGroup>> 备几模式切换引用。
+    let groups: Vec<adw::PreferencesGroup> = Vec::new();
+    let groups_handle = Rc::new(RefCell::new(groups));
+
+    for &mode_key in mode_keys.iter() {
+        let group = adw::PreferencesGroup::new();
+        group.set_title(&format!("{} — {}",
+            tr.get(lang, "folia.section.tuning"),
+            tr.get(lang, &format!("folia.mode.{}", mode_key))));
+
+        if mode_key == "cadenza" {
+            // folia 上游未暴露 cadenza 面板，这里加个说明行
+            let note = tr.get(lang, "folia.mode.cadenza.note");
+            let r = adw::ActionRow::builder().title(note).subtitle("").build();
+            group.add(&r);
+        } else {
+            let fields: Vec<super::folia_meta::Field> = super::folia_meta::FIELDS
+                .iter().filter(|f| f.mode == mode_key).copied().collect();
+            for field in fields {
+                let title = if lang_en { field.en } else { field.zh };
+                let row = build_folia_field_row(&field, &active, &state, title, lang);
+                group.add(&row);
+            }
+        }
+
+        group.set_visible(mode_key == mode_now);
+        groups_handle.borrow_mut().push(group);
+    }
+
+    // —— 模式下拉切换：映射 selected → mode key，调出 folia_preset_set(visualizerMode) + 切换可见组 ——
+    let gh_for_cb = Rc::clone(&groups_handle);
+    mode_row.connect_selected_notify(move |r| {
+        let idx = r.selected() as usize;
+        // mode_keys_clone 来源 Rc; active_clone2; st_for_mode
+        let key = mode_keys_clone.get(idx).map(|s| s.as_str()).unwrap_or("classic");
+        folia_preset_set(&mut st_for_mode.borrow_mut().folia, &active_clone2, "visualizerMode", serde_json::json!(key));
+        // 切换组可见性
+        let groups = gh_for_cb.borrow();
+        for (i, g) in groups.iter().enumerate() {
+            g.set_visible(i == idx);
+        }
+    });
+
+    page.add(&top_group);
+    for g in groups_handle.borrow().iter() {
+        page.add(g);
+    }
+    prefs.add(&page);
+}
+
+/// 单个 folia 字段 → 对应行控件：Bool/SwitchRow；Float/scale_row；Enum/ComboRow。
+fn build_folia_field_row(field: &super::folia_meta::Field, active: &str, state: &State, title: &str, lang: Lang) -> gtk4::Widget {
+    use super::folia_meta::{Kind, Opt};
+    let lang_en = lang == Lang::En;
+    let mode = field.mode;
+    let path_owned = field.path.to_string();
+    match field.kind {
+        Kind::Bool | Kind::BoolOnOff | Kind::BoolShowHide | Kind::BoolOnOffZhSubtle => {
+            // 布尔统一用 SwitchRow；三种标签变种仅影响 Combo而当选项列表文案不影响 SwitchRow。取当前默认标签文本作为行标题变量（已传）。
+            // 实际只是个 toggle，'true' = shown/enable, 'false' = off/hide，默认值从现设定。
+            let cur = {
+                let s = state.borrow();
+                folia_tuning_get(&s.folia, active, mode, &path_owned)
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true)              // 缺失回退 true （多数默认）
+            };
+            let row = adw::SwitchRow::builder().title(title).build();
+            row.set_active(cur);
+            let st = state.clone();
+            let active_s = active.to_string();
+            let path = path_owned.clone();
+            row.connect_active_notify(move |r| {
+                folia_tuning_set(&mut st.borrow_mut().folia, &active_s, mode, &path, serde_json::json!(r.is_active()));
+            });
+            row.upcast::<gtk4::Widget>()
+        }
+        Kind::Float { min, max, step } => {
+            let cur = {
+                let s = state.borrow();
+                folia_tuning_get(&s.folia, active, mode, &path_owned)
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(1.0) as f32
+            };
+            let row = adw::ActionRow::builder().title(title).build();
+            let scale = gtk4::Scale::with_range(gtk4::Orientation::Horizontal, min, max, step);
+            scale.set_draw_value(true);
+            scale.set_digits(if step >= 1.0 { 0 } else if step >= 0.05 { 2 } else { 3 });
+            scale.set_hexpand(true);
+            scale.set_width_request(260);
+            scale.set_value(cur as f64);
+            let st = state.clone();
+            let active_s = active.to_string();
+            let path = path_owned.clone();
+            scale.connect_value_changed(move |s| {
+                let v = s.value() as f32;
+                folia_tuning_set(&mut st.borrow_mut().folia, &active_s, mode, &path, serde_json::json!(v));
+            });
+            row.add_suffix(&scale);
+            row.upcast::<gtk4::Widget>()
+        }
+        Kind::Enum { opts } => {
+            let cur_str = {
+                let s = state.borrow();
+                folia_tuning_get(&s.folia, active, mode, &path_owned)
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("").to_string()
+            };
+            let labels: Vec<String> = opts.iter().map(|o: &Opt| {
+                if lang_en { o.en.to_string() } else { o.zh.to_string() }
+            }).collect();
+            let labels_refs: Vec<&str> = labels.iter().map(|s| s.as_str()).collect();
+            let model = gtk4::StringList::new(&labels_refs);
+            let combo = adw::ComboRow::builder().title(title).build();
+            combo.set_model(Some(&model));
+            let idx = opts.iter().position(|o| o.v == cur_str).unwrap_or(0) as u32;
+            combo.set_selected(idx);
+            let st = state.clone();
+            let active_s = active.to_string();
+            let path = path_owned.clone();
+            // opts.v 生命周期为 'static，天将作闭共享
+            let vals: Rc<Vec<&'static str>> = Rc::new(opts.iter().map(|o| o.v).collect());
+            let vals_for_cb = vals.clone();
+            combo.connect_selected_notify(move |r| {
+                let i = r.selected() as usize;
+                let v = vals_for_cb.get(i).copied().unwrap_or("");
+                folia_tuning_set(&mut st.borrow_mut().folia, &active_s, mode, &path, serde_json::json!(v));
+            });
+            // 释放 vals 的所有权给闭包中不动 (引用计数) —— 弱 Rc 引用本身会在闭包中持有 vals.clone
+            let _ = vals;
+            combo.upcast::<gtk4::Widget>()
+        }
+    }
+}
+

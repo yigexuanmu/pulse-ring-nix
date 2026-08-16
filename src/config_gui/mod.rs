@@ -10,6 +10,7 @@
 // 这样 GUI 与上游 pulse-ring 二进制共用同一份 Config 定义，不重复维护。
 
 pub mod app;
+pub mod folia_meta;
 pub mod i18n;
 pub mod qml_io;
 

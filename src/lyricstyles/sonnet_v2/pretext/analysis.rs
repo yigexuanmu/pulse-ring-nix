@@ -1897,6 +1897,17 @@ fn merge_keep_all_text_segments(
     }
 }
 
+/// `clearAnalysisCaches` — pretext analysis.ts. Rust port holds no global
+/// (singleton) caches (`analysis` is per-call pure functional); the TS clears
+/// the `Intl.Segmenter` singletons which don't exist here. No-op kept for
+/// byte-faithful API parity.
+pub fn clear_analysis_caches() {}
+
+/// `setAnalysisLocale` — pretext analysis.ts. The Rust port keys word-break
+/// behaviour on `UnicodeSegmentation` (UAX #29) built into the crate; there is
+/// no per-locale override. Kept as a no-op for byte-faithful API parity.
+pub fn set_analysis_locale(_locale: Option<&str>) {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

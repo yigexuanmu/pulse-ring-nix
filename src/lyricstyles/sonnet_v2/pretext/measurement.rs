@@ -359,11 +359,15 @@ pub struct FontMeasurementState<'a, B: MeasureBackend> {
 /// the downstream `getCorrectedSegmentWidth` short-circuits to
 /// `metrics.width`, byte-faithful with the TS no-`document` branch.
 pub fn get_font_measurement_state<'a, B: MeasureBackend>(
-    caches: &'a mut MeasurementCaches,
+    caches: &mut MeasurementCaches,
     backend: &'a B,
     font_str: &'a str,
     needs_emoji_correction: bool,
 ) -> FontMeasurementState<'a, B> {
+    // Note: `caches` is borrowed only for the duration of this call (fetches
+    // the per-font cache via clone-on-miss); the returned `FontMeasurementState`
+    // owns its `segment_cache` so callers may freely re-borrow `caches` (e.g.
+    // for `state.commit(caches)`) byte-faithful with the TS WeakMap scope.
     let _ = needs_emoji_correction; // Rust has no DOM-canvas divergence
     let font_size = parse_font_size(font_str);
     let emoji_correction = get_emoji_correction(font_str, font_size);
@@ -423,6 +427,11 @@ impl<'a, B: MeasureBackend> FontMeasurementState<'a, B> {
 }
 
 fn get_emoji_correction(_font_str: &str, _font_size: f32) -> f32 { 0.0 }
+
+/// `clearMeasurementCaches` — pretext measurement.ts:31. The Rust port keeps no
+/// global caches (`get_font_measurement_state` returns an owned cache scoped to
+/// the prepared-text lifetime); kept as a no-op for byte-faithful API parity.
+pub fn clear_measurement_caches() {}
 
 #[cfg(test)]
 mod tests {

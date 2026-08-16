@@ -153,8 +153,10 @@ process.stdin.on('data', (chunk) => {
 // XGetWindowAttributes failed → whenReady 死锁。Wayland 后端 on this
 // compositor (niri) 经实测工作）。
 app.commandLine.appendSwitch('ozone-platform', 'wayland');
-// 必须软件渲染：本机 MESA DRI 权限问题会让 GPU 进程段错误崩溃（exit 139）。
-app.disableHardwareAcceleration();
+// 不调 disableHardwareAcceleration()：sonnet/monet/diorama/pendolo 需要 WebGL（PixiJS）。
+// 之前加它是因为 GPU 进程在 NixOS sandbox 下 exit 139；但主 spawn 已强制
+// --no-sandbox（web_wallpaper.rs），sandbox 不再阻碍 GPU 进程初始化，
+// 留 WebGL 即可恢复 sonnet PixiJS 渲染。
 
 app.whenReady().then(() => {
   // transparent: 歌词层除歌词特效本身外应当全透明，让底层壁纸透出。

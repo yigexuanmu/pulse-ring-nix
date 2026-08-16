@@ -24,6 +24,7 @@ pub mod line_break;
 pub mod line_text;
 pub mod measurement;
 pub mod layout;
+pub mod rich_inline;
 
 /// Placeholder for the shared `Intl.Segmenter('word')` (Phase 2.6 layout.rs
 /// takes ownership of it via analysis.rs). Removed once `analysis.rs` builds

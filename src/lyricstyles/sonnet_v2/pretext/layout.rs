@@ -115,7 +115,11 @@ pub struct PreparedTextWithSegments {
 }
 
 impl PreparedTextWithSegments {
-    fn as_view(&self) -> PreparedSegmentView<'_> {
+    /// `asView`-style accessor — produces the borrow-coupled view
+    /// `PreparedSegmentView` that `line_text::build_line_text_from_range`
+    /// (and rich-inline materializers) consume. `pub(crate)` since rich_inline
+    /// is a sibling pretext module.
+    pub(crate) fn as_view(&self) -> PreparedSegmentView<'_> {
         PreparedSegmentView {
             segments: &self.segments,
             kinds: &self.prepared.kinds,
@@ -847,6 +851,20 @@ pub fn prepare<B: MeasureBackend>(
         prepared: rich.prepared,
         seg_levels: rich.seg_levels,
     }
+}
+
+/// `prepareWithSegments` — pretext layout.ts. Returns the rich variant
+/// (`PreparedTextWithSegments`) so callers (rich-inline, line-text materializers)
+/// can read segment text + the bidi `seg_levels` for rendering.
+pub fn prepare_with_segments<B: MeasureBackend>(
+    text: &str,
+    caches: &mut MeasurementCaches,
+    backend: &B,
+    font: &str,
+    options: PrepareOptions,
+) -> PreparedTextWithSegments {
+    // TS: prepareInternal(text, font, true, options) — include_segments = true.
+    prepare_internal(text, caches, backend, font, true, options)
 }
 
 // ===== create_layout_line / create_layout_line_range =====

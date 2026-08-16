@@ -845,3 +845,30 @@ Phase 2.2（analysis 全算法层）终结：7 个 driver pipeline merge passes 
 | `measurement.ts` | 275 | `measureText` 包装（FreeType 替代 ::after Phase 0 freetype-sys 集成） |
 
 下一续接：读 PLAN Phase 2.3 → 译 `layout.ts`（pretext layout 入口，依赖 analysis.rs 已就绪），逐 export TDD + cargo check + commit。每文件独立 commit，不复用 stub。
+
+### 2026-08-16 续 III —— Phase 2.4/2.5 推进（HEAD = 29e7177）
+
+Phase 2.5 的 bidi.ts（175 行）+ line_text.ts（107 行）+ Phase 2.4 measurement.ts（275 行）全部落地。Phase 2.2 完整收尾。**28 个新 commit past c644f4c**，`sonnet_v2/` Rust **4,879 LOC**，**114 个单元测试绿**（45 analysis + 9 bidi + 9 line_text + 12 measurement + 39 预存）。
+
+| 阶段 | commit | pretext 文件 | TS 行 | Rust 结构 |
+|---|---|---|---|---|
+| 2.2 完整 | `4f0ab37` | analysis.ts 完整算法层（8 passes） | 1458 | analysis.rs |
+| 2.5 bidi | `9e2d1d1` | bidi.ts computeBidiLevels + computeSegmentLevels | 175 | bidi.rs (UTF-16 索引语义保留) |
+| 2.5 line_text | `efcfbea` | line_text.ts buildLineTextFromRange + 图素切片缓存 | 107 | line_text.rs (PreparedSegmentView 借用 adapter) |
+| 2.4 measurement | `29e7177` | measurement.ts 全部算法层 + MeasureBackend trait | 275 | measurement.rs (DOM 缺失 short-circuit faithful) |
+
+**关键架构决策**：
+1. **bidi 索引语义**: pretext TS 保留 UTF-16 codeUnit 索引；Rust analysis.rs::starts[] 是 UTF-8 byte offset。`compute_segment_levels` 按一次 char_indices 走 + UTF-16 cu_len 累计 → 字面行为一致；
+2. **measurement MeasureBackend trait**: `freetype-sys` 实际宽度在 Phase 5 atlas 注入；测量算法 + 3 个 breakable-fit 模式 + 缓存层完全在 measurement.rs，trait 是注入点；
+3. **emojiCorrection byte-faithful 路径**: TS `getEmojiCorrection` 仅在 DOM 存在时返回非 0；Rust 没 DOM → `getCorrectedSegmentWidth` 一直走 `emojiCorrection==0 → metrics.width` 紧直通支路（pretext 没文档测时也是这条路径）；
+4. **EngineProfile non_browser()**: 严格匹配 TS `typeof navigator === 'undefined'` 分支的 5 个常量。
+
+### 续接点：Phase 2.3 / 2.5 剩余
+
+| 文件 | 行 | 主要 exports | 依赖 |
+|---|---|---|---|
+| `rich-inline.ts` | 518 | 行内 rich text 节点（富文本混排） | analysis, measurement |
+| `line-break.ts` | 1236 | `layoutNextLine` / `breakLine` 折行算法 | analysis, measurement, line_text |
+| `layout.ts` | 914 | `prepare` / `prepareWithSegments` / `layoutWithLines` —— pretext 入口 | 全部已 ported 的 |
+
+下一续接顺序（按依赖）：`rich-inline.ts` → `line-break.ts` → `layout.ts`（这最后一个是 pretext 入口，依赖前两者）。每文件独立 commit + test。layout.ts 收尾后 Phase 2 完结，进 Phase 3（纯算法层 sonnetProgram/motion/semantic）。

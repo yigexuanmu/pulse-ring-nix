@@ -25,6 +25,7 @@ pub mod lyrics_util;
 pub mod pretext;
 pub mod random;
 pub mod semantic;
+pub mod motion;
 pub mod program;
 pub mod types;
 

@@ -324,3 +324,48 @@ pub struct SonnetProgram {
     pub paragraph_gap_threshold: f64,
     pub paragraphs: Vec<SonnetParagraph>,
 }
+
+// ===== folia `src/types.ts` theme contract (motion subset) =====
+
+/// folia `src/types.ts` — `animationIntensity = 'calm' | 'normal' | 'chaotic'`.
+///
+/// Consumed by `sonnetMotion.resolve_sonnet_animation_scale` to scale PV
+/// animation amplitude. The full `Theme` contract (`accent`/`background`/
+/// `particleSettings`/...) ports in a later phase; `sonnetMotion` only reads
+/// this field, so we expose a minimal `SonnetTheme` mirroring that subset.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetAnimationIntensity {
+    Calm,
+    Normal,
+    Chaotic,
+}
+
+/// folia `src/types.ts` — `Theme` (motion-only subset).
+#[derive(Debug, Clone, Copy)]
+pub struct SonnetTheme {
+    pub animation_intensity: SonnetAnimationIntensity,
+}
+
+// ===== folia `sonnetTypographyRoles.ts` — layout layer forward type =====
+
+/// folia `sonnetTypographyRoles.ts` — `SonnetSegmentRole =
+/// 'hero' | 'semi-hero' | 'support' | 'decoration'`.
+///
+/// Forward-declared here so `sonnetMotion.resolve_sonnet_segment_depth` /
+/// `resolve_sonnet_segment_normal_offset` can reference it before the full
+/// typography layer port (Phase 5). The enum ordering matches the TS string
+/// union ordering for deterministic dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetSegmentRole {
+    Hero,
+    SemiHero,
+    Support,
+    Decoration,
+}
+
+/// folia `sonnetMotion.ts` — `layoutDirection = 'horizontal' | 'vertical'`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonnetLayoutDirection {
+    Horizontal,
+    Vertical,
+}

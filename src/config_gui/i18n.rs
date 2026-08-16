@@ -50,10 +50,11 @@ fn zh<'a>(k: &'a str) -> Option<&'a str> {
     let table: &[(&str, &str)] = &[
         ("app.title", "pulse-ring 配置"),
         // tabs
-        ("tab.shape", "形状 & 颜色"),
+        ("tab.general", "通用"),
+        ("tab.shape", "形状和颜色"),
         ("tab.rings", "三层环"),
         ("tab.spawn", "出生动画"),
-        ("tab.audio", "音频 & 位置"),
+        ("tab.audio", "音频和位置"),
         ("tab.language", "语言"),
         ("tab.particles", "粒子"),
         ("tab.wallpaper", "壁纸"),
@@ -121,6 +122,7 @@ fn zh<'a>(k: &'a str) -> Option<&'a str> {
         // common
         ("common.save", "保存"),
         ("common.savedHint", "已保存到 ~/.config/pulse-ring/pulse-ring.qml"),
+        ("common.applyHint", "保存后需重启 pulse-ring 生效"),
     ];
     table.iter().find(|(k2, _)| *k2 == k).map(|(_, v)| *v)
 }
@@ -128,10 +130,11 @@ fn zh<'a>(k: &'a str) -> Option<&'a str> {
 fn en<'a>(k: &'a str) -> Option<&'a str> {
     let table: &[(&str, &str)] = &[
         ("app.title", "pulse-ring Settings"),
-        ("tab.shape", "Shape & Color"),
+        ("tab.general", "General"),
+        ("tab.shape", "Shape and Color"),
         ("tab.rings", "Three Rings"),
         ("tab.spawn", "Spawn Animation"),
-        ("tab.audio", "Audio & Position"),
+        ("tab.audio", "Audio and Position"),
         ("tab.language", "Language"),
         ("tab.particles", "Particles"),
         ("tab.wallpaper", "Wallpaper"),
@@ -193,6 +196,7 @@ fn en<'a>(k: &'a str) -> Option<&'a str> {
         ("lang.note", "Takes effect after restarting the GUI"),
         ("common.save", "Save"),
         ("common.savedHint", "Saved to ~/.config/pulse-ring/pulse-ring.qml"),
+        ("common.applyHint", "Restart pulse-ring to apply changes"),
     ];
     table.iter().find(|(k2, _)| *k2 == k).map(|(_, v)| *v)
 }

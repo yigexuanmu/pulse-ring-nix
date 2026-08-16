@@ -40,7 +40,7 @@ ureq = { version = "2", default-features = false, features = ["tls", "gzip"] }
 
 # GTK4 / libadwaita: 独立配置 GUI (bin: pulse-ring-config)
 gtk4 = { version = "0.9", features = ["v4_14"] }
-libadwaita = { version = "0.7", features = ["v1_5"] }
+libadwaita = { version = "0.7", features = ["v1_5", "v1_6"] }
 
 [[bin]]
 name = "pulse-ring"

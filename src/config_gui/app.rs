@@ -73,56 +73,18 @@ fn present_window(app: &adw::Application, state: State) {
     }
     let tr = Tr::new();
 
-    let win = adw::ApplicationWindow::builder()
+    // AdwPreferencesWindow 本身是 GtkWindow（顶层 root）—— 直接当顶层窗口用，
+    // 严禁再套 ApplicationWindow/ToolbarView（之前崩溃根因：双重 root）。
+    let prefs = adw::PreferencesWindow::builder()
         .application(app)
+        .title(&title)
         .default_width(900)
         .default_height(680)
         .build();
-
-    // —— HeaderBar ——
-    let header = adw::HeaderBar::new();
-
-    // 语言切换按钮：写偏好 + 弹提示 (重开 GUI 生效)
-    let lang_btn = gtk4::Button::with_label(tr.get(lang, "tab.language"));
-    lang_btn.add_css_class("flat");
-    let st = state.clone();
-    lang_btn.connect_clicked(move |_| {
-        let cur = st.borrow().lang;
-        let next = cur.other();
-        st.borrow_mut().lang = next;
-        save_lang_pref(next);
-        let msg = format!(
-            "{} → {} ({})",
-            tr.get(cur, "tab.language"),
-            next.code(),
-            tr.get(cur, "lang.note"),
-        );
-        info_dialog(&msg);
-    });
-    header.pack_start(&lang_btn);
-
-    // 保存按钮：写盘 + 弹提示
-    let save_btn = gtk4::Button::with_label(tr.get(lang, "common.save"));
-    save_btn.add_css_class("suggested-action");
-    let st = state.clone();
-    save_btn.connect_clicked(move |_| {
-        let s = st.borrow();
-        match qml_io::save_config(&s.config) {
-            Ok(_) => info_dialog(&s.tr.get(s.lang, "common.savedHint")),
-            Err(e) => {
-                info_dialog(&format!("{}: {}", s.tr.get(s.lang, "common.save"), e))
-            }
-        }
-    });
-    header.pack_end(&save_btn);
-
-    let toolbar = adw::ToolbarView::new();
-    toolbar.add_top_bar(&header);
-
-    // —— 多 PreferencesPage ——
-    let prefs = adw::PreferencesWindow::new();
     prefs.set_search_enabled(true);
 
+    // —— 各 PreferencesPage ——
+    build_general_page(&prefs, state.clone(), &tr, lang);
     build_shape_color_page(&prefs, state.clone(), &tr, lang);
     build_rings_page(&prefs, state.clone(), &tr, lang);
     build_spawn_page(&prefs, state.clone(), &tr, lang);
@@ -130,26 +92,16 @@ fn present_window(app: &adw::Application, state: State) {
     build_language_page(&prefs, state.clone(), &tr, lang);
     build_stub_pages(&prefs, &tr, lang);
 
-    toolbar.set_content(Some(&prefs));
-    win.set_content(Some(&toolbar));
-    win.set_title(Some(&title));
-    win.present();
+    prefs.present();
+}
+
+/// 弹一个 libadwaita Toast（保存反馈等）。parent 必须是 PreferencesWindow。
+fn toast(parent: &adw::PreferencesWindow, msg: &str) {
+    let t = adw::Toast::new(msg);
+    parent.add_toast(t);
 }
 
 // —— helpers ——
-
-/// 弹一个非阻塞信息对话框（v1 用 gtk4 MessageDialog）。
-fn info_dialog(msg: &str) {
-    use gtk4::Dialog;
-    use gtk4::MessageType;
-    let dlg = gtk4::MessageDialog::builder()
-        .text(msg)
-        .message_type(MessageType::Info)
-        .buttons(gtk4::ButtonsType::Ok)
-        .build();
-    dlg.connect_response(|d, _| d.close());
-    dlg.present();
-}
 
 /// 构造 ActionRow + Scale 后缀，绑定到 Config 字段。返回该 row 供 add 进 group。
 fn scale_row<F>(
@@ -191,6 +143,40 @@ fn shape_from_index(i: u32) -> crate::config::Shape {
         5 => crate::config::Shape::Star,
         _ => crate::config::Shape::Flower,
     }
+}
+
+// ============== General (Save + apply hint) page ==============
+
+fn build_general_page(prefs: &adw::PreferencesWindow, state: State, tr: &Tr, lang: Lang) {
+    let page = adw::PreferencesPage::new();
+    page.set_title(tr.get(lang, "tab.general"));
+    page.set_icon_name(Some("emblem-system-symbolic"));
+
+    let grp = adw::PreferencesGroup::new();
+    grp.set_title(tr.get(lang, "tab.general"));
+    grp.set_description(Some(tr.get(lang, "common.applyHint")));
+
+    // 保存按钮：AdwButtonRow（libadwaita 1.5+），看起来像按钮的整行。
+    let save_row = adw::ButtonRow::builder()
+        .title(tr.get(lang, "common.save"))
+        .build();
+    save_row.add_css_class("suggested-action");
+    let st = state.clone();
+    let prefs_clone = prefs.clone();
+    save_row.connect_activated(move |_| {
+        let msg = {
+            let s = st.borrow();
+            match qml_io::save_config(&s.config) {
+                Ok(_) => s.tr.get(s.lang, "common.savedHint").to_string(),
+                Err(e) => format!("{}: {}", s.tr.get(s.lang, "common.save"), e),
+            }
+        };
+        toast(&prefs_clone, &msg);
+    });
+    grp.add(&save_row);
+
+    page.add(&grp);
+    prefs.add(&page);
 }
 
 // ============== 各页 ==============

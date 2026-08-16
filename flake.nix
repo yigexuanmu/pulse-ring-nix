@@ -52,6 +52,10 @@
               pkgs.alsa-lib
               pkgs.wayland
               pkgs.libxkbcommon
+              # Sonnet v2 uses FreeType for byte-identical glyph coverage + harfbuzz
+              # for shaping, replacing the fontdue SDF raster.
+              pkgs.freetype
+              pkgs.harfbuzz
               # PipeWire ALSA plugin: libasound_module_pcm_pipewire.so + 50/99-pipewire.conf
               # Without it, ALSA `default` PCM can't dlopen the PipeWire backend and
               # `snd_pcm_hw_params` returns ENOENT → audio falls back to silent_source.
@@ -116,6 +120,10 @@
               # catch real audio the same way the installed binary does.
               pkgs.pipewire
               pkgs.pulseaudio
+              # Sonnet v2 uses FreeType for byte-identical glyph coverage + harfbuzz
+              # for shaping, replacing the fontdue SDF raster.
+              pkgs.freetype
+              pkgs.harfbuzz
             ];
           };
         });

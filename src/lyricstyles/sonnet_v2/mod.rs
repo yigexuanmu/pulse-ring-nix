@@ -32,6 +32,7 @@ pub mod semantic;
 pub mod poster_blocks_layout;
 pub mod shot_flow_layouts;
 pub mod transitions;
+pub mod typography_layout;
 pub mod typography_roles;
 pub mod types;
 

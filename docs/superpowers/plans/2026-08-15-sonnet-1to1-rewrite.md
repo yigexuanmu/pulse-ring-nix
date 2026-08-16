@@ -926,3 +926,42 @@ Phase 2.5 的 bidi.ts（175 行）+ line_text.ts（107 行）+ Phase 2.4 measure
 
 ### Next session continuation seed
 **Port `rich_inline.rs`** (port of pretext rich-inline.ts — 518 lines): the rich-text inline expansion layer. It imports only from already-ported `layout.ts` + `line-break.ts`, so it is the last self-contained pretext file. Exports: `prepareRichInline` (or equivalent), `RichInlineNode` / `RichInlineSegment` types, with measurement wired through `MeasureBackend`. After rich-inline lands, **Phase 2 (pretext) is fully complete** and Phase 3 (sonnet pure-algorithm layer: types/motion/program/random/semantic) can begin — those folia files are already read in context from the audit pass.
+
+### Phase 2.8 — rich_inline.rs ✅ landed
+- `src/lyricstyles/sonnet_v2/pretext/rich_inline.rs` 760 lines (port of pretext rich-inline.ts 518 lines).
+- Structure: 9 public types (`RichInlineItem`, `RichInlineBreak`, `PreparedRichInline`, `RichInlineCursor`, `RichInlineFragment`, `RichInlineFragmentRange`, `RichInlineLine`, `RichInlineLineRange`, `RichInlineStats`) + private `PreparedRichInlineItem` + `prepare_rich_inline` (collapsible-boundary gap accumulation across item boundaries, shared `MeasureBackend`) + `step_rich_inline_line` walker (atomic `Never` items + greedy line fold via `step_prepared_line_geometry` delegation) + `materialize_fragment_text` + `materialize_rich_inline_line_range` + `walk_rich_inline_line_ranges` + `measure_rich_inline_stats`. 4 new tests green.
+- Key port fidelity notes:
+  - `get_collapsed_space_width` uses `RefCell<HashMap<String,f32>>` since TS relies on JS closure-shared mutable state — Rust needs an inner-mutable borrow for cross-call memoization without changing the outer `&mut caches` signature.
+  - `prepareWholeItemLine` calls `step_prepared_line_geometry` with `f32::INFINITY` to mirror TS `Number.POSITIVE_INFINITY` "always fits" semantics (the stepper clamps fit comparisons).
+  - `as_view` lifted to `pub(crate)` on `PreparedTextWithSegments` so the sibling `rich_inline` materializer can borrow the `PreparedSegmentView` for `build_line_text_from_range` without exposing the field publicly.
+  - Unicode full-width `）` (U+FF09) typo crept into one `if let` pattern at write time — caught + replaced with ASCII `)` before commit. Watch for this on future big-file writes.
+
+## Phase 2 (pretext) — FULLY COMPLETE ✅
+
+All 7 pretext files ported byte-faithful: `analysis → bidi + bidi_data → line_text → measurement → line_break → layout → rich_inline`. **5683 TS lines → 8279 Rust LOC.** **124 unit tests green, 0 regressions.** HEAD `fcae717` == `origin/feat/sonnet-1to1-rewrite`, 33 commits past `c644f4c`.
+
+| File | TS lines | Rust lines | Status |
+|---|---|---|---|
+| bidi_data (2.1) | 996 | 831 | ✅ |
+| analysis (2.2) | 1458 | 2679 | ✅ all 8 merge passes |
+| line_text (2.5a) | 107 | 285 | ✅ |
+| measurement (2.4) | 275 | 594 | ✅ (FontMeasurementState owns cache) |
+| line_break (2.6) | 1236 | 1641 | ✅ |
+| bidi (2.5b) | 175 | 318 | ✅ |
+| layout (2.7) | 914 | 1121 | ✅ |
+| **rich_inline (2.8)** | **518** | **760** | **✅ THIS TURN** |
+
+### Next session continuation seed
+**Phase 3 — sonnet pure-algorithm layer** (folia files already read in full earlier in this and prior sessions, no new sources need re-reading). All zero-PIXI / pure-function modules:
+
+| File | Lines | Role |
+|---|---|---|
+| `types.ts` | 95 | `SonnetShot` / `SonnetShotKind` / `SonnetProgram` / `SonnetSegmentRole` / `SonnetAnimationCue` / `GraphemeTiming` etc. Pure data contracts. |
+| `sonnetRandom.ts` | 21 | `hashSonnetSeed`: FNV-style hash → seeded RNG. ~30 Rust LOC. |
+| `sonnetMotion.ts` | 282 | Easing functions + motion utilities for shot transitions. |
+| `sonnetProgram.ts` | 265 | `buildSonnetProgram(lines)`: paragraph folding by `songPart`/`isChorus`, shot boundary detection (cue start times), shot-duration aggregation. |
+| `sonnetSemantic.ts` | ? | Segment role classification (`SonnetSegmentRole` for hero/semi-hero/support/decoration). |
+
+Phase 3 ordering: `types → random → motion → program → semantic` (each independent, no inter-file deps). Target: byte-identical port exposing the inputs Phase 4 (Mg family — `sonnetSceneBuilder` / `sonnetTextViewBuilder` / `sonnetCameraTracking`) consumes. Phase 4 is where the **X-architecture arena indexing** must replace the folia PIXI scene-tree mutation: each `GlyphView` / `ShotView` / `SegmentView` / `SceneView` becomes an arena `Id` + flat mutate-then-flatten pass that emits the existing `CharQuad` draw stream.
+
+Phase 4+ touch points (defer): the FreeType/Harfbuzz-based `GlyphAtlas` extension (Phase 5), `run.rs` QML menu wiring (Phase 9.5), `main.rs::active_lyric_index` and `lyricview.rs::build_frame` integration so the v2 path lights up behind a config flag.

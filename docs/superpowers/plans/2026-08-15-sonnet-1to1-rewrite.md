@@ -901,3 +901,28 @@ Phase 2.5 的 bidi.ts（175 行）+ line_text.ts（107 行）+ Phase 2.4 measure
 
 ### Next session continuation seed
 **Port `layout.rs`** (port of layout.ts — 914 lines): types `PreparedText` / `PreparedSegmentView` / `MeasuredTextUnit` / `PreparedTextWithSegments` / `AnalysisProfile`-shaped builder, `measureNaturalWidth` / `prepare` / `prepareWithSegments` / `measureAnalysis` (self-contained per the read-through notes — they only need `analysis` + `measurement` exports, both done). The `layoutWithLines` / `layout` line-break-dependent public APIs land with line-break integration (or as a stub returning the walker delegation already present in line_break.rs).
+
+### Phase 2.7 — layout.rs ✅ landed
+- `src/lyricstyles/sonnet_v2/pretext/layout.rs` 1121 lines (port of pretext layout.ts 914 lines).
+- Structure: 9 public types (`PrepareOptions` + `PreparedText` + `PreparedTextWithSegments` + `LayoutCursor` + `LayoutLine` + `LayoutLineRange` + `LayoutResult` + `LayoutLinesResult` + `LineStats`) + private `PreparedSegmentView` / `MeasuredTextUnit` / `BreakGroupAccum` + the full `measure_analysis` / `prepare_internal` / `build_base_cjk_units` / `count_rendered_spacing_graphemes` / `is_preferred_break_grapheme` / `get_breakable_grapheme_advance` / `merge_keep_all_text_units` / `map_analysis_chunks_to_prepared_chunks` pipeline + 9 public layout APIs (`prepare` / `layout` / `materialize_line_range` / `walk_line_ranges` / `measure_line_stats` / `measure_natural_width` / `layout_next_line` / `layout_next_line_range` / `layout_with_lines` / `clear_cache`).
+- **120 tests green** (was 118; +2 new layout tests: `prepare_latin_text_and_layout_wraps_by_width` + `layout_with_lines_materializes_each_line`).
+- Key port fidelity notes:
+  - `measure_analysis` / `prepare_internal` / `prepare` are generic over `B: MeasureBackend` so the real FreeType backend (Phase 5) and the test `ByteLenBackend` both plug in byte-faithfully.
+  - `walk_prepared_lines_raw` takes `Option<LineVisitor<'_>>` (a `&mut dyn FnMut(f32, usize, usize, usize, usize)`); layout wraps its closures into locals first then passes `Some(&mut visitor)` to avoid borrow-checker churn with the captured `prepared` ref.
+  - `buildLineTextFromRange` preserves the trailing space at the break boundary (line text "abc " not "abc") — confirmed by test output and faithful to the TS slicing logic (end-grapheme-inclusive).
+  - Supporting no-ops on sibling modules for byte-faithful API parity: `analysis::clear_analysis_caches` + `analysis::set_analysis_locale`, `measurement::clear_measurement_caches`. Relaxed the `caches` borrow lifetime in `measurement::get_font_measurement_state` so the returned `FontMeasurementState` owns its `segment_cache` (callers may re-borrow `caches` for `state.commit(caches)` — matches TS WeakMap scope semantics).
+
+### Pretext status: 7/8 files ported, 7544 LOC shipshape on origin (`9f81839`)
+| File | TS lines | Rust lines | Status |
+|---|---|---|---|
+| bidi_data (2.1) | 996 | 831 | ✅ |
+| analysis (2.2) | 1458 | 2679 | ✅ all 8 merge passes |
+| line_text (2.5a) | 107 | 285 | ✅ |
+| measurement (2.4) | 275 | 594 | ✅ (FontMeasurementState owns cache) |
+| line_break (2.6) | 1236 | 1641 | ✅ |
+| bidi (2.5b) | 175 | 318 | ✅ |
+| **layout (2.7)** | **914** | **1121** | **✅ THIS TURN** |
+| rich_inline (2.8) | 518 | 0 | NEXT — last pretext file |
+
+### Next session continuation seed
+**Port `rich_inline.rs`** (port of pretext rich-inline.ts — 518 lines): the rich-text inline expansion layer. It imports only from already-ported `layout.ts` + `line-break.ts`, so it is the last self-contained pretext file. Exports: `prepareRichInline` (or equivalent), `RichInlineNode` / `RichInlineSegment` types, with measurement wired through `MeasureBackend`. After rich-inline lands, **Phase 2 (pretext) is fully complete** and Phase 3 (sonnet pure-algorithm layer: types/motion/program/random/semantic) can begin — those folia files are already read in context from the audit pass.

@@ -628,6 +628,98 @@ pub fn merge_url_like_runs(seg: MergedSegmentation) -> MergedSegmentation {
     }
 }
 
+/// `numericJoinerChars` — pretext analysis.ts:695. Nine chars that glue adjacent
+/// numeric segments together (punctuation commonly found in numeric runs). The
+/// TS Set is small enough to spell out as a `matches!`.
+pub fn is_numeric_joiner_char(ch: char) -> bool {
+    matches!(
+        ch,
+        ':' | '-' | '/' | '×' | ',' | '.' | '+' | '\u{2013}' | '\u{2014}'
+    )
+}
+
+/// `segmentContainsDecimalDigit(text)` — pretext analysis.ts:778. True iff any
+/// code point in `text` has General_Category Nd (decimal number).
+pub fn segment_contains_decimal_digit(text: &str) -> bool {
+    text.chars().any(is_decimal_digit_char)
+}
+
+/// `isNumericRunSegment(text)` — pretext analysis.ts:785. A text run qualifies as
+/// a numeric run iff nonempty AND every char is a decimal digit OR one of the
+/// numeric joiner chars.
+pub fn is_numeric_run_segment(text: &str) -> bool {
+    if text.is_empty() { return false; }
+    text.chars().all(|ch| is_decimal_digit_char(ch) || is_numeric_joiner_char(ch))
+}
+
+/// `mergeNumericRuns` — pretext analysis.ts:794.
+/// Merge runs of numeric text segments (Nd + numeric joiners) into a single Text
+/// segment, stopping at any kind-breaking or non-numeric text segment. Each
+/// absorbed run starts as a `text`-kind segment accepted by `isNumericRunSegment`
+/// (no need to verify it carries a decimal digit individually — the START seg
+/// must contain a Nd char per the outer condition). Byte-identical control flow
+/// to the TS original.
+pub fn merge_numeric_runs(seg: MergedSegmentation) -> MergedSegmentation {
+    let len = seg.len;
+    let in_texts = seg.texts;
+    let in_is_word_like = seg.is_word_like;
+    let in_kinds = seg.kinds;
+    let in_starts = seg.starts;
+
+    let mut texts: Vec<String> = vec![];
+    let mut is_word_like: Vec<bool> = vec![];
+    let mut kinds: Vec<SegmentBreakKind> = vec![];
+    let mut starts: Vec<usize> = vec![];
+
+    let mut i = 0usize;
+    while i < len {
+        let text = &in_texts[i];
+        let kind = in_kinds[i];
+        if kind == SegmentBreakKind::Text
+            && is_numeric_run_segment(text)
+            && segment_contains_decimal_digit(text)
+        {
+            let mut merged_parts: Vec<String> = vec![text.clone()];
+            let mut j = i + 1;
+            while j < len
+                && in_kinds[j] == SegmentBreakKind::Text
+                && is_numeric_run_segment(&in_texts[j])
+            {
+                merged_parts.push(in_texts[j].clone());
+                j += 1;
+            }
+            texts.push(join_text_parts(&merged_parts));
+            is_word_like.push(true);
+            kinds.push(SegmentBreakKind::Text);
+            starts.push(in_starts[i]);
+            i = j; // TS: i = j - 1; outer for-loop ++ .
+            continue;
+        }
+        texts.push(text.clone());
+        is_word_like.push(in_is_word_like[i]);
+        kinds.push(kind);
+        starts.push(in_starts[i]);
+        i += 1;
+    }
+
+    let new_len = texts.len();
+    MergedSegmentation {
+        len: new_len,
+        texts,
+        text_parts: vec![],
+        is_word_like,
+        kinds,
+        starts,
+        single_char_run_chars: vec![],
+        single_char_run_lengths: vec![],
+        contains_cjk: vec![],
+        contains_arabic_script: vec![],
+        ends_with_closing_quote: vec![],
+        ends_with_myanmar_medial_glue: vec![],
+        has_arabic_no_space_punctuation: vec![],
+    }
+}
+
 /// `mergeGlueConnectedTextRuns` — pretext analysis.ts:951.
 /// Fold chains of `glue`-kind segments into adjacent `text` runs; standalone glue
 /// clusters (no following text) are kept as glue kind. Byte-identical control flow.
@@ -919,9 +1011,9 @@ fn build_merged_segmentation(
     let seg = merge_glue_connected_text_runs(seg);
     let seg = merge_url_like_runs(seg);
     let seg = merge_url_query_runs(seg);
-    // TODO Phase 2.2: remaining 5 passes — merge_numeric_runs /
-    //   split_hyphenated_numeric_runs / merge_no_space_word_chains /
-    //   carry_trailing_forward_sticky_across_cjk_boundary /
+    let seg = merge_numeric_runs(seg);
+    // TODO Phase 2.2: remaining 4 passes — split_hyphenated_numeric_runs /
+    //   merge_no_space_word_chains / carry_trailing_forward_sticky_across_cjk_boundary /
     //   merge_keep_all_text_segments — ported in follow-up commits one pass at a time.
     seg
 }
@@ -1874,5 +1966,75 @@ mod tests {
         assert_eq!(merged.len, 2);
         assert_eq!(merged.texts[0], "http://foo?q=1");
         assert_eq!(merged.texts[1], " ");
+    }
+
+    /// `is_numeric_run_segment` classification.
+    #[test]
+    fn numeric_run_segment_classifier() {
+        assert!(is_numeric_run_segment("3.14"));
+        assert!(is_numeric_run_segment("12:30:00"));
+        assert!(is_numeric_run_segment("2024-01-01"));
+        // '=' is NOT a numeric joiner — test the negative case:
+        assert!(!is_numeric_run_segment("1=1"));
+        assert!(!is_numeric_run_segment(""));
+        assert!(!is_numeric_run_segment("abc"));
+        assert!(!is_numeric_run_segment("1a2"));
+        // en dash / em dash are joiners:
+        assert!(is_numeric_run_segment("5–3"));
+        assert!(is_numeric_run_segment("5—3"));
+    }
+
+    /// `merge_numeric_runs` merges a chain of numeric text segments into one.
+    #[test]
+    fn merge_numeric_runs_folds_digit_chain() {
+        // ["2024", "-", "01", "-", "01"] all text kind — merges into one Text seg.
+        let seg = MergedSegmentation {
+            len: 5,
+            texts: vec!["2024".into(), "-".into(), "01".into(), "-".into(), "01".into()],
+            text_parts: vec![vec![]; 5],
+            is_word_like: vec![false; 5],
+            kinds: vec![SegmentBreakKind::Text; 5],
+            starts: vec![0, 4, 5, 7, 8],
+            single_char_run_chars: vec![None; 5],
+            single_char_run_lengths: vec![0; 5],
+            contains_cjk: vec![false; 5],
+            contains_arabic_script: vec![false; 5],
+            ends_with_closing_quote: vec![false; 5],
+            ends_with_myanmar_medial_glue: vec![false; 5],
+            has_arabic_no_space_punctuation: vec![false; 5],
+        };
+        let merged = merge_numeric_runs(seg);
+        assert_eq!(merged.len, 1);
+        assert_eq!(merged.texts[0], "2024-01-01");
+        assert_eq!(merged.is_word_like[0], true);
+        assert_eq!(merged.starts[0], 0);
+    }
+
+    /// `merge_numeric_runs`: pure joiner run (e.g. ":.") with no leading digit is NOT
+    /// a numeric run — `segment_contains_decimal_digit` gate keeps it as separate
+    /// text segments.
+    #[test]
+    fn merge_numeric_runs_skips_pure_joiners() {
+        // ":." contains only joiners and no digit → is_numeric_run_segment=true
+        // but segment_contains_decimal_digit=false → outer condition fails. Each
+        // ":" and "." appear as independent Text segments (no merge).
+        let seg = MergedSegmentation {
+            len: 2,
+            texts: vec![":".into(), ".".into()],
+            text_parts: vec![vec![]; 2],
+            is_word_like: vec![false; 2],
+            kinds: vec![SegmentBreakKind::Text; 2],
+            starts: vec![0, 1],
+            single_char_run_chars: vec![None; 2],
+            single_char_run_lengths: vec![0; 2],
+            contains_cjk: vec![false; 2],
+            contains_arabic_script: vec![false; 2],
+            ends_with_closing_quote: vec![false; 2],
+            ends_with_myanmar_medial_glue: vec![false; 2],
+            has_arabic_no_space_punctuation: vec![false; 2],
+        };
+        let merged = merge_numeric_runs(seg);
+        assert_eq!(merged.len, 2); // both standalone, not merged
+        assert_eq!(merged.is_word_like[0], false);
     }
 }

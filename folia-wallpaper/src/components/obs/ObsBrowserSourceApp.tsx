@@ -3,14 +3,100 @@ import { useMotionValue } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import VisualizerRenderer from '../visualizer/VisualizerRenderer';
 import { PlayerState } from '../../types';
+import type { Theme } from '../../types';
 import type { ObsBrowserSourceAudio, ObsBrowserSourceClock, ObsBrowserSourceConfig } from '../../types/obsBrowserSource';
 import { findLatestActiveLineIndex } from '../../utils/appPlaybackHelpers';
 import { buildObsBrowserSourceConfigSignature, resolveObsBrowserSourceClockTime } from '../../utils/obsBrowserSource';
+import { extractColors } from '../../utils/colorExtractor';
 
 // src/components/obs/ObsBrowserSourceApp.tsx
 // Read-only OBS browser source renderer driven by Folia's main playback clock.
+//
+// Theme: pulse-ring pushes a fixed theme derived from its ring palette
+// (always-purple when no music / single-color preview). Here we override
+// `theme.primaryColor / backgroundColor / accentColor` with colors extracted
+// from the album cover via the project-bundled `extractColors`, picking a
+// mid-lightness representative so the lyric text stays legible on any cover.
 
 const EMPTY_SPECTRUM = new Uint8Array(0);
+
+// --- small color helpers (kept local; no new deps) ---
+const hexToRgb = (hex: string): [number, number, number] => {
+    const m = hex.replace('#', '');
+    return [
+        parseInt(m.slice(0, 2), 16) || 0,
+        parseInt(m.slice(2, 4), 16) || 0,
+        parseInt(m.slice(4, 6), 16) || 0,
+    ];
+};
+const rgbToHex = (r: number, g: number, b: number): string =>
+    '#' + [r, g, b]
+        .map(v => Math.max(0, Math.min(255, Math.round(v))).toString(16).padStart(2, '0'))
+        .join('');
+// HSL-ish lightness (range 0-255); used to pick the mid-bright representative.
+const rgbLightness = (r: number, g: number, b: number): number =>
+    (Math.max(r, g, b) + Math.min(r, g, b)) / 2;
+// Pick the per-lightness median of the colors array. extractColors returns colors
+// sorted by saturation (most vibrant first), not by brightness — so we re-sort
+// here and pick the middle element, which is usually the most "representative"
+// mid-tone of the cover.
+const pickMidLightness = (colors: string[]): string | null => {
+    if (!colors || colors.length === 0) return null;
+    const sorted = [...colors].sort((a, b) => {
+        const [ar, ag, ab] = hexToRgb(a);
+        const [br, bg, bb] = hexToRgb(b);
+        return rgbLightness(ar, ag, ab) - rgbLightness(br, bg, bb);
+    });
+    return sorted[Math.floor(sorted.length / 2)];
+};
+// Lighten a color toward white by fraction f (0-1).
+const lighten = (hex: string, f: number): string => {
+    const [r, g, b] = hexToRgb(hex);
+    return rgbToHex(r + (255 - r) * f, g + (255 - g) * f, b + (255 - b) * f);
+};
+// Darken a color toward black by fraction f (0-1).
+const darken = (hex: string, f: number): string => {
+    const [r, g, b] = hexToRgb(hex);
+    return rgbToHex(r * (1 - f), g * (1 - f), b * (1 - f));
+};
+// If a color is too dark to read against a very dark background, lift it until
+// its lightness clears `minL` (range 0-255). Nighttime goals need a higher
+// floor than daytime.
+const ensureVisible = (hex: string, minL: number): string => {
+    const [r, g, b] = hexToRgb(hex);
+    const l = rgbLightness(r, g, b);
+    if (l >= minL) return hex;
+    const f = (minL - l) / (255 - l || 1);
+    return lighten(hex, Math.min(0.85, f));
+};
+// Derive a legible theme from cover-derived representative colors. Returning
+// null lets the caller preserve the pulse-ring-supplied fallback theme for
+// the no-cover / extraction-failure case (no flicker transition).
+const buildCoverTheme = (
+    coverColors: string[],
+    fallback: Theme,
+    isDaylight: boolean,
+): Theme | null => {
+    if (!coverColors || coverColors.length === 0) return null;
+    const mid = pickMidLightness(coverColors) ?? fallback.primaryColor;
+    // extractColors returns most-vibrant-first; use it as accent.
+    const vibrant = coverColors[0] ?? fallback.accentColor;
+    const secondarySeed = coverColors[Math.min(coverColors.length - 1, Math.max(1, Math.floor(coverColors.length * 0.4)))];
+    const primaryLift = isDaylight ? 90 : 130;
+    const secondaryLift = isDaylight ? 70 : 120;
+    const accentLift = isDaylight ? 80 : 100;
+    const primaryColor = ensureVisible(mid, primaryLift);
+    return {
+        ...fallback,
+        name: 'pulse-ring-cover',
+        primaryColor,
+        accentColor: ensureVisible(vibrant, accentLift),
+        secondaryColor: ensureVisible(secondarySeed ?? mid, secondaryLift),
+        // Keep a tight, recognisable background derived from the same hue (instead
+        // of pulse-ring's near-black base) so the cover palette reads as one piece.
+        backgroundColor: darken(primaryColor, 0.78),
+    };
+};
 
 const buildEventSourceUrl = () => {
     const params = new URLSearchParams(window.location.search);
@@ -51,6 +137,10 @@ const ObsBrowserSourceApp: React.FC = () => {
         spectrum,
     }), [bass, lowMid, mid, spectrum, treble, vocal]);
 
+    // Cover-derived override for theme.primaryColor/backgroundColor/accentColor.
+    // null preserves the pulse-ring-supplied config.theme (no flicker transition).
+    const [derivedTheme, setDerivedTheme] = useState<Theme | null>(null);
+
     useEffect(() => {
         document.body.style.backgroundColor = 'transparent';
         document.documentElement.style.backgroundColor = 'transparent';
@@ -61,6 +151,29 @@ const ObsBrowserSourceApp: React.FC = () => {
     useEffect(() => {
         configRef.current = config;
     }, [config]);
+
+    // Override lyric/background colors across song changes using the album cover.
+    // extractColors (project-bundled) returns up to 5 vibrancy-ranked hex colors;
+    // buildCoverTheme picks the mid-lightness representative and produces a
+    // legible, single-hue theme. Skipped (stays on pulse-ring fallback) when
+    // there is no coverUrl or extraction fails.
+    useEffect(() => {
+        const coverUrl = config?.coverUrl;
+        const isDaylight = config?.isDaylight ?? false;
+        const fallback = config?.theme;
+        if (!coverUrl || !fallback) {
+            setDerivedTheme(null);
+            return;
+        }
+        let cancelled = false;
+        void extractColors(coverUrl, 5)
+            .then(colors => {
+                if (cancelled) return;
+                setDerivedTheme(buildCoverTheme(colors, fallback, isDaylight));
+            })
+            .catch(() => { if (!cancelled) setDerivedTheme(null); });
+        return () => { cancelled = true; };
+    }, [config?.coverUrl, config?.isDaylight, config?.theme]);
 
     useEffect(() => {
         let isHandlingResize = false;
@@ -173,6 +286,8 @@ const ObsBrowserSourceApp: React.FC = () => {
         );
     }
 
+    const effectiveTheme = derivedTheme ?? config.theme;
+
     return (
         <div
             className="overflow-hidden"
@@ -180,8 +295,8 @@ const ObsBrowserSourceApp: React.FC = () => {
                 width: obsDimensions.width,
                 height: obsDimensions.height,
                 zoom: obsScale,
-                backgroundColor: config.background?.transparent ? 'transparent' : config.theme.backgroundColor,
-                color: config.theme.primaryColor,
+                backgroundColor: config.background?.transparent ? 'transparent' : effectiveTheme.backgroundColor,
+                color: effectiveTheme.primaryColor,
             }}
         >
             <VisualizerRenderer
@@ -190,7 +305,7 @@ const ObsBrowserSourceApp: React.FC = () => {
                 currentTime={currentTime}
                 currentLineIndex={currentLineIndex}
                 lines={config.lyrics?.lines ?? []}
-                theme={config.theme}
+                theme={effectiveTheme}
                 subtitleTheme={config.subtitleTheme}
                 isDaylight={config.isDaylight}
                 audioPower={audioPower}

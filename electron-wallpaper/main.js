@@ -112,10 +112,11 @@ const TRANSPARENT_BG = { mode: null, transparent: true };
 // 5 频段峰值（folia ObsBrowserSourceAudio.bands 的 5 字段: bass/lowMid/mid/vocal/treble）
 // 间隔与 obs-bridge.ts 对齐 (0-6/6-20/20-55/55-90/90-128)。
 function compute5Band(bands) {
+  // folia 协议: bands 是 0..255 (AnalyserNode byte range); pulse-ring 给 0..1, *255 对齐.
   const peak = (a, b) => {
     let m = 0;
     for (let i = a; i < b && i < bands.length; i++) m = Math.max(m, bands[i]);
-    return m;
+    return Math.min(255, Math.round(m * 255));
   };
   return {
     bass: peak(0, 6),
@@ -217,8 +218,12 @@ function buildObsAudio(bands, energy) {
   for (let i = 0; i < arr.length && i < 128; i++) {
     spectrum.push(Math.min(255, Math.round(arr[i] * 255)));
   }
+  // folia 协议: audioPower/bands/spectrum 全部 0..255 (folia usePlaybackVisualizerBridge 用
+  // AnalyserNode.getByteFrequencyData 0..255 再 process() 保持 0..255; diorama DioramaScene.tsx:879
+  // 注释 "Audio levels arrive 0..255" 后 /255 归一). pulse-ring audio.rs 给 0..1 FFT magnitude,
+  // 这里 *255 对齐; 否则 diorama /255 永远 ~0.0003 → 音频响应失效.
   return {
-    audioPower: energy || 0,
+    audioPower: Math.min(255, Math.round((energy || 0) * 255)),
     bands: compute5Band(arr),
     spectrum,
     sentAtMs: Date.now(),

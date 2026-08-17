@@ -1147,20 +1147,26 @@ fn spawn_cover_thread() -> (
 fn build_cover_data_url(path: &str) -> Option<String> {
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     let expanded = path.replacen('~', &std::env::var("HOME").unwrap_or_default(), 1);
-    let bytes = std::fs::read(&expanded).ok()?;
-    if bytes.is_empty() {
-        return None;
-    }
-    // `image` is built with only png+jpeg here; load_from_memory handles both.
-    let img = image::load_from_memory(&bytes).ok()?;
-    let thumb = img.thumbnail(256, 256);
+    let bytes = match std::fs::read(&expanded) {
+        Ok(b) if !b.is_empty() => b,
+        _ => { log::warn!("cover-data-url: read failed or empty {path}"); return None; }
+    };
+    // `image` 0.25 only bundles zune-jpeg (decoder); no JPEG encoder by default here.
+    // decode handles png+jpeg; encode uses PNG (bundled png encoder).
+    let img = match image::load_from_memory(&bytes) {
+        Ok(v) => v,
+        Err(e) => { log::warn!("cover-data-url: decode failed {path} ({e})"); return None; }
+    };
+    // 128x128 is plenty for folia's extractColors 50×50 grid; base64 data URL still tiny (~few KiB).
+    let thumb = img.thumbnail(128, 128);
     let mut buf = std::io::Cursor::new(Vec::<u8>::new());
-    thumb.write_to(&mut buf, image::ImageFormat::Jpeg).ok()?;
-    let out = buf.into_inner();
-    if out.is_empty() {
+    if let Err(e) = thumb.write_to(&mut buf, image::ImageFormat::Png) {
+        log::warn!("cover-data-url: png encode failed {path} ({e})");
         return None;
     }
-    Some(format!("data:image/jpeg;base64,{}", STANDARD.encode(&out)))
+    let out = buf.into_inner();
+    if out.is_empty() { log::warn!("cover-data-url: png encoded to empty"); return None; }
+    Some(format!("data:image/png;base64,{}", STANDARD.encode(&out)))
 }
 
 /// Decode a PNG or JPEG file into RGBA (scaled to fit 256 slot).

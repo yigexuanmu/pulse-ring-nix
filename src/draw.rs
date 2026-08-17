@@ -96,6 +96,12 @@ pub struct RingRenderer {
     overlay_pipeline: Option<wgpu::RenderPipeline>,
     overlay_bind_group: Option<wgpu::BindGroup>,
     overlay_dirty: bool,
+    // ---- sonnet lyrics layer (native-res wgpu, GPU-direct composite; no Electron).
+    // Phase 1 scaffold: a centered rounded block at surface native resolution to
+    // prove sharp edges (no 2.7x upscale blur) + GPU composite + zero stdout pipe.
+    // Gated on PULSE_RING_SONNET_TEST env var for the proof; Phase 7 wires config.
+    sonnet_enabled: bool,
+    sonnet_pipeline: Option<wgpu::RenderPipeline>,
 }
 
 /// Uniforms for the wallpaper transition pass (GLSL `TransitionUniforms` block).
@@ -450,6 +456,8 @@ impl RingRenderer {
             overlay_pipeline: None,
             overlay_bind_group: None,
             overlay_dirty: false,
+            sonnet_enabled: std::env::var("PULSE_RING_SONNET_TEST").is_ok(),
+            sonnet_pipeline: None,
         }
     }
 
@@ -929,6 +937,83 @@ impl RingRenderer {
         });
         self.overlay_pipeline = Some(pipeline);
         self.overlay_bind_group = Some(bg);
+    }
+
+    /// Sonnet lyrics visualizer enabled (Phase 1: env-gated proof; Phase 7: config-wired).
+    pub fn set_sonnet_enabled(&mut self, v: bool) {
+        self.sonnet_enabled = v;
+    }
+
+    /// Lazily build the sonnet pipeline — a full-screen triangle whose fragment
+    /// draws a centered rounded block at surface native resolution. No textures,
+    /// no buffers beyond a tiny uniform; the shader does all the math on the GPU.
+    /// Sharp edge at native res proves the layer is not upscaled (the Electron
+    /// overlay path was 960x540 compositor-upscaled to 2.7x → blur).
+    fn ensure_sonnet_pass(&mut self) {
+        if self.sonnet_pipeline.is_some() {
+            return;
+        }
+        let shader = self.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("sonnet"),
+            source: wgpu::ShaderSource::Wgsl(
+                r#"
+                // Phase 1 proof shader: centered rounded block, native-res sharp edges.
+                // Phase 3+ replaces this with lyon-tessellated decor + cosmic-text glyphs.
+                struct VsOut { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+                @vertex
+                fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
+                    let p = vec2<f32>(f32((vi << 1u) & 2u), f32(vi & 2u));
+                    return VsOut(vec4<f32>(p * 2.0 - 1.0, 0.0, 1.0), p);
+                }
+                @fragment
+                fn fs_main(@location(0) uv: vec2<f32>) -> @location(0) vec4<f32> {
+                    let center = vec2<f32>(0.5, 0.4);
+                    let half_size = vec2<f32>(0.25, 0.09);
+                    let d = abs(uv - center) - half_size;
+                    let outside = length(max(d, vec2<f32>(0.0)));
+                    let inside = min(max(d.x, d.y), 0.0);
+                    let dist = outside + inside;
+                    let radius = 0.012;
+                    // 1.5px AA band at native resolution — crisp, no compositor blur.
+                    let alpha = smoothstep(radius + 0.0008, radius - 0.0008, dist);
+                    let color = vec3<f32>(0.0, 0.89, 1.0);
+                    return vec4<f32>(color * alpha, alpha);
+                }
+                "#
+                .into(),
+            ),
+        });
+        let pl = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sonnet pl"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sonnet"),
+            layout: Some(&pl),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: self.config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        self.sonnet_pipeline = Some(pipeline);
     }
 
     /// Drop the overlay (e.g. when the folia web wallpaper stops) so the wallpaper
@@ -1494,6 +1579,35 @@ impl RingRenderer {
                 multiview_mask: None,
             });
             drop(clear_pass);
+        }
+
+        // Pass 1.4: sonnet lyrics layer (native-res wgpu, GPU-direct composite).
+        // Sits ABOVE the wallpaper, BELOW the Electron overlay and the rings.
+        // Phase 1: centered rounded block proving native-res sharp edges.
+        // Phase 3+: lyon-tessellated decor + cosmic-text glyphs replace the shader.
+        if self.sonnet_enabled {
+            self.ensure_sonnet_pass();
+            if let Some(p) = self.sonnet_pipeline.as_ref() {
+                let mut sn_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("sonnet pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        depth_slice: None,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                sn_pass.set_pipeline(p);
+                sn_pass.draw(0..3, 0..1);
+                drop(sn_pass);
+            }
         }
 
         // Pass 1.5: folia overlay (lyrics visualizer). Drawn ABOVE the wallpaper and

@@ -77,10 +77,14 @@ const ensureVisible = (hex: string, minL: number): string => {
 };
 // Derive a theme that matches the cover's actual dominant color:
 //   - `representatives` (median-cut, population-weighted) come back sorted by
-//     pixel share — [0] is the cover's true main color, what "lyric color matches
-//     the cover" actually means. Use it as primary (NOT the most vibrant).
+//     pixel share — [0] is the cover's largest region by area. For dark covers
+//     (mostly black/near-black) this maps a near-black [0] to a mid-grey after
+//     the visible lift, losing the cover's true accent. Skip representatives
+//     lighter than `MIN_PRIMARY_LIGHTNESS` so the chosen primary carries the
+//     cover's actual hue identity (e.g. dark blue #5D6C94 beats black #091011).
 //   - `vibrants` (saturation-ranked) leggings are accents for emphasis only.
 // Returning null preserves the pulse-ring-supplied fallback theme (no flicker).
+const MIN_PRIMARY_LIGHTNESS = 30; // 0-255; treat <30 as "near-black background"
 const buildCoverTheme = (
     representatives: string[],
     vibrants: string[],
@@ -88,12 +92,20 @@ const buildCoverTheme = (
     isDaylight: boolean,
 ): Theme | null => {
     if (!representatives || representatives.length === 0) return null;
-    const primaryRaw = representatives[0];
+    // Pick the first representative with visible hue identity; fall back to
+    // [0] only when the entire cover is genuinely near-black.
+    const firstVisible = representatives.find((hex) => {
+        const [r, g, b] = hexToRgb(hex);
+        return rgbLightness(r, g, b) >= MIN_PRIMARY_LIGHTNESS;
+    }) ?? representatives[0];
+    const primaryRaw = firstVisible;
     const accentRaw =
         (vibrants && vibrants.length > 0 ? vibrants[0] : null)
         ?? pickMostVibrant(representatives)
         ?? fallback.accentColor;
-    const secondaryRaw = representatives.length > 1 ? representatives[1] : primaryRaw;
+    const secondaryRaw =
+        representatives.find((hex, i) => i > 0 && hex !== firstVisible)
+        ?? (representatives.length > 1 ? representatives[1] : primaryRaw);
     const primaryLift = isDaylight ? 90 : 130;
     const secondaryLift = isDaylight ? 70 : 120;
     const accentLift = isDaylight ? 80 : 100;
@@ -105,8 +117,12 @@ const buildCoverTheme = (
         accentColor: ensureVisible(accentRaw, accentLift),
         secondaryColor: ensureVisible(secondaryRaw, secondaryLift),
         // Background derived from the true cover primary so the palette reads
-        // as one cohesive piece (vs pulse-ring's near-black base).
-        backgroundColor: darken(primaryColor, 0.78),
+        // as one cohesive piece (vs pulse-ring's near-black base). When the
+        // chosen primary is itself near-black (genuinely dark covers), keep the
+        // background near-black rather than lifting it to grey.
+        backgroundColor: rgbLightness(...hexToRgb(primaryRaw)) < MIN_PRIMARY_LIGHTNESS
+            ? darken(primaryColor, 0.6)
+            : darken(primaryColor, 0.78),
     };
 };
 

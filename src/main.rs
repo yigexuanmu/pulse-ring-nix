@@ -2233,10 +2233,26 @@ impl App {
 
         // Playback: throttle to ~2Hz (folia extrapolates the clock client-side, so 2Hz anchor
         // re-sync is plenty; a track change forces an immediate flush).
+        //
+        // IMPORTANT: the position pushed to folia must be *extrapolated* (poll + dt since
+        // last poll), NOT the raw polled self.music.position_sec. folia's renderer runs
+        // its own client-side extrapolation in `resolveObsBrowserSourceClockTime`
+        // (currentTime + (nowMs - sentAtMs)). If we push the raw polled value, it lags
+        // behind folia's already-extrapolated lyric clock at the moment of dispatch, so
+        // every 0.5s dispatch snaps the lyric time *backward* — visibly seen as the
+        // karaoke bar / cover shrinking back, or the line-change animation re-triggering
+        // (the user-visible "lyrics bounces back"). Pushing the extrapolated value keeps
+        // the dispatch in sync with folia's own extrapolation and removes the bounce.
         let dt = (now - self.folia_last_pb_push).max(0.0);
         if track_changed || dt >= 0.5 {
             self.folia_last_pb_push = now;
-            let (pos, dur, playing) = (self.music.position_sec, self.folia_duration, self.music.playing);
+            let pos = if self.music.playing {
+                let wall_dt = (now - self.lyric_pos_poll_elapsed).max(0.0);
+                self.music.position_sec + wall_dt
+            } else {
+                self.music.position_sec
+            };
+            let (dur, playing) = (self.folia_duration, self.music.playing);
             let (title, artist, album) = (
                 self.music.title.clone(),
                 self.music.artist.clone(),

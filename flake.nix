@@ -5,9 +5,23 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
     rust-overlay.url = "github:oxalica/rust-overlay";
+    # wl-proxy: provide `wl-paper`, a Wayland proxy that wraps arbitrary
+    # Wayland clients (Electron) into wlr-layer-shell surfaces. We use it to
+    # run the folia Electron renderer as a native layer-shell overlay
+    # (transparent, compositor-direct, no stdout framebuffer pipe) sitting
+    # ABOVE pulse-ring's own Layer::Background surface. Pure-Rust crate
+    # (pre-generated protocols, no system-deps / wayland-scanner at build
+    # time), so builds cleanly in a pure Nix sandbox.
+    # NOTE: wl-proxy upstream has no flake.nix (plain cargo workspace), so we
+    # treat it as a tarball source (`flake = false`) and build `wl-paper` via
+    # buildRustPackage in the let block below.
+    wl-proxy = {
+      url = "github:mahkoh/wl-proxy";
+      flake = false;
+    };
   };
 
-  outputs = { self, nixpkgs, flake-utils, rust-overlay }:
+  outputs = { self, nixpkgs, flake-utils, rust-overlay, wl-proxy }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         overlays = [ (import rust-overlay) ];
@@ -86,6 +100,21 @@
           extensions = [ "rust-src" "rust-analyzer" ];
         };
 
+        # `wl-paper` binary (from wl-proxy input) — wraps Electron as a
+        # wlr-layer-shell surface. Pure-Rust crate (edition 2024, rust 1.89+);
+        # protocols are pre-generated so no wayland-scanner/system-deps at
+        # build time. We build only the `apps/wl-paper` subcrate via
+        # buildAndTestSubdir (the workspace root has no [package], only
+        # [workspace]). Consumed in web_wallpaper.rs via PULSE_RING_WL_PAPER.
+        wlPaper = pkgs.rustPlatform.buildRustPackage {
+          pname = "wl-paper";
+          version = "0.1.0";
+          src = wl-proxy;
+          cargoLock.lockFile = wl-proxy + "/Cargo.lock";
+          buildAndTestSubdir = "apps/wl-paper";
+          doCheck = false;
+        };
+
         # Fonts baked into the binary at build time (postPatch substituteInPlace
         # replaces the Arch/FHS hard-coded paths in src/main.rs with these Nix
         # store paths). This mirrors the master-branch packaging and frees the
@@ -139,6 +168,10 @@
             # wallpaper packs (e.g. folia-lyrics) the same way the installed
             # wrapper does, without copying packs into ~/.config/.
             export PULSE_RING_WALLPAPER_LIB="$PWD/assets/wallpapers"
+            # wl-paper binary: wraps Electron as a layer-shell surface (used by
+            # web_wallpaper.rs to composite the folia renderer natively on top
+            # of pulse-ring's Layer::Background surface).
+            export PULSE_RING_WL_PAPER="${wlPaper}/bin/wl-paper"
           '';
         };
 
@@ -199,7 +232,8 @@
               --prefix PATH : "${pkgs.lib.makeBinPath runtimeBins}" \
               --set PULSE_RING_ELECTRON "${pkgs.electron}/bin/electron" \
               --set PULSE_RING_HELPER "$out/share/pulse-ring/electron-wallpaper/main.js" \
-              --set PULSE_RING_WALLPAPER_LIB "$out/share/pulse-ring/assets/wallpapers"
+              --set PULSE_RING_WALLPAPER_LIB "$out/share/pulse-ring/assets/wallpapers" \
+              --set PULSE_RING_WL_PAPER "${wlPaper}/bin/wl-paper"
           '';
 
           meta = with pkgs.lib; {
@@ -211,6 +245,10 @@
         };
 
         packages.default = self.packages.${system}.pulse-ring;
+
+        # Standalone `wl-paper` binary ( Wayland proxy for arbitrary clients).
+        # Also consumed internally by the pulse-ring package (wrapProgram env).
+        packages.wl-paper = wlPaper;
 
         apps.pulse-ring = {
           type = "app";

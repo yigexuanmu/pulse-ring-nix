@@ -1,16 +1,17 @@
-// pulse-ring 网页壁纸渲染器（Electron 离屏）— folia OBS 浏览器源同款
+// pulse-ring 网页壁纸渲染器（Electron + wl-paper layer-shell）— folia OBS 浏览器源同款
 //
-// 架构（与 folia 原版 obs browser source 100% 等价，仅数据源换成 pulse-ring）：
+// F-wl-paper 架构：electron 不再 offscreen 抓帧走 stdout，而是被 wl-paper 包成
+// Wayland layer-shell surface 直接可见。compositor 自己合成 folia 层与 pulse-ring
+// background 层，pulse-ring 不再 wgpu 上传 folia 帧。
 //
-//   pulse-ring (Rust) — stdin → main.js —→ 本进程内嵌 mini HTTP+SSE server
-//                                                   ├─ GET /obs?obs=1&token=local → folia dist/index.html
-//                                                   └─ GET /obs/events?token=local → SSE 长连接
-//                                                          event: config/clock/audio
-//                                                  ↑
-//   BrowserWindow loadURL('http://127.0.0.1:port/obs?obs=1&token=local')
+//   pulse-ring (Rust) — stdin → wl-paper → main.js —→ 本进程内嵌 mini HTTP+SSE server
+//                                                           ├─ GET /obs?obs=1&token=local → folia dist/index.html
+//                                                           └─ GET /obs/events?token=local → SSE 长连接
+//                                                                  event: config/clock/audio
+//                                                          ↑
+//   BrowserWindow loadURL('http://127.0.0.1:port/obs?obs=1&token=local')  (可见窗口, wlpaper 转 layer surface)
 //     ├─ folia 原版 ObsBrowserSourceApp 用原生 new EventSource('/obs/events?token=local') 连 SSE
-//     ├─ Chromium 渲染 sonnet/... (走 folia 原版 bootstrap.tsx 的 ?obs=1 路由)
-//     └─ Chromium offscreen paint 事件 → image.toBitmap → stdout → Rust wgpu overlay
+//     └─ Chromium 渲染 sonnet/... 直接画到自己的 GPU surface (compositor 合层)
 //
 // stdin 协议（不改，仍是 Rust 端原有 4 个 tag）：
 //   0x00 + 128 x f32 + energy f32               (audio)
@@ -269,55 +270,10 @@ if (!htmlPath) {
   app.quit();
 }
 
-let queue = [];
-let writing = false;
-let paused = false;
-let outputClosed = false;
-
-process.stdout.on('error', () => {
-  outputClosed = true;
-  queue = [];
-  writing = false;
-  paused = true;
-  process.exit(0);
-});
-
-function writeFrame(buf, w, h) {
-  if (paused || outputClosed) return;
-  const header = Buffer.alloc(8);
-  header.writeUInt32LE(w, 0);
-  header.writeUInt32LE(h, 4);
-  queue.push(header);
-  queue.push(buf);
-  pump();
-}
-
-function pump() {
-  if (writing || queue.length === 0 || outputClosed) return;
-  writing = true;
-  const chunk = queue.shift();
-  let ok;
-  try {
-    ok = process.stdout.write(chunk, (err) => {
-      if (err) outputClosed = true;
-    });
-  } catch (_) {
-    outputClosed = true;
-    writing = false;
-    return;
-  }
-  if (!ok) {
-    paused = true;
-    process.stdout.once('drain', () => {
-      paused = false;
-      writing = false;
-      pump();
-    });
-  } else {
-    writing = false;
-    pump();
-  }
-}
+// F-wl-paper: 不再有 stdout 帧管道。electron 渲染到自己的 GPU surface，
+// 由 wl-paper 转成 layer-shell 后 compositor 直接合成，pulse-ring stdout 不再
+// 承载 RGBA 帧。仍保留对 stdout 的错误处理，避免意外写入导致 EPIPE 杀进程。
+process.stdout.on('error', () => { process.exit(0); });
 
 const input = { buf: Buffer.alloc(0) };
 const AUDIO_BYTES = 1 + (128 + 1) * 4;
@@ -364,7 +320,7 @@ process.stdin.on('data', (chunk) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Electron 主进程: wayland offscreen + 内嵌 SSE server + BrowserWindow loadURL
+// Electron 主进程: wayland layer-shell (经 wl-paper) + 内嵌 SSE server + BrowserWindow loadURL
 // ─────────────────────────────────────────────────────────────────────────────
 
 app.commandLine.appendSwitch('ozone-platform', 'wayland');
@@ -433,14 +389,18 @@ app.whenReady().then(async () => {
   win = new BrowserWindow({
     width,
     height,
-    show: false,
+    // F-wl-paper: show:true 让 wl-paper 能抓到可见的 wl_surface。wl-paper 把这个
+    // 普通 xdg_toplevel 转成 zwlr_layer_surface 后，compositor 直接合成到屏幕。
+    // transparent:true 保留 (folia ObsBrowserSourceApp body 透明，露出底层 pulse-ring background)。
+    show: true,
     frame: false,
     transparent: true,
+    hasShadow: false,
+    backgroundColor: '#00000000',
     webPreferences: {
-      offscreen: true,
+      // 无 offscreen —— 帧不再过 stdout。compositor 直接收 electron 的 wl_surface commit。
       backgroundThrottling: false,
       // 无 preload —— folia ObsBrowserSourceApp 自给自足, 只用 EventSource + window.location.
-      // 原本 preload.js 暴露 window.pulseRing 的是给已删的 obs-bridge.ts 用; SSE 路径下不需要.
     },
   });
 
@@ -461,15 +421,8 @@ app.whenReady().then(async () => {
 
   win.loadURL(pageUrl);
 
-  // Chromium 合成完一帧 → paint 事件 → image.toBitmap (BGRA) → stdout。
-  // setFrameRate(60) 让 Chromium 以 60fps 上限推帧；管道忙(paused)时丢弃本帧不串行阻塞。
-  win.webContents.on('paint', (event, dirty, image) => {
-    if (paused || outputClosed || !win || win.isDestroyed()) return;
-    const size = image.getSize();
-    if (size.width === 0 || size.height === 0) return;
-    writeFrame(image.toBitmap(), size.width, size.height);
-  });
-  win.webContents.setFrameRate(60);
+  // 无 paint 事件、无 stdout 帧 — electron 直接渲染到自己的 wl_surface 由
+  // wl-paper 转成 layer-shell 后供 compositor 合层。
 
   win.webContents.on('did-finish-load', () => {
     // SSE 路径下数据通过 HTTP SSE 广播; did-finish-load 时若已有缓存事件,

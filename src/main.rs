@@ -2400,6 +2400,11 @@ impl App {
                 }
             }
         }
+        // F-wl-paper: folia renders to its OWN layer surface (wl-paper → electron),
+        // not to the pulse-ring wgpu overlay. `drain_web` is now a no-op (rx is a
+        // permanently empty channel — see web_wallpaper.rs), so folia_overlay_image
+        // stays None and the Pass 1.5 overlay never uploads. Kept as a no-op so the
+        // call sites don't need touching during the transition.
         if let Some(player) = &mut self.scene_player {
             if let Some(frame) = web_wallpaper::drain_web(&player.rx) {
                 self.folia_overlay_image = Some(ImageData {

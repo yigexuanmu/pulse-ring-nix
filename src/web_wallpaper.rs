@@ -1,17 +1,29 @@
-//! Web wallpaper via Electron offscreen rendering.
+//! Web wallpaper via Electron running as a Wayland layer-shell surface.
 //!
-//! Spawns the bundled Electron helper (`electron-wallpaper/main.js`) which renders an
-//! HTML wallpaper offscreen and streams RGBA frames on stdout:
-//! `[u32le w][u32le h][w*h*4 RGBA]`. This thread parses the stream and forwards each
-//! frame through a channel — the render loop uploads them like video wallpaper frames.
+//! F-wl-paper architecture: pulse-ring spawns `wl-paper` (from the wl-proxy
+//! project), which wraps Electron as a `zwlr_layer_surface_v1` on the compositor.
+//! Electron renders the folia wallpaper directly to its OWN GPU surface — there
+//! is NO stdout frame pipe and NO wgpu texture upload on the pulse-ring side.
+//! The compositor composites the folia layer surface above the pulse-ring
+//! background layer (Layer::Background) which still draws the ring + image
+//! wallpaper; folia uses Layer::Bottom so it sits one step above the ring.
+//!
+//! stdin pipe is preserved: pulse-ring pushes config/lyrics/playback/theme/audio
+//! to Electron via the same tag protocol. `wl-paper`'s
+//! `spawn_and_forward_exit_code` inherits all three std handles, so the stdin
+//! pipe flows pulse-ring → wl-paper → electron unchanged. stdout is set to null
+//! (electron/main.js no longer emit RGBA frames — main.js logs to stderr only).
 
-use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 
+/// Legacy frame type kept so `drain_web` stays callable from the render loop
+/// during the transition. F-wl-paper produces no frames — `rx` is a permanently
+/// empty channel, so `drain_web` always returns `None` and the wgpu overlay pass
+/// stays a no-op (no texture to upload).
 pub struct WebFrame {
     pub rgba: Vec<u8>,
     pub width: u32,
@@ -21,6 +33,8 @@ pub struct WebFrame {
 pub struct WebWallpaperPlayer {
     pub rx: Receiver<WebFrame>,
     /// Child stdin: we push audio frames (and the manifest config) to the page.
+    /// This is the stdin of the `wl-paper` process; wl-paper inherits it and
+    /// `spawn_and_forward_exit_code` passes the same fd to the electron child.
     stdin: Option<std::process::ChildStdin>,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<()>>,
@@ -98,7 +112,7 @@ impl Drop for WebWallpaperPlayer {
     }
 }
 
-/// Resolve the Electron binary used to run the offscreen wallpaper helper.
+/// Resolve the Electron binary used to run the wallpaper helper.
 ///
 /// Priority:
 ///   1. `PULSE_RING_ELECTRON` env var (set by the Nix wrapper to `pkgs.electron`).
@@ -116,8 +130,38 @@ fn electron_binary() -> std::path::PathBuf {
         .join("electron-wallpaper/node_modules/.bin/electron")
 }
 
-/// Start rendering `html_path` at `width`x`height` via Electron offscreen.
+/// Resolve the `wl-paper` binary (Wayland proxy that wraps arbitrary clients as
+/// layer-shell surfaces). Priority mirrors electron_binary(): env var first
+/// (set by the Nix wrapper to the wl-proxy build's `bin/wl-paper`), then a
+/// source-tree fallback for `cargo run` development.
+fn wl_paper_binary() -> std::path::PathBuf {
+    if let Ok(p) = std::env::var("PULSE_RING_WL_PAPER") {
+        return std::path::PathBuf::from(p);
+    }
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("wl-paper")
+}
+
+/// Start the folia wallpaper as a Wayland layer-shell surface.
+///
+/// Spawn chain:
+///   pulse-ring
+///     └── wl-paper --layer bottom --keyboard-interactivity none
+///           └── electron --no-sandbox <main.js>   (stdin/stdout/stderr inherited)
+///
+/// `wl-paper` translates Electron's `xdg_toplevel` into a `zwlr_layer_surface_v1`
+/// and forwards all std handles to the electron child, so the existing stdin tag
+/// protocol (config/lyrics/playback/theme/audio) keeps working unchanged.
+/// `width`/`height` are advisory: the compositor configures the layer surface to
+/// the output's full size, so Electron's initial BrowserWindow size is mostly
+/// cosmetic (it gets resized by the first configure).
 pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<WebWallpaperPlayer, String> {
+    let wl_paper = wl_paper_binary();
+    if !wl_paper.is_file() {
+        return Err(format!(
+            "wl-paper not found at {} (set PULSE_RING_WL_PAPER or build the wl-proxy flake input)",
+            wl_paper.display()
+        ));
+    }
     let electron = electron_binary();
     if !electron.is_file() {
         return Err(format!(
@@ -144,110 +188,52 @@ pub fn start_web_wallpaper(html_path: &str, width: u32, height: u32) -> Result<W
         )
     };
 
-    let mut child = Command::new(&electron)
-        // --no-sandbox is mandatory on NixOS: the distribution ships no setuid
-        // sandbox helper, so Chromium's default sandbox blocks the renderer
-        // from initializing the GPU/Compositor stack (page boots but renders
-        // nothing — a fully-white surface). Same behaviour as the bundled
-        // electron helper scripts shipped by most NixOS Electron apps.
-        //
-        // htmlPath / width / height 走 env, 不走 argv 位置参数.
-        // 原因: Electron CLI flag (如 --no-sandbox) 不被从 argv 剖除, 会留在
-        // process.argv 里搅乱位置 — 曾导致 main.js 自己被当成 htmlPath, 页面
-        // 渲染出 main.js 源码. 用 env 完全脱离 argv 解析陷阱.
+    let electron_str = electron.to_string_lossy().into_owned();
+    // wl-paper: --layer bottom sits ABOVE the pulse-ring Layer::Background surface
+    // (which draws the ring + image wallpaper) so folia's decorated lyrics render
+    // over the ring while the transparent body lets the ring show through. Earlier
+    // iterations kept folia as a wgpu overlay texture inside the background surface
+    // (Pass 1.5), which meant a 960x540 -> fullscreen bilinear upscale and the
+    // blurriness you saw; giving folia its own full-res layer surface fixes that.
+    // --keyboard-interactivity none keeps the layer from stealing keyboard focus
+    // (folia lyrics are display-only; pulse-ring keeps its own input handling).
+    //
+    // trailing_var_arg: everything after the wl-paper options is the electron
+    // command line (electron --no-sandbox <main.js>) and is passed verbatim to
+    // `Command::new(electron).args(["--no-sandbox", main.js])` by wl-paper's
+    // `spawn_and_forward_exit_code`. htmlPath / width / height still go via env
+    // (PULSE_RING_HTML / WIDTH / HEIGHT) to keep main.js's argv parsing untouched
+    // and avoid wl-paper's clap trying to interpret them.
+    let mut child = Command::new(&wl_paper)
+        .arg("--layer")
+        .arg("bottom")
+        .arg("--keyboard-interactivity")
+        .arg("none")
+        .arg(&electron_str)
         .arg("--no-sandbox")
-        // 不强制 GL 后端：让 Chromium 用机器的硬件 GPU（mesa libglvnd EGL+OpenGL）。
-        // 之前强行 --use-gl=egl --use-angle=swiftshader 是误诊，实测在离屏 wayland 下这些
-        // flags 透不到 GPU 进程（仍报 gl=none,angle=none），反而按软件渲染拖垮性能。真凶
-        // 已定位在 main.js 的 stdin race（见 commit 99b7fc6），与 GL 后端无关。
-        .arg(&helper)                        // main script: Electron 执行 helper
-        .env("PULSE_RING_HTML", &abs_html)    // htmlPath via env
+        .arg(&helper)                       // main script: wl-paper → electron 的 argv[1]
+        .env("PULSE_RING_HTML", &abs_html)   // htmlPath via env (main.js 仍读)
         .env("PULSE_RING_WIDTH", width.to_string())
         .env("PULSE_RING_HEIGHT", height.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stdin(Stdio::piped())               // pulse-ring → wl-paper → electron (inherit)
+        .stdout(Stdio::null())               // electron 不再发射 RGBA 帧; 丢弃任何意外 stdout
+        .stderr(Stdio::inherit())            // electron console.error + wl-paper env_logger → 这里
         .spawn()
-        .map_err(|e| format!("spawn electron failed: {e}"))?;
+        .map_err(|e| format!("spawn wl-paper failed: {e}"))?;
 
     let stdin = child.stdin.take();
-    let stdout = child.stdout.take().ok_or("no stdout")?;
-    let (tx, rx) = channel::<WebFrame>();
+    // F-wl-paper: electron renders to its own layer surface, no frame stream on
+    // stdout. Keep a permanently-empty channel so `drain_web` (called from the
+    // render loop) stays a no-op without touching its call sites in main.rs.
+    let (_tx, rx) = channel::<WebFrame>();
     let stop = Arc::new(AtomicBool::new(false));
-    let stop_thread = stop.clone();
 
-    let handle = std::thread::Builder::new()
-        .name("pulse-ring-web".into())
-        .spawn(move || {
-            let mut reader = stdout;
-            let mut buf = Vec::new();
-            let mut pending: Option<(u32, u32)> = None;
-            let mut frames: u64 = 0;
-            loop {
-                if stop_thread.load(Ordering::SeqCst) {
-                    break;
-                }
-                if pending.is_none() {
-                    // Read the 8-byte header. If the stream is desynced (Electron/
-                    // Chromium printed junk on stdout at startup), resync by
-                    // scanning for a plausible header instead of dying.
-                    let mut hdr = [0u8; 8];
-                    let mut got = 0;
-                    while got < 8 {
-                        match reader.read(&mut hdr[got..]) {
-                            Ok(0) => return,
-                            Ok(n) => got += n,
-                            Err(_) => return,
-                        }
-                    }
-                    let mut w = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-                    let mut h = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-                    while !(w > 0 && w <= 8192 && h > 0 && h <= 8192 && (w * h * 4) < 256 * 1024 * 1024) {
-                        // shift left by one byte and read one more
-                        hdr.copy_within(1.., 0);
-                        match reader.read(&mut hdr[7..]) {
-                            Ok(0) => return,
-                            Ok(n) if n > 0 => {}
-                            Err(_) => return,
-                            _ => {}
-                        }
-                        w = u32::from_le_bytes([hdr[0], hdr[1], hdr[2], hdr[3]]);
-                        h = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
-                    }
-                    if got > 8 || w != 960 {
-                        log::info!("web reader: resynced to {w}x{h} (discarded {} junk bytes)", got.saturating_sub(8));
-                    }
-                    pending = Some((w, h));
-                }
-                let (w, h) = pending.unwrap();
-                let len = (w as usize) * (h as usize) * 4;
-                buf.clear();
-                buf.resize(len, 0);
-                let mut got = 0;
-                while got < len {
-                    match reader.read(&mut buf[got..]) {
-                        Ok(0) => return,
-                        Ok(n) => got += n,
-                        Err(_) => return,
-                    }
-                }
-                pending = None;
-                frames += 1;
-                if frames % 30 == 0 || frames <= 3 {
-                    log::info!("web reader: frame #{frames} {w}x{h} ok");
-                }
-                if tx.send(WebFrame { rgba: buf.clone(), width: w, height: h }).is_err() {
-                    return;
-                }
-            }
-        })
-        .map_err(|e| e.to_string())?;
-
+    // No reader thread in F-wl-paper. `handle` stays None; Drop joins nothing.
     Ok(WebWallpaperPlayer {
         rx,
         stdin,
         stop,
-        handle: Some(handle),
+        handle: None,
         child: Some(child),
     })
 }

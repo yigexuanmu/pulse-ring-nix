@@ -335,7 +335,11 @@ pub struct Config {
     /// Persistent SCENE wallpaper (folder with project.json type:"scene", or an HTML
     /// file). A scene is a living environment — it is NOT part of the rotation.
     pub scene_wallpaper: Option<String>,
-    /// Render size for the web wallpaper (screen-sized by default).
+    /// Render size for the web wallpaper (logical pixels, BrowserWindow dimensions).
+    /// Trade-off: blur vs fps — Electron 每帧走 stdout pipe (BGRA 帧) 上传到 wgpu overlay,
+    /// 被 GPU bilinear upsample 到 surface (整屏). 太小→糊, 太大→fps 低 (stdout pipe
+    /// ~140 MiB/s 带宽, 单帧 = W×H×4×scaleFactor² bytes).
+    /// 1280×800 (16:10) 对应 2560×1600 屏 2× 整数 scale, ~30fps 平衡点。
     pub web_wallpaper_size: (u32, u32),
     /// Rotating image wallpaper list (each entry is a path); empty = no rotation.
     pub wallpapers: Vec<String>,
@@ -425,7 +429,7 @@ impl Default for Config {
             video_wallpaper_audio: true,
             web_wallpaper: None,
             scene_wallpaper: None,
-            web_wallpaper_size: (960, 540),
+            web_wallpaper_size: (1280, 800),
             wallpapers: Vec::new(),
             wallpaper_interval: 30.0,
             wallpaper_transition: 1.2,

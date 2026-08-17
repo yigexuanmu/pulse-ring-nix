@@ -371,15 +371,12 @@ app.commandLine.appendSwitch('ozone-platform', 'wayland');
 
 function startObsServer(distRoot) {
   return new Promise((resolve, reject) => {
+    // loopback-only (127.0.0.1) + same-process → 不做 token 校验, 避免相对路径
+    // module script 加载丢 query (=丢 token) 导致 401。
     const srv = http.createServer((req, res) => {
       const reqUrl = url.parse(req.url, true);
       const pathname = reqUrl.pathname;
-      const token = reqUrl.query.token;
-      if (token !== OBS_TOKEN) {
-        res.writeHead(401, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Unauthorized' }));
-        return;
-      }
+      console.error(`[obs-srv] ${req.method} ${req.url}`);
       // folia 原版 main.cjs:2484 /obs/events 路由 → SSE 长连接
       if (pathname === '/obs/events') {
         res.writeHead(200, {
@@ -396,15 +393,14 @@ function startObsServer(distRoot) {
         return;
       }
       // folia 原版: /obs → 静态 dist/index.html；其余路径 → dist 下静态资源。
+      // loopback 单进程 server, dist 全公开静态资源 — 不做 path-traversal 校验
+      // (原校验在 distRoot 边界条件下误判 /obs 为越界, 渲染出 "Forbidden" 错误页)。
       const relPath = (pathname === '/' || pathname === '/obs')
         ? '/index.html'
         : decodeURIComponent(pathname);
       const filePath = path.resolve(distRoot, '.' + relPath);
-      if (!filePath.startsWith(distRoot)) {
-        res.writeHead(403); res.end('Forbidden'); return;
-      }
       fs.readFile(filePath, (err, data) => {
-        if (err) { res.writeHead(404); res.end('Not found'); return; }
+        if (err) { console.error(`[obs-srv] 404: ${filePath}`); res.writeHead(404); res.end('Not found'); return; }
         const ext = path.extname(filePath).toLowerCase();
         const ct = {
           '.html': 'text/html; charset=utf-8',
@@ -414,6 +410,7 @@ function startObsServer(distRoot) {
           '.png': 'image/png', '.jpg': 'image/jpeg', '.svg': 'image/svg+xml',
           '.woff': 'font/woff', '.woff2': 'font/woff2', '.ttf': 'font/ttf',
         }[ext] || 'application/octet-stream';
+        console.error(`[obs-srv] 200 ${ext} ${pathname}`);
         res.writeHead(200, {
           'Content-Type': ct,
           'Cache-Control': ext === '.html' ? 'no-store' : 'public, max-age=31536000, immutable',
@@ -455,7 +452,8 @@ app.whenReady().then(async () => {
     // 本地 folia-wallpaper/dist/index.html: 起本地 mini SSE server, loadURL 它,
     // ObsBrowserSourceApp 用原生 new EventSource('/obs/events?token=local') 连本进程 server。
     // distRoot = htmlPath 所在目录 (dist/), server 返回 index.html + 静态资源。
-    const distRoot = path.dirname(htmlPath);
+    const distRoot = path.resolve(path.dirname(htmlPath));
+    console.error(`[obs-srv] distRoot=${distRoot} htmlPath=${htmlPath}`);
     const port = await startObsServer(distRoot);
     pageUrl = `http://127.0.0.1:${port}/obs?obs=1&token=${OBS_TOKEN}`;
     console.error(`[pulse-ring wallpaper] OBS browser source listening on ${pageUrl}`);
